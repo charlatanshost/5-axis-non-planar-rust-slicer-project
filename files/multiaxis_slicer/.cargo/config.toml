@@ -1,0 +1,3 @@
+[build]
+# Build to a local directory outside OneDrive to avoid sync issues
+target-dir = "C:/temp/multiaxis-slicer-target"

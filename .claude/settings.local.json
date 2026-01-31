@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(tar:*)",
+      "Bash(cargo build:*)",
+      "Bash(timeout 5 tail:*)",
+      "Bash(rustc:*)",
+      "Bash(cargo --version:*)",
+      "Bash(cargo run:*)",
+      "Bash(cargo fix:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(cargo check:*)",
+      "Bash(cargo doc:*)",
+      "Bash(ls:*)",
+      "Bash(Select-Object -First 50)",
+      "Bash(find:*)",
+      "Bash(tasklist:*)",
+      "Bash(findstr:*)",
+      "Bash(taskkill:*)",
+      "Bash(tee:*)",
+      "Bash(cargo tree:*)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(cargo test:*)"
+    ]
+  }
+}

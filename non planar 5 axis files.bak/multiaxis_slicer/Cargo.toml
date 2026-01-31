@@ -1,0 +1,62 @@
+[package]
+name = "multiaxis_slicer"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "High-performance 5-axis non-planar slicer"
+
+[dependencies]
+# Linear algebra and 3D math
+nalgebra = "0.32"
+glam = "0.24"
+
+# Geometry and collision detection
+parry3d = "0.13"
+
+# Mesh I/O
+stl_io = "0.7"
+
+# Computational geometry
+geo = "0.27"
+spade = "2.9"
+
+# Parallelism
+rayon = "1.8"
+crossbeam = "0.8"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Optimization
+ordered-float = "4.2"
+
+[dev-dependencies]
+criterion = "0.5"
+approx = "0.5"
+
+# Python bindings (optional, uncomment if needed)
+# [dependencies.pyo3]
+# version = "0.20"
+# features = ["extension-module"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.bench]
+inherits = "release"
+
+[[bench]]
+name = "slicing_benchmark"
+harness = false
