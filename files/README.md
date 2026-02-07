@@ -1,203 +1,180 @@
 # MultiAxis Slicer
 
-High-performance 5-axis non-planar slicer written in Rust.
+High-performance 5-axis non-planar slicer written in Rust, featuring curved-layer slicing based on the S3-Slicer algorithm (SIGGRAPH Asia 2022 Best Paper).
 
 ## Features
 
-- ✅ **Fast mesh slicing** - O(n log k + k + m) algorithm from optimal slicing paper
-- ✅ **Centroidal axis computation** - 100x faster than medial axis
-- ✅ **Parallel processing** - Multi-threaded slicing with Rayon
-- ✅ **5-axis toolpath generation** - Support for A/B rotation axes
-- ✅ **G-code generation** - Direct output for CNC/3D printers
-- 🚧 **Ruled surface detection** - Coming soon
-- 🚧 **Singularity optimization** - Coming soon
-- 🚧 **Collision detection** - Coming soon
+- **S3-Slicer curved-layer pipeline** - Full implementation of the "S3-Slicer: A General Slicing Framework for Multi-Axis 3D Printing" paper
+- **Tetrahedral volumetric deformation** - Per-tetrahedron ASAP (As-Similar-As-Possible) deformation with scaling, matching the original paper's approach
+- **Voxel-based mesh reconstruction** - SDF + Surface Nets preprocessing that guarantees clean, manifold input for TetGen, even from self-intersecting STL files
+- **Interactive GUI** - egui-based application with 3D viewport, real-time mesh preview, and parameter controls
+- **Fast mesh slicing** - O(n log k + k + m) algorithm from optimal slicing paper
+- **Centroidal axis computation** - 100x faster than medial axis
+- **Parallel processing** - Multi-threaded computation with Rayon
+- **5-axis toolpath generation** - Support for A/B rotation axes
+- **G-code generation** - Direct output for CNC/3D printers
+- **Support generation** - Overhang detection and tree-based support structures
 
 ## Quick Start
 
 ### Prerequisites
 
+- [Rust toolchain](https://rustup.rs/) (stable, 1.75+)
+- C++ compiler (required by TetGen dependency)
+
 ```bash
 # Install Rust (if not already installed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
-
-# Verify installation
-rustc --version
-cargo --version
 ```
 
-### Build
+### Build & Run
 
 ```bash
-# Clone or navigate to the project
 cd multiaxis_slicer
 
-# Build release version (optimized)
+# Build and run the GUI application (release mode recommended)
+cargo run --bin gui --release
+
+# Run tests
+cargo test --lib
+
+# Build library only
 cargo build --release
-
-# Build with all optimizations
-cargo build --profile release
 ```
 
-### Run Example
+The GUI will open with a 3D viewport. Load an STL file and select a deformation method to start slicing.
 
-```bash
-# Run the simple slicer example
-cargo run --example simple_slicer --release
+## S3-Slicer Pipeline
 
-# With logging
-RUST_LOG=info cargo run --example simple_slicer --release
-```
+The core of this project is a full implementation of the S3-Slicer algorithm for curved-layer non-planar 3D printing. The pipeline supports multiple deformation methods:
 
-## Usage as Library
+### Tet Volumetric (Recommended)
 
-Add to your `Cargo.toml`:
+The full volumetric pipeline from the original paper:
 
-```toml
-[dependencies]
-multiaxis_slicer = { path = "../multiaxis_slicer" }
-```
+1. **Mesh preprocessing** - Voxel reconstruction (SDF + Surface Nets) produces a clean, manifold surface from potentially self-intersecting STL files
+2. **Tetrahedralization** - TetGen (via `tritet` crate) generates a constrained Delaunay tet mesh
+3. **Quaternion field optimization** - Per-tetrahedron rotation field optimized for fabrication objectives (support-free, strength, etc.)
+4. **Volumetric ASAP deformation** - Per-tet As-Similar-As-Possible deformation with scaling via SVD of deformation gradients
+5. **Scalar field computation** - Volume-based scalar field with Laplacian smoothing
+6. **Marching tetrahedra** - Isosurface extraction produces curved layers
 
-Use in your code:
+### Other Methods
 
-```rust
-use multiaxis_slicer::*;
-
-fn main() -> Result<()> {
-    // Load mesh
-    let mesh = Mesh::from_stl("model.stl")?;
-    
-    // Configure slicer
-    let config = slicing::SlicingConfig {
-        layer_height: 0.2,
-        ..Default::default()
-    };
-    
-    // Slice
-    let slicer = slicing::Slicer::new(config);
-    let layers = slicer.slice(&mesh)?;
-    
-    // Generate toolpaths
-    let generator = toolpath::ToolpathGenerator::new(0.4, 0.2);
-    let toolpaths = generator.generate(&layers);
-    
-    // Generate G-code
-    let gcode_gen = gcode::GCodeGenerator::new();
-    gcode_gen.generate(&toolpaths, "output.gcode")?;
-    
-    Ok(())
-}
-```
+- **Virtual Scalar Field** - Computes scalar field directly without mesh deformation. Good fallback for complex models.
+- **ASAP Deformation** - Surface-based ASAP solver. Can cause mesh collapse on complex geometry.
+- **Scale-Controlled** - Local deformation with scale control.
 
 ## Architecture
 
 ```
 multiaxis_slicer/
 ├── src/
-│   ├── lib.rs              # Main library entry point
-│   ├── geometry.rs         # Geometric primitives (Triangle, Point, etc.)
-│   ├── mesh.rs             # Mesh loading and manipulation
-│   ├── slicing.rs          # Core slicing algorithms
-│   ├── centroidal_axis.rs  # Centroidal axis computation
-│   ├── toolpath.rs         # Toolpath generation
-│   ├── gcode.rs            # G-code output
-│   ├── ruled_surface.rs    # Ruled surface detection (TODO)
-│   ├── singularity.rs      # Singularity optimization (TODO)
-│   └── collision.rs        # Collision detection (TODO)
-├── examples/
-│   └── simple_slicer.rs    # Example CLI application
-└── tests/                  # Integration tests
+│   ├── lib.rs                    # Library entry point
+│   ├── bin/gui.rs                # GUI application entry point
+│   │
+│   ├── geometry.rs               # Geometric primitives (Triangle, Point3D, etc.)
+│   ├── mesh.rs                   # Mesh loading (STL) and manipulation
+│   ├── slicing.rs                # Core planar slicing algorithms
+│   ├── toolpath.rs               # Toolpath generation
+│   ├── toolpath_patterns.rs      # Infill patterns (linear, concentric, etc.)
+│   ├── gcode.rs                  # G-code output
+│   ├── centroidal_axis.rs        # Centroidal axis computation
+│   ├── ruled_surface.rs          # Ruled surface detection
+│   ├── singularity.rs            # Singularity optimization
+│   ├── collision.rs              # Collision detection
+│   │
+│   ├── s3_slicer/                # S3-Slicer curved-layer pipeline
+│   │   ├── pipeline.rs           # Main pipeline orchestration
+│   │   ├── voxel_remesh.rs       # SDF + Surface Nets mesh reconstruction
+│   │   ├── tet_mesh.rs           # TetMesh struct, TetGen integration
+│   │   ├── tet_quaternion_field.rs  # Per-tet quaternion field optimization
+│   │   ├── tet_asap_deformation.rs  # Volumetric ASAP with per-tet scaling
+│   │   ├── tet_scalar_field.rs   # Volume-based scalar field
+│   │   ├── marching_tet.rs       # Marching tetrahedra isosurface extraction
+│   │   ├── quaternion_field.rs   # Surface-based quaternion field
+│   │   ├── asap_deformation.rs   # Surface ASAP solver
+│   │   ├── deformation.rs        # Mesh deformation utilities
+│   │   ├── deformation_v2.rs     # Scale-controlled deformation
+│   │   ├── scalar_field.rs       # Surface scalar field
+│   │   ├── isosurface.rs         # Marching triangles isosurface extraction
+│   │   ├── heat_method.rs        # Geodesic distance via heat method
+│   │   └── isotropic_remesh.rs   # Botsch & Kobbelt 2004 remeshing (legacy)
+│   │
+│   ├── gui/                      # egui GUI application
+│   │   ├── app.rs                # Main application state and logic
+│   │   ├── control_panel.rs      # Parameter controls sidebar
+│   │   ├── viewport_3d.rs        # 3D mesh rendering
+│   │   ├── stats_panel.rs        # Slicing statistics display
+│   │   ├── gcode_panel.rs        # G-code preview
+│   │   └── theme.rs              # UI theming
+│   │
+│   ├── support_generation/       # Support structure generation
+│   │   ├── overhang_detection.rs # Detect overhanging faces
+│   │   ├── tree_skeleton.rs      # Tree-based support structures
+│   │   └── support_toolpath.rs   # Support toolpath generation
+│   │
+│   └── motion_planning/          # Multi-axis motion planning
+│
+├── Cargo.toml
+└── README.md
 ```
 
-## Performance
+## Key Dependencies
 
-Compared to Python-based slicers:
+| Crate | Purpose |
+|-------|---------|
+| `nalgebra` | Linear algebra (vectors, matrices, quaternions, SVD) |
+| `tritet` | TetGen wrapper for constrained Delaunay tetrahedralization |
+| `sprs` | Sparse matrix operations for Laplacian systems |
+| `rayon` | Parallel iteration |
+| `parry3d` | Convex hull computation |
+| `eframe`/`egui` | GUI framework |
+| `three-d` | 3D rendering in the viewport |
 
-| Operation | Python (NumPy) | Rust | Speedup |
-|-----------|----------------|------|---------|
-| Mesh loading | 500ms | 50ms | 10x |
-| Triangle-plane intersection | 2000ms | 20ms | 100x |
-| Contour building | 1000ms | 15ms | 67x |
-| Total slicing (complex model) | 5000ms | 100ms | 50x |
-
-## Algorithms Implemented
-
-### 1. Optimal Slicing Algorithm
-Based on "An Optimal Algorithm for 3D Triangle Mesh Slicing" - O(n log k + k + m) complexity.
-
-### 2. Centroidal Axis
-Based on "Support-Free Volume Printing by Multi-Axis Motion" - 100x faster than medial axis.
-
-### 3. Hash-Based Contour Construction
-O(m) complexity using hash tables for endpoint chaining.
-
-## Next Steps
-
-### Phase 1: Core Algorithms (Complete ✓)
-- [x] Mesh loading (STL)
-- [x] Basic slicing
-- [x] Contour building
-- [x] Centroidal axis
-- [x] Toolpath generation
-- [x] G-code output
-
-### Phase 2: Advanced Features (In Progress)
-- [ ] Ruled surface detection
-- [ ] Singularity optimization
-- [ ] Collision detection
-- [ ] Graph-based path planning
-- [ ] Variable layer heights
-
-### Phase 3: Optimization
-- [ ] Adaptive slicing
-- [ ] Support generation
-- [ ] Infill patterns
-- [ ] Surface quality optimization
-
-### Phase 4: Integration
-- [ ] Python bindings (PyO3)
-- [ ] GUI application
-- [ ] Web interface (WASM)
+**Note:** TetGen (`tritet`) is AGPL licensed and enabled via the `tetgen` cargo feature flag (on by default). Disable with `--no-default-features` if AGPL is not acceptable.
 
 ## Testing
 
 ```bash
-# Run all tests
-cargo test
+# Run all library tests (skips examples that have known compile issues)
+cargo test --lib
 
-# Run with output
-cargo test -- --nocapture
+# Run specific test module
+cargo test --lib -- voxel_remesh
+cargo test --lib -- tet_mesh
+cargo test --lib -- isotropic_remesh
 
-# Run specific test
-cargo test test_triangle_plane_intersection
+# Run with log output
+RUST_LOG=info cargo test --lib -- --nocapture
 
 # Run benchmarks
 cargo bench
 ```
 
-## Documentation
+## Performance
 
-```bash
-# Generate and open documentation
-cargo doc --open
-```
+The voxel reconstruction + TetGen pipeline processes an 80K-triangle Stanford Bunny in ~5-10 seconds (release mode), compared to ~28 minutes for the previous isotropic remeshing approach.
 
-## Contributing
-
-This is a research project. Feel free to:
-- Report issues
-- Submit pull requests
-- Suggest improvements
-- Share your results
+| Operation | Time (Release) |
+|-----------|---------------|
+| Voxel reconstruction (80K tris) | ~2-5s |
+| TetGen tetrahedralization | ~1-2s |
+| Quaternion field optimization | ~1s |
+| ASAP volumetric deformation | ~2-5s |
+| Scalar field + layer extraction | ~1-2s |
 
 ## References
 
-1. "An Optimal Algorithm for 3D Triangle Mesh Slicing"
-2. "Support-Free Volume Printing by Multi-Axis Motion" (TOG 2020)
-3. "Singularity-Aware Motion Planning for Multi-Axis Additive Manufacturing" (RAL 2021)
-4. XYZdims blog series on non-planar slicing
+1. "S3-Slicer: A General Slicing Framework for Multi-Axis 3D Printing" (SIGGRAPH Asia 2022)
+   - [Paper](https://dl.acm.org/doi/10.1145/3550469.3555430) | [Code](https://github.com/zhangty019/S3_DeformFDM)
+2. "An Optimal Algorithm for 3D Triangle Mesh Slicing"
+3. "Support-Free Volume Printing by Multi-Axis Motion" (TOG 2020)
+4. "A Remeshing Approach to Multiresolution Modeling" - Botsch & Kobbelt (2004)
+5. "Singularity-Aware Motion Planning for Multi-Axis Additive Manufacturing" (RAL 2021)
 
 ## License
 
-MIT License - See LICENSE file for details
+MIT License - See LICENSE file for details.
+
+**Note:** The TetGen dependency (`tritet`) is AGPL licensed. If distributing binaries, ensure compliance or build with `--no-default-features` to exclude it.
