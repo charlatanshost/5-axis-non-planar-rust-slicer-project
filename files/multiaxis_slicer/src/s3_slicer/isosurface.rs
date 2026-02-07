@@ -75,14 +75,22 @@ impl CurvedLayer {
     /// Convert to standard Layer format for compatibility
     pub fn to_layer(&self) -> Layer {
         // Chain segments into continuous contours
-        let paths = chain_segments(&self.segments, 0.1);
+        // Use a larger tolerance for curved layers since segment endpoints may not align perfectly
+        let paths = chain_segments(&self.segments, 1.0);
+
+        // Debug: Log chaining results for first few layers
+        if self.segments.len() > 0 {
+            log::debug!("CurvedLayer::to_layer(): {} segments → {} paths (tolerance=1.0mm)",
+                self.segments.len(), paths.len());
+        }
 
         // Convert paths to Contour objects
         let contours: Vec<Contour> = paths.into_iter()
+            .filter(|points| points.len() >= 2)  // Filter out single-point paths
             .map(|points| {
                 // Check if path is closed (first and last points are close)
                 let is_closed = if points.len() >= 3 {
-                    (points[0] - points[points.len() - 1]).norm() < 0.1
+                    (points[0] - points[points.len() - 1]).norm() < 1.0
                 } else {
                     false
                 };
@@ -134,7 +142,17 @@ impl IsosurfaceExtractor {
     ) -> CurvedLayer {
         // Convert per-triangle scalar field to per-vertex values
         let vertex_scalar_map = triangle_field_to_vertex_field(mesh, &scalar_field.values);
+        self.extract_at_value_cached(mesh, scalar_field, iso_value, &vertex_scalar_map)
+    }
 
+    /// Extract isosurface using a precomputed vertex scalar map (avoids rebuilding it every call)
+    fn extract_at_value_cached(
+        &self,
+        mesh: &Mesh,
+        scalar_field: &ScalarField,
+        iso_value: f64,
+        vertex_scalar_map: &HashMap<u64, f64>,
+    ) -> CurvedLayer {
         // Parallel extraction of contour segments for each triangle
         let results: Vec<(LineSegment, Vector3D)> = mesh.triangles
             .par_iter()
@@ -215,14 +233,20 @@ impl IsosurfaceExtractor {
     ) -> Vec<CurvedLayer> {
         let range = max_value - min_value;
 
+        // Precompute vertex scalar map ONCE (this is expensive for large meshes)
+        log::info!("  Precomputing vertex scalar map ({} triangles)...", mesh.triangles.len());
+        let vertex_scalar_map = triangle_field_to_vertex_field(mesh, &scalar_field.values);
+        log::info!("  Vertex scalar map ready ({} unique vertices)", vertex_scalar_map.len());
+
         // Parallel extraction of all layers
-        let layers: Vec<CurvedLayer> = (0..self.config.num_layers)
+        let num_layers = self.config.num_layers;
+        let layers: Vec<CurvedLayer> = (0..num_layers)
             .into_par_iter()
             .filter_map(|i| {
-                let t = i as f64 / (self.config.num_layers - 1).max(1) as f64;
+                let t = i as f64 / (num_layers - 1).max(1) as f64;
                 let iso_value = min_value + t * range;
 
-                let layer = self.extract_at_value(mesh, scalar_field, iso_value);
+                let layer = self.extract_at_value_cached(mesh, scalar_field, iso_value, &vertex_scalar_map);
 
                 // Filter out empty layers
                 if !layer.segments.is_empty() {
@@ -233,6 +257,7 @@ impl IsosurfaceExtractor {
             })
             .collect();
 
+        log::info!("  Extracted {} uniform layers", layers.len());
         layers
     }
 
@@ -248,11 +273,16 @@ impl IsosurfaceExtractor {
         log::info!("  Target thickness: {:.3} mm", self.config.target_layer_thickness);
         log::info!("  Range: [{:.3}, {:.3}] mm", self.config.min_layer_thickness, self.config.max_layer_thickness);
 
+        // Precompute vertex scalar map ONCE (this is expensive for large meshes)
+        log::info!("  Precomputing vertex scalar map ({} triangles)...", mesh.triangles.len());
+        let vertex_scalar_map = triangle_field_to_vertex_field(mesh, &scalar_field.values);
+        log::info!("  Vertex scalar map ready ({} unique vertices)", vertex_scalar_map.len());
+
         let mut layers = Vec::new();
         let mut current_iso_value = min_value;
 
         // Extract first layer
-        let first_layer = self.extract_at_value(mesh, scalar_field, current_iso_value);
+        let first_layer = self.extract_at_value_cached(mesh, scalar_field, current_iso_value, &vertex_scalar_map);
         if first_layer.segments.is_empty() {
             log::warn!("First layer is empty, falling back to uniform spacing");
             return self.extract_layers_uniform(mesh, scalar_field, min_value, max_value);
@@ -263,17 +293,21 @@ impl IsosurfaceExtractor {
         // Iteratively find next layers using binary search
         while current_iso_value < max_value && layers.len() < self.config.num_layers {
             // Binary search for next iso_value that gives target layer thickness
-            match self.find_next_iso_value(
+            match self.find_next_iso_value_cached(
                 mesh,
                 scalar_field,
                 &layers.last().unwrap(),
                 current_iso_value,
                 max_value,
+                &vertex_scalar_map,
             ) {
                 Some(next_iso_value) => {
-                    let next_layer = self.extract_at_value(mesh, scalar_field, next_iso_value);
+                    let next_layer = self.extract_at_value_cached(mesh, scalar_field, next_iso_value, &vertex_scalar_map);
 
                     if !next_layer.segments.is_empty() {
+                        if layers.len() % 50 == 0 {
+                            log::info!("  Extracted {} layers so far (iso={:.2})...", layers.len(), next_iso_value);
+                        }
                         layers.push(next_layer);
                         current_iso_value = next_iso_value;
                     } else {
@@ -298,14 +332,15 @@ impl IsosurfaceExtractor {
         layers
     }
 
-    /// Binary search for next iso-value that gives target layer thickness
-    fn find_next_iso_value(
+    /// Binary search for next iso-value that gives target layer thickness (with precomputed vertex map)
+    fn find_next_iso_value_cached(
         &self,
         mesh: &Mesh,
         scalar_field: &ScalarField,
         previous_layer: &CurvedLayer,
         current_iso: f64,
         max_iso: f64,
+        vertex_scalar_map: &HashMap<u64, f64>,
     ) -> Option<f64> {
         let range = max_iso - current_iso;
         if range < 1e-10 {
@@ -316,12 +351,12 @@ impl IsosurfaceExtractor {
         let mut low = current_iso + range * 0.001;
         let mut high = (current_iso + range * 0.1).min(max_iso);
 
-        // Binary search iterations
-        for _iteration in 0..20 {
+        // Binary search iterations (reduced from 20 to 10 for speed)
+        for _iteration in 0..10 {
             let mid = (low + high) / 2.0;
 
-            // Extract candidate layer
-            let candidate_layer = self.extract_at_value(mesh, scalar_field, mid);
+            // Extract candidate layer using cached vertex map
+            let candidate_layer = self.extract_at_value_cached(mesh, scalar_field, mid, vertex_scalar_map);
 
             if candidate_layer.segments.is_empty() {
                 // Empty layer, search higher
@@ -361,59 +396,14 @@ fn compute_layer_distance(layer1: &CurvedLayer, layer2: &CurvedLayer) -> f64 {
         return 0.0;
     }
 
-    // Sample points from both layers
-    let points1 = sample_layer_points(layer1, 10); // Sample ~10 points per segment
-    let points2 = sample_layer_points(layer2, 10);
-
-    if points1.is_empty() || points2.is_empty() {
-        return (layer2.z - layer1.z).abs();
-    }
-
-    // Compute distances from points in layer1 to closest points in layer2
-    let distances: Vec<f64> = points1
-        .iter()
-        .map(|p1| {
-            points2
-                .iter()
-                .map(|p2| (*p1 - *p2).norm())
-                .fold(f64::INFINITY, f64::min)
-        })
-        .collect();
-
-    // Return median distance for robustness
-    if !distances.is_empty() {
-        let mut sorted = distances.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        sorted[sorted.len() / 2]
-    } else {
-        (layer2.z - layer1.z).abs()
-    }
+    // For performance, use average Z difference as a fast approximation
+    // This avoids the expensive O(n*m) nearest-neighbor search
+    // which was a major bottleneck on large meshes (225K+ triangles)
+    let avg_z1 = layer1.average_z();
+    let avg_z2 = layer2.average_z();
+    (avg_z2 - avg_z1).abs()
 }
 
-/// Sample points along layer segments
-fn sample_layer_points(layer: &CurvedLayer, samples_per_segment: usize) -> Vec<Point3D> {
-    let mut points = Vec::new();
-
-    for segment in &layer.segments {
-        // Add segment endpoints
-        points.push(segment.start);
-
-        // Add intermediate points
-        for i in 1..samples_per_segment {
-            let t = i as f64 / samples_per_segment as f64;
-            let point = Point3D::new(
-                segment.start.x + t * (segment.end.x - segment.start.x),
-                segment.start.y + t * (segment.end.y - segment.start.y),
-                segment.start.z + t * (segment.end.z - segment.start.z),
-            );
-            points.push(point);
-        }
-
-        points.push(segment.end);
-    }
-
-    points
-}
 
 /// Extract contour segment from a single triangle using marching triangles
 fn extract_triangle_contour(

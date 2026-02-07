@@ -22,6 +22,9 @@ stl_io = "0.7"
 geo = "0.27"
 spade = "2.9"
 
+# Tetrahedral meshing (optional, AGPL via TetGen)
+tritet = { version = "3.1", optional = true }
+
 # Parallelism
 rayon = "1.8"
 crossbeam = "0.8"
@@ -48,6 +51,10 @@ three-d = { version = "0.18", features = ["egui-gui"] }
 tokio = { version = "1.36", features = ["full"] }
 rfd = "0.14"
 palette = "0.7"
+
+[features]
+default = ["tetgen"]
+tetgen = ["tritet/with_tetgen"]
 
 [dev-dependencies]
 criterion = "0.5"

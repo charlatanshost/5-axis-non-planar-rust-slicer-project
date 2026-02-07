@@ -109,7 +109,7 @@ impl AsapSolver {
 
     /// Solve for deformed mesh
     pub fn solve(&self) -> Mesh {
-        log::info!("Solving ASAP deformation...");
+        log::info!("Solving ASAP deformation ({} vertices)...", self.vertices.len());
         log::info!("  Max iterations: {}", self.config.max_iterations);
         log::info!("  Convergence threshold: {:.2e}", self.config.convergence_threshold);
 
@@ -118,15 +118,19 @@ impl AsapSolver {
 
         // ASAP iteration
         for iteration in 0..self.config.max_iterations {
+            log::info!("  ASAP iteration {}/{}...", iteration + 1, self.config.max_iterations);
+
             // Local step: Compute optimal rotations
+            log::info!("    Local step (computing rotations)...");
             let rotations = self.compute_optimal_rotations(&deformed_positions);
 
             // Global step: Solve for new positions
+            log::info!("    Global step (solving linear system)...");
             let new_positions = self.solve_global_step(&deformed_positions, &rotations);
 
             // Check convergence
             let max_displacement = compute_max_displacement(&deformed_positions, &new_positions);
-            log::info!("  Iteration {}: max displacement = {:.6}", iteration + 1, max_displacement);
+            log::info!("    Max displacement: {:.6}", max_displacement);
 
             deformed_positions = new_positions;
 
@@ -136,6 +140,7 @@ impl AsapSolver {
             }
         }
 
+        log::info!("  Building deformed mesh...");
         // Build deformed mesh
         self.build_deformed_mesh(&deformed_positions)
     }
@@ -230,15 +235,37 @@ impl AsapSolver {
         }
 
         // Add positional constraints (fix bottom vertices)
+        // Use a height-based gradient: vertices at bottom are strongly fixed,
+        // vertices higher up get progressively weaker constraints
         let min_z = self.vertices.iter().map(|v| v.z).fold(f64::INFINITY, f64::min);
+        let max_z = self.vertices.iter().map(|v| v.z).fold(f64::NEG_INFINITY, f64::max);
+        let height_range = (max_z - min_z).max(1.0);
+
+        // Fixed layer thickness - vertices within this range are strongly fixed
+        let fixed_layer_thickness = 2.0_f64.min(height_range * 0.1); // 2mm or 10% of height
+
         for (idx, vertex) in self.vertices.iter().enumerate() {
-            if (vertex.z - min_z).abs() < 1.0 {
-                // Fix this vertex
+            let height_above_bottom = vertex.z - min_z;
+
+            if height_above_bottom < fixed_layer_thickness {
+                // Bottom layer: strongly fixed
                 let weight = self.config.constraint_weight;
                 triplets.add_triplet(idx, idx, weight);
                 rhs_x[idx] += weight * vertex.x;
                 rhs_y[idx] += weight * vertex.y;
                 rhs_z[idx] += weight * vertex.z;
+            } else {
+                // Above bottom: add a soft regularization to prevent wild deformations
+                // Weight decreases with height (further from bottom = more freedom to move)
+                let height_fraction = height_above_bottom / height_range;
+                let soft_weight = self.config.constraint_weight * 0.01 * (1.0 - height_fraction).max(0.0);
+
+                if soft_weight > 0.1 {
+                    triplets.add_triplet(idx, idx, soft_weight);
+                    rhs_x[idx] += soft_weight * vertex.x;
+                    rhs_y[idx] += soft_weight * vertex.y;
+                    rhs_z[idx] += soft_weight * vertex.z;
+                }
             }
         }
 
@@ -295,6 +322,12 @@ impl AsapSolver {
 
 /// Compute optimal rotation matrix via SVD
 /// Aligns rest-pose edges with deformed edges, guided by quaternion field
+///
+/// The quaternion field provides a TARGET rotation that guides the deformation.
+/// We blend the SVD-computed rotation (from edge correspondences) with the
+/// quaternion target rotation using spherical interpolation.
+///
+/// This is the correct approach - we DON'T add quaternions to the covariance matrix.
 fn compute_optimal_rotation(
     e1_rest: Vector3D,
     e2_rest: Vector3D,
@@ -304,7 +337,8 @@ fn compute_optimal_rotation(
     tri_idx: usize,
     quaternion_weight: f64,
 ) -> Matrix3<f64> {
-    // Build covariance matrix: C = Σ (deformed * rest^T)
+    // Step 1: Build covariance matrix from edge correspondences ONLY
+    // C = Σ (deformed * rest^T)
     let mut covariance = Matrix3::zeros();
 
     // Add edge contributions
@@ -314,17 +348,10 @@ fn compute_optimal_rotation(
         covariance += def_vec * rest_vec.transpose();
     }
 
-    // Add quaternion field guidance
-    if tri_idx < quaternion_field.rotations.len() {
-        let quat = quaternion_field.rotations[tri_idx];
-        let target_rotation = quaternion_to_matrix(&quat);
-        covariance += target_rotation * quaternion_weight;
-    }
-
-    // SVD: C = U * Σ * V^T
+    // Step 2: Extract optimal rotation from covariance via SVD
     let svd = SVD::new(covariance, true, true);
 
-    if let (Some(u), Some(v_t)) = (svd.u, svd.v_t) {
+    let edge_rotation = if let (Some(u), Some(v_t)) = (svd.u, svd.v_t) {
         // Optimal rotation: R = U * V^T
         let mut rotation = u * v_t;
 
@@ -340,18 +367,50 @@ fn compute_optimal_rotation(
         rotation
     } else {
         Matrix3::identity()
+    };
+
+    // Step 3: Blend with quaternion field target rotation
+    // The quaternion field provides guidance, not a hard constraint
+    if quaternion_weight > 0.0 && tri_idx < quaternion_field.rotations.len() {
+        let target_quat = quaternion_field.rotations[tri_idx];
+
+        // Skip if target is identity (no rotation guidance for this triangle)
+        if target_quat.angle() < 1e-6 {
+            return edge_rotation;
+        }
+
+        // Convert edge rotation to quaternion for blending
+        let edge_rot_matrix = nalgebra::Rotation3::from_matrix_unchecked(edge_rotation);
+        let edge_quat = nalgebra::UnitQuaternion::from_rotation_matrix(&edge_rot_matrix);
+
+        // Spherical interpolation: blend edge-based rotation with quaternion field target
+        // quaternion_weight of 0.3 means 30% guidance from quaternion field, 70% from edges
+        let blended_quat = edge_quat.slerp(&target_quat, quaternion_weight.min(1.0));
+
+        // Convert back to rotation matrix
+        blended_quat.to_rotation_matrix().into_inner()
+    } else {
+        edge_rotation
     }
 }
 
-/// Solve sparse linear system using iterative method (Jacobi)
+/// Solve sparse linear system using iterative method (Gauss-Seidel with early termination)
 fn solve_sparse_system(matrix: &CsMat<f64>, rhs: &[f64]) -> Vec<f64> {
     let n = rhs.len();
-    let mut solution = vec![0.0; n];
 
-    // Jacobi iteration (simple but works)
-    for _iteration in 0..100 {
-        let mut new_solution = solution.clone();
+    // Initialize with RHS values (better starting point than zeros)
+    let mut solution: Vec<f64> = rhs.iter().map(|&r| {
+        if r.is_finite() { r * 0.01 } else { 0.0 }
+    }).collect();
 
+    // Limit iterations based on mesh size - smaller meshes need fewer iterations
+    let max_iterations = (20 + n / 500).min(50);
+    let convergence_threshold = 1e-4;
+
+    for iteration in 0..max_iterations {
+        let mut max_change = 0.0f64;
+
+        // Gauss-Seidel (use updated values immediately - faster convergence than Jacobi)
         for i in 0..n {
             let mut sum = rhs[i];
             let mut diagonal = 0.0;
@@ -368,29 +427,24 @@ fn solve_sparse_system(matrix: &CsMat<f64>, rhs: &[f64]) -> Vec<f64> {
 
             if diagonal.abs() > 1e-10 {
                 let candidate = sum / diagonal;
-                // Safety: Check for NaN/infinity before accepting solution
                 if candidate.is_finite() {
-                    new_solution[i] = candidate;
-                } else {
-                    log::warn!("  WARNING: Non-finite value in ASAP solve at vertex {}: sum={}, diagonal={}", i, sum, diagonal);
-                    // Keep previous value instead of accepting NaN/inf
-                    new_solution[i] = solution[i];
+                    let change = (candidate - solution[i]).abs();
+                    max_change = max_change.max(change);
+                    solution[i] = candidate;
                 }
             }
         }
 
-        solution = new_solution;
+        // Early termination if converged
+        if max_change < convergence_threshold {
+            break;
+        }
     }
 
     // Final safety check
-    let nan_count = solution.iter().filter(|&&v| !v.is_finite()).count();
-    if nan_count > 0 {
-        log::error!("  ERROR: ASAP solver produced {} non-finite values!", nan_count);
-        // Replace with zeros as last resort
-        for v in &mut solution {
-            if !v.is_finite() {
-                *v = 0.0;
-            }
+    for v in &mut solution {
+        if !v.is_finite() {
+            *v = 0.0;
         }
     }
 

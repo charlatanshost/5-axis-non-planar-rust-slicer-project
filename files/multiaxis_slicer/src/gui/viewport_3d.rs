@@ -502,7 +502,10 @@ impl Viewport3D {
         log::info!("✓ Created XYZ coordinate axes (X=red, Y=green, Z=blue)");
     }
 
-    /// Create 3D visualization of toolpaths as instanced spheres + connecting lines (much better than 2D projection for non-planar)
+    /// Create 3D visualization of ALL toolpaths as thin tube geometry
+    /// Color scheme:
+    /// - EXTRUSION moves: Gradient from GREEN (start) → YELLOW → RED (end) based on queue position
+    /// - TRAVEL moves: Bright CYAN - clearly different from extrusion colors
     fn create_toolpath_lines(&mut self, app: &SlicerApp) {
         if app.toolpaths.is_empty() {
             self.toolpath_spheres = None;
@@ -511,164 +514,86 @@ impl Viewport3D {
             return;
         }
 
-        let mut transforms = Vec::new();
-        let mut sphere_colors = Vec::new();
+        // For tube segments (proper 3D geometry)
+        let mut tube_positions: Vec<Vec3> = Vec::new();
+        let mut tube_normals: Vec<Vec3> = Vec::new();
+        let mut tube_colors: Vec<Srgba> = Vec::new();
+        let mut tube_indices: Vec<u32> = Vec::new();
 
-        // For line segments
-        let mut line_positions = Vec::new();
-        let mut line_colors = Vec::new();
-        let mut line_indices = Vec::new();
+        let tube_radius = 0.2;     // Visible tubes
+        let tube_segments = 4;     // Square cross-section for performance
 
-        let sphere_radius = 0.25; // Small spheres for toolpath points
-        let line_width = 0.15;    // Thin lines connecting points
-        let num_layers = app.toolpaths.len();
+        // Count total segments for gradient calculation
+        let total_segments: usize = app.toolpaths.iter()
+            .map(|tp| tp.paths.len().saturating_sub(1))
+            .sum();
 
-        // PERFORMANCE: For large toolpath sets (>50 layers), reduce detail to prevent GPU overload
-        let layer_step = if num_layers > 100 { 5 } else if num_layers > 50 { 3 } else { 1 };
-        let point_step = if num_layers > 100 { 5 } else if num_layers > 50 { 3 } else { 1 };
+        log::info!("Creating toolpath visualization: {} layers, {} total segments",
+            app.toolpaths.len(), total_segments);
 
-        if layer_step > 1 || point_step > 1 {
-            log::warn!("PERFORMANCE: Reducing toolpath detail - showing every {}th layer, every {}th point", layer_step, point_step);
-            log::warn!("  Total layers: {}, will show ~{} layers", num_layers, num_layers / layer_step);
-        }
+        // Track global segment index for gradient color (motion planning queue position)
+        let mut global_segment_idx = 0usize;
 
-        for (layer_idx, toolpath) in app.toolpaths.iter().enumerate() {
-            // PERFORMANCE: Skip layers if we're reducing detail
-            if layer_idx % layer_step != 0 {
-                continue;
-            }
+        // Process ALL toolpaths - no skipping!
+        for toolpath in app.toolpaths.iter() {
+            // Create tube segments connecting consecutive points
+            for window in toolpath.paths.windows(2) {
+                let p1 = vec3(window[0].position.x as f32, window[0].position.y as f32, window[0].position.z as f32);
+                let p2 = vec3(window[1].position.x as f32, window[1].position.y as f32, window[1].position.z as f32);
 
-            // Color gradient from blue (bottom) to red (top) for extrusion
-            let t = layer_idx as f32 / num_layers.max(1) as f32;
-
-            // HSL color: hue from 240° (blue) to 0° (red)
-            let hue = 240.0 * (1.0 - t);
-            let saturation = 0.9;
-            let lightness = 0.6;
-
-            // Convert HSL to RGB for extrusion moves
-            let (r, g, b) = hsl_to_rgb(hue, saturation, lightness);
-            let extrusion_color = Srgba::new((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, 255);
-
-            // Travel move color (light cyan/gray)
-            let travel_color = Srgba::new(100, 200, 220, 180);
-
-            // PERFORMANCE: Skip spheres entirely for large toolpath sets (lines are enough)
-            if num_layers <= 50 {
-                // Create sphere instance for each toolpath point
-                for (point_idx, segment) in toolpath.paths.iter().enumerate() {
-                    // Skip points if we're reducing detail
-                    if point_idx % point_step != 0 {
-                        continue;
-                    }
-
-                    let position = vec3(
-                        segment.position.x as f32,
-                        segment.position.y as f32,
-                        segment.position.z as f32,
-                    );
-
-                    // Color based on whether this is travel or extrusion
-                    let is_extrusion = segment.extrusion > 1e-6;
-                    let color = if is_extrusion { extrusion_color } else { travel_color };
-
-                    // Create transformation matrix for this sphere instance
-                    let transform = Mat4::from_translation(position) * Mat4::from_scale(sphere_radius);
-
-                    transforms.push(transform);
-                    sphere_colors.push(color);
-                }
-            }
-
-            // Create line segments connecting consecutive points
-            for (seg_idx, window) in toolpath.paths.windows(2).enumerate() {
-                // Skip segments if we're reducing detail
-                if seg_idx % point_step != 0 {
-                    continue;
-                }
-
-                let p1 = vec3(
-                    window[0].position.x as f32,
-                    window[0].position.y as f32,
-                    window[0].position.z as f32,
-                );
-                let p2 = vec3(
-                    window[1].position.x as f32,
-                    window[1].position.y as f32,
-                    window[1].position.z as f32,
-                );
-
-                // Determine if this segment is travel or extrusion
-                // Use the second point's extrusion value (where we're moving TO)
+                // Determine if this is extrusion or travel move
                 let is_extrusion = window[1].extrusion > 1e-6;
-                let line_color = if is_extrusion { extrusion_color } else { travel_color };
 
-                // Create a thin box connecting p1 and p2
-                let base_idx = line_positions.len() as u32;
+                let segment_color = if is_extrusion {
+                    // EXTRUSION: Gradient GREEN (120°) -> YELLOW (60°) -> RED (0°)
+                    // Based on position in motion planning queue
+                    let t = global_segment_idx as f32 / total_segments.max(1) as f32;
+                    let hue = 120.0 * (1.0 - t); // 120° = green, 0° = red
+                    let (r, g, b) = hsl_to_rgb(hue, 1.0, 0.5);
+                    Srgba::new((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, 255)
+                } else {
+                    // TRAVEL: Bright cyan - clearly different from extrusion gradient
+                    Srgba::new(0, 220, 255, 220)
+                };
 
-                // Simple quad representation (two triangles forming a line)
-                line_positions.push(p1);
-                line_positions.push(p2);
-                line_colors.push(line_color);
-                line_colors.push(line_color);
+                // Create tube geometry for this segment
+                create_tube_segment(
+                    p1, p2, tube_radius, tube_segments, segment_color,
+                    &mut tube_positions, &mut tube_normals, &mut tube_colors, &mut tube_indices
+                );
 
-                // We'll render these as degenerate triangles that appear as lines
-                line_indices.push(base_idx);
-                line_indices.push(base_idx + 1);
-                line_indices.push(base_idx + 1);
+                global_segment_idx += 1;
             }
         }
 
-        log::info!("Creating toolpath visualization: {} sphere instances, {} line segments",
-            transforms.len(), line_indices.len() / 3);
+        log::info!("  → {} tube vertices, {} indices", tube_positions.len(), tube_indices.len());
 
-        // CRITICAL FIX: Always update last_toolpath_count to prevent infinite loop
-        // Even if transforms is empty (due to performance skip), we still processed these toolpaths
         self.last_toolpath_count = app.toolpaths.len();
 
-        if transforms.is_empty() {
-            self.toolpath_spheres = None;
-            // Don't return yet - we still need to create lines!
-        } else {
-            // Create spheres for points
-            let sphere_cpu = CpuMesh::sphere(8); // Low poly sphere for performance
+        // No spheres - just tubes for cleaner visualization
+        self.toolpath_spheres = None;
 
-            let instances = Instances {
-                transformations: transforms,
-                colors: Some(sphere_colors),
-                ..Default::default()
-            };
-
-            let instanced_mesh = InstancedMesh::new(&self.context, &instances, &sphere_cpu);
-
-            let sphere_material = ColorMaterial {
-                color: Srgba::WHITE, // Will be modulated by instance colors
-                ..Default::default()
-            };
-
-            self.toolpath_spheres = Some(Arc::new(Gm::new(instanced_mesh, sphere_material)));
-        }
-
-        // Create lines connecting points (if we have any)
-        if line_positions.is_empty() || line_indices.is_empty() {
+        // Create tube mesh for lines
+        if tube_positions.is_empty() || tube_indices.is_empty() {
             self.toolpath_lines = None;
             return;
         }
 
-        let line_cpu_mesh = CpuMesh {
-            positions: Positions::F32(line_positions),
-            colors: Some(line_colors),
-            indices: Indices::U32(line_indices),
+        let tube_cpu_mesh = CpuMesh {
+            positions: Positions::F32(tube_positions),
+            normals: Some(tube_normals),
+            colors: Some(tube_colors),
+            indices: Indices::U32(tube_indices),
             ..Default::default()
         };
 
-        let line_gpu_mesh = Mesh::new(&self.context, &line_cpu_mesh);
+        let tube_gpu_mesh = Mesh::new(&self.context, &tube_cpu_mesh);
+        let tube_material = ColorMaterial::default();
 
-        let line_material = ColorMaterial::default(); // Uses vertex colors
+        self.toolpath_lines = Some(Arc::new(Gm::new(tube_gpu_mesh, tube_material)));
 
-        self.toolpath_lines = Some(Arc::new(Gm::new(line_gpu_mesh, line_material)));
-
-        log::info!("✓ Created 3D toolpath visualization for {} layers", num_layers);
+        log::info!("✓ Toolpath visualization: {} segments (GREEN→RED = extrusion queue, CYAN = travel)",
+            total_segments);
     }
 
     /// Render build plate grid at specified Z height by projecting to 2D screen space
@@ -875,8 +800,9 @@ impl Viewport3D {
             let context = self.context.clone();
             let mesh_arc = Arc::clone(mesh_obj);
             let build_plate_arc = self.build_plate_mesh.clone();
-            let toolpath_spheres_arc = self.toolpath_spheres.clone();
-            let toolpath_lines_arc = self.toolpath_lines.clone();
+            // Only include toolpath objects if show_toolpaths is enabled
+            let toolpath_spheres_arc = if app.show_toolpaths { self.toolpath_spheres.clone() } else { None };
+            let toolpath_lines_arc = if app.show_toolpaths { self.toolpath_lines.clone() } else { None };
             let axes_arc = self.axes_mesh.clone();
             let camera_yaw = self.camera_yaw;
             let camera_pitch = self.camera_pitch;
@@ -1431,6 +1357,82 @@ impl Viewport3D {
                 }
             }
         }
+    }
+}
+
+/// Create tube geometry for a single line segment (proper 3D instead of degenerate triangles)
+fn create_tube_segment(
+    p1: Vec3,
+    p2: Vec3,
+    radius: f32,
+    segments: u32,
+    color: Srgba,
+    positions: &mut Vec<Vec3>,
+    normals: &mut Vec<Vec3>,
+    colors: &mut Vec<Srgba>,
+    indices: &mut Vec<u32>,
+) {
+    let direction = p2 - p1;
+    let length = direction.magnitude();
+
+    // Skip zero-length segments
+    if length < 0.001 {
+        return;
+    }
+
+    let dir_normalized = direction / length;
+
+    // Find perpendicular vectors for the tube cross-section
+    let up = if dir_normalized.y.abs() < 0.9 {
+        vec3(0.0, 1.0, 0.0)
+    } else {
+        vec3(1.0, 0.0, 0.0)
+    };
+
+    let perp1 = dir_normalized.cross(up).normalize();
+    let perp2 = dir_normalized.cross(perp1).normalize();
+
+    let base_idx = positions.len() as u32;
+
+    // Create vertices for tube (ring at p1 and ring at p2)
+    for ring in 0..2 {
+        let center = if ring == 0 { p1 } else { p2 };
+
+        for i in 0..segments {
+            let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
+            let cos_a = angle.cos();
+            let sin_a = angle.sin();
+
+            let offset = perp1 * cos_a * radius + perp2 * sin_a * radius;
+            let position = center + offset;
+            let normal = (perp1 * cos_a + perp2 * sin_a).normalize();
+
+            positions.push(position);
+            normals.push(normal);
+            colors.push(color);
+        }
+    }
+
+    // Create indices for tube faces (quads made of triangles)
+    for i in 0..segments {
+        let i_next = (i + 1) % segments;
+
+        // Ring 0 vertex indices
+        let v0 = base_idx + i;
+        let v1 = base_idx + i_next;
+
+        // Ring 1 vertex indices
+        let v2 = base_idx + segments + i;
+        let v3 = base_idx + segments + i_next;
+
+        // Two triangles per quad
+        indices.push(v0);
+        indices.push(v2);
+        indices.push(v1);
+
+        indices.push(v1);
+        indices.push(v2);
+        indices.push(v3);
     }
 }
 

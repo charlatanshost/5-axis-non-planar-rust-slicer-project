@@ -198,13 +198,44 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                         });
 
                         ui.separator();
-                        ui.label(egui::RichText::new("Deformation Quality (Phase 3)").weak());
+                        ui.label(egui::RichText::new("Deformation Method").weak());
 
-                        ui.checkbox(&mut app.s3_use_asap_deformation, "Use ASAP Deformation")
-                            .on_hover_text("Enable high-quality ASAP deformation (slower but better geometry preservation)\nDisabled = Fast scale-controlled deformation");
+                        // Deformation method combo box
+                        egui::ComboBox::from_label("")
+                            .selected_text(match app.s3_deformation_method {
+                                crate::s3_slicer::DeformationMethod::TetVolumetric => "Tet Volumetric (Best)",
+                                crate::s3_slicer::DeformationMethod::VirtualScalarField => "Virtual",
+                                crate::s3_slicer::DeformationMethod::AsapDeformation => "ASAP Deformation",
+                                crate::s3_slicer::DeformationMethod::ScaleControlled => "Scale-Controlled",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut app.s3_deformation_method,
+                                    crate::s3_slicer::DeformationMethod::TetVolumetric,
+                                    "Tet Volumetric (Best)"
+                                ).on_hover_text("Full volumetric pipeline from the original S3-Slicer paper.\nUses tetrahedral mesh, per-tet ASAP deformation with scaling,\nand marching tetrahedra for layer extraction.\nMost accurate, avoids surface mesh collapse.");
 
-                        // Show ASAP settings only when enabled
-                        if app.s3_use_asap_deformation {
+                                ui.selectable_value(
+                                    &mut app.s3_deformation_method,
+                                    crate::s3_slicer::DeformationMethod::VirtualScalarField,
+                                    "Virtual"
+                                ).on_hover_text("Computes scalar field directly without mesh deformation.\nAvoids mesh collapse issues. Good for complex models.");
+
+                                ui.selectable_value(
+                                    &mut app.s3_deformation_method,
+                                    crate::s3_slicer::DeformationMethod::AsapDeformation,
+                                    "ASAP Deformation"
+                                ).on_hover_text("Full mesh deformation using ASAP solver.\n⚠ Can cause mesh collapse on complex models!");
+
+                                ui.selectable_value(
+                                    &mut app.s3_deformation_method,
+                                    crate::s3_slicer::DeformationMethod::ScaleControlled,
+                                    "Scale-Controlled"
+                                ).on_hover_text("Per-vertex local deformation. Faster but less accurate.");
+                            });
+
+                        // Show ASAP settings only when ASAP is selected
+                        if matches!(app.s3_deformation_method, crate::s3_slicer::DeformationMethod::AsapDeformation) {
                             ui.indent("asap_settings", |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label("ASAP iterations:");
@@ -220,10 +251,23 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                                         .on_hover_text("Convergence threshold (lower = more precise)");
                                 });
 
-                                ui.label(egui::RichText::new("⚠ ASAP is 10-30x slower but produces better results")
+                                ui.label(egui::RichText::new("⚠ ASAP can cause mesh collapse on complex models!")
                                     .small()
-                                    .color(egui::Color32::from_rgb(255, 200, 100)));
+                                    .color(egui::Color32::from_rgb(255, 100, 100)));
                             });
+                        }
+
+                        // Show hints for each method
+                        if matches!(app.s3_deformation_method, crate::s3_slicer::DeformationMethod::TetVolumetric) {
+                            ui.label(egui::RichText::new("✓ Tet Volumetric: Full volume mesh pipeline (original paper algorithm)")
+                                .small()
+                                .color(egui::Color32::from_rgb(100, 200, 255)));
+                        }
+
+                        if matches!(app.s3_deformation_method, crate::s3_slicer::DeformationMethod::VirtualScalarField) {
+                            ui.label(egui::RichText::new("✓ Virtual mode: No mesh deformation preview, but slicing works correctly")
+                                .small()
+                                .color(egui::Color32::from_rgb(100, 200, 100)));
                         }
                     });
 

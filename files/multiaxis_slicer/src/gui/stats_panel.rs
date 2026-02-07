@@ -5,7 +5,10 @@ use egui;
 
 pub fn render(app: &SlicerApp, ctx: &egui::Context) {
     egui::TopBottomPanel::bottom("stats_panel")
-        .default_height(150.0)
+        .resizable(true)
+        .default_height(100.0)
+        .min_height(60.0)
+        .max_height(200.0)
         .show(ctx, |ui| {
             ui.heading("Statistics & Progress");
             ui.separator();

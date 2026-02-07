@@ -144,8 +144,9 @@ pub struct SlicerApp {
     pub s3_smoothness_weight: f64,         // 0.0-1.0
     pub s3_optimization_iterations: usize, // 10-100
 
-    // ASAP deformation settings (Phase 3)
-    pub s3_use_asap_deformation: bool,     // true = ASAP (quality), false = scale-controlled (fast)
+    // Deformation method (Phase 3)
+    pub s3_deformation_method: crate::s3_slicer::DeformationMethod,
+    pub s3_use_asap_deformation: bool,     // DEPRECATED - use s3_deformation_method
     pub s3_asap_max_iterations: usize,     // 5-20
     pub s3_asap_convergence: f64,          // 1e-5 to 1e-3
 
@@ -190,7 +191,7 @@ impl Default for SlicerApp {
             show_toolpaths: true,
             show_wireframe: false,
             selected_layer: None,
-            show_gcode_terminal: true,
+            show_gcode_terminal: false,
             gcode_scroll_to_bottom: false,
             toolpath_playback_enabled: false,
             toolpath_playback_position: 0,
@@ -217,8 +218,9 @@ impl Default for SlicerApp {
             s3_smoothness_weight: 0.5,
             s3_optimization_iterations: 50,
 
-            // ASAP deformation defaults
-            s3_use_asap_deformation: false, // Default to fast mode
+            // Deformation method defaults
+            s3_deformation_method: crate::s3_slicer::DeformationMethod::TetVolumetric, // Default to tet volumetric (best quality)
+            s3_use_asap_deformation: false, // DEPRECATED
             s3_asap_max_iterations: 10,
             s3_asap_convergence: 1e-4,
 
@@ -375,8 +377,8 @@ impl SlicerApp {
         let smoothness_weight = self.s3_smoothness_weight;
         let optimization_iterations = self.s3_optimization_iterations;
 
-        // Get ASAP deformation settings
-        let use_asap_deformation = self.s3_use_asap_deformation;
+        // Get deformation method settings
+        let deformation_method = self.s3_deformation_method;
         let asap_max_iterations = self.s3_asap_max_iterations;
         let asap_convergence = self.s3_asap_convergence;
 
@@ -402,8 +404,9 @@ impl SlicerApp {
                 overhang_threshold,
                 smoothness_weight,
                 max_rotation_degrees,
-                // ASAP deformation settings
-                use_asap_deformation,
+                // Deformation method settings
+                deformation_method,
+                use_asap_deformation: matches!(deformation_method, crate::s3_slicer::DeformationMethod::AsapDeformation),
                 asap_max_iterations,
                 asap_convergence_threshold: asap_convergence,
             };
@@ -477,6 +480,87 @@ impl SlicerApp {
             }
         };
 
+        // For Virtual method, no actual deformation happens - explain this to user
+        if matches!(self.s3_deformation_method, crate::s3_slicer::DeformationMethod::VirtualScalarField) {
+            self.log("Virtual mode: Scalar field computed directly, no mesh deformation preview.".to_string());
+            self.log("Slicing will work correctly - curved layers are computed from virtual heights.".to_string());
+            self.deformed_mesh = None;
+            self.show_deformed_mesh = false;
+            return;
+        }
+
+        // For Tet Volumetric, run the tet deformation pipeline for preview
+        if matches!(self.s3_deformation_method, crate::s3_slicer::DeformationMethod::TetVolumetric) {
+            self.log("Tet Volumetric: Running volumetric deformation preview...".to_string());
+            self.is_deforming = true;
+            let mesh_clone = mesh.clone();
+            let fabrication_objective = self.s3_fabrication_objective;
+            let overhang_threshold = self.s3_overhang_threshold;
+            let smoothness_weight = self.s3_smoothness_weight;
+            let optimization_iterations = self.s3_optimization_iterations;
+            let max_rotation_degrees = self.config.max_rotation_degrees;
+            let asap_max_iterations = self.s3_asap_max_iterations;
+            let asap_convergence = self.s3_asap_convergence;
+
+            let (tx, rx) = mpsc::channel();
+            self.deformed_mesh_receiver = Some(rx);
+
+            std::thread::spawn(move || {
+                use crate::s3_slicer::{
+                    TetMesh, TetQuaternionField, TetAsapSolver, TetAsapConfig,
+                };
+
+                log::info!("=== Tet Volumetric Deformation Preview ===");
+
+                // Step 1: Tetrahedralize
+                log::info!("Step 1/3: Tetrahedralizing...");
+                let tet_mesh = match TetMesh::from_surface_mesh(&mesh_clone) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        log::error!("Tet preview failed: {}. No deformation preview available.", e);
+                        let _ = tx.send(mesh_clone);
+                        return;
+                    }
+                };
+
+                log::info!("  → {} vertices, {} tets", tet_mesh.vertices.len(), tet_mesh.tets.len());
+
+                // Step 2: Optimize tet quaternion field
+                log::info!("Step 2/3: Optimizing per-tet quaternion field...");
+                let quat_config = crate::s3_slicer::QuaternionFieldConfig {
+                    objective: fabrication_objective,
+                    build_direction: crate::geometry::Vector3D::new(0.0, 0.0, 1.0),
+                    optimization_iterations,
+                    smoothness_weight,
+                    objective_weight: 1.0,
+                    overhang_threshold,
+                    max_rotation_degrees,
+                };
+                let tet_qfield = TetQuaternionField::optimize(&tet_mesh, quat_config);
+
+                // Step 3: ASAP deformation
+                log::info!("Step 3/3: Running volumetric ASAP deformation...");
+                let tet_asap_config = TetAsapConfig {
+                    max_iterations: asap_max_iterations,
+                    convergence_threshold: asap_convergence,
+                    quaternion_weight: 0.3,
+                    constraint_weight: 500.0,
+                    allow_scaling: true,
+                };
+
+                let solver = TetAsapSolver::new(tet_mesh, tet_qfield, tet_asap_config);
+                let deformed_tet = solver.solve();
+
+                // Convert deformed tet surface to Mesh for preview
+                let deformed_surface = deformed_tet.to_surface_mesh();
+                log::info!("  → Deformed surface: {} triangles", deformed_surface.triangles.len());
+                log::info!("✓ Tet volumetric deformation preview complete");
+
+                let _ = tx.send(deformed_surface);
+            });
+            return;
+        }
+
         self.log("Deforming mesh using S3-Slicer algorithm...".to_string());
         self.is_deforming = true;
         let fabrication_objective = self.s3_fabrication_objective;
@@ -484,6 +568,9 @@ impl SlicerApp {
         let smoothness_weight = self.s3_smoothness_weight;
         let optimization_iterations = self.s3_optimization_iterations;
         let max_rotation_degrees = self.config.max_rotation_degrees;
+        let deformation_method = self.s3_deformation_method;
+        let asap_max_iterations = self.s3_asap_max_iterations;
+        let asap_convergence = self.s3_asap_convergence;
 
         // Create channel for sending deformed mesh back to main thread
         let (tx, rx) = mpsc::channel();
@@ -509,9 +596,35 @@ impl SlicerApp {
             log::info!("  → Quaternion field energy: {:.4}", quaternion_field.energy);
 
             // Step 2: Deform mesh using quaternion field
-            log::info!("Step 2/2: Deforming mesh...");
-            let deformation = S3SlicerDeformation::new(mesh.clone(), quaternion_field);
-            let deformed = deformation.get_deformed_mesh().clone();
+            let deformed = match deformation_method {
+                crate::s3_slicer::DeformationMethod::AsapDeformation => {
+                    log::info!("Step 2/2: Deforming mesh using ASAP (global)...");
+                    use crate::s3_slicer::{AsapSolver, AsapConfig};
+
+                    let asap_config = AsapConfig {
+                        max_iterations: asap_max_iterations,
+                        convergence_threshold: asap_convergence,
+                        quaternion_weight: 0.3,  // Match slicing pipeline
+                        constraint_weight: 500.0,  // Match slicing pipeline
+                        use_cotangent_weights: true,
+                    };
+
+                    let solver = AsapSolver::new(mesh.clone(), quaternion_field, asap_config);
+                    solver.solve()
+                }
+                crate::s3_slicer::DeformationMethod::ScaleControlled => {
+                    log::info!("Step 2/2: Deforming mesh using scale-controlled (local)...");
+                    let deformation = S3SlicerDeformation::new(mesh.clone(), quaternion_field);
+                    deformation.get_deformed_mesh().clone()
+                }
+                crate::s3_slicer::DeformationMethod::VirtualScalarField |
+                crate::s3_slicer::DeformationMethod::TetVolumetric => {
+                    // These shouldn't happen (handled above), but just in case
+                    log::info!("Step 2/2: No surface mesh deformation for this method");
+                    mesh.clone()
+                }
+            };
+
             log::info!("  → Deformed mesh: {} triangles", deformed.triangles.len());
             log::info!("✓ Mesh deformation complete");
 
@@ -527,7 +640,25 @@ impl SlicerApp {
             return;
         }
 
-        self.log(format!("Generating {} toolpaths...", self.toolpath_pattern.name()));
+        // Debug: Log layer info
+        let total_contours: usize = self.layers.iter().map(|l| l.contours.len()).sum();
+        let total_points: usize = self.layers.iter()
+            .flat_map(|l| l.contours.iter())
+            .map(|c| c.points.len())
+            .sum();
+        log::info!("generate_toolpaths: {} layers, {} contours, {} total points",
+            self.layers.len(), total_contours, total_points);
+
+        // Debug: Log first few layers
+        for (i, layer) in self.layers.iter().enumerate().take(3) {
+            log::info!("  Layer {}: z={:.2}, {} contours, {} points",
+                i, layer.z,
+                layer.contours.len(),
+                layer.contours.iter().map(|c| c.points.len()).sum::<usize>());
+        }
+
+        self.log(format!("Generating {} toolpaths from {} layers ({} contours)...",
+            self.toolpath_pattern.name(), self.layers.len(), total_contours));
 
         use crate::toolpath_patterns::ToolpathConfig;
         let pattern_config = ToolpathConfig {
@@ -680,6 +811,8 @@ impl SlicerApp {
 
         let gcode_gen = GCodeGenerator::new();
         self.gcode_lines = gcode_gen.generate_to_string(&self.toolpaths);
+        self.show_gcode_terminal = true;
+        self.gcode_scroll_to_bottom = true;
         self.log(format!("✓ Generated {} lines of G-code", self.gcode_lines.len()));
     }
 
@@ -867,10 +1000,12 @@ impl eframe::App for SlicerApp {
         }
 
         // Render UI panels
+        // NOTE: In egui, all Side/Top/Bottom panels must be added BEFORE CentralPanel.
+        // CentralPanel takes whatever space remains after other panels are allocated.
         self.render_control_panel(ctx);
+        self.render_stats_panel(ctx);
         self.render_gcode_terminal(ctx);
         self.render_central_panel(ctx);
-        self.render_stats_panel(ctx);
     }
 
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
@@ -891,8 +1026,9 @@ impl SlicerApp {
 
         egui::TopBottomPanel::bottom("gcode_terminal")
             .resizable(true)
-            .min_height(100.0)
-            .max_height(600.0)
+            .default_height(150.0)
+            .min_height(80.0)
+            .max_height(300.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("G-code Output");

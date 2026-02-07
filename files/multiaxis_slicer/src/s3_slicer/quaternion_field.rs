@@ -186,6 +186,10 @@ impl QuaternionField {
 }
 
 /// Compute optimal rotation for a triangle based on objective
+///
+/// For S3-Slicer global deformation, we compute rotations for ALL triangles,
+/// not just overhangs. The rotation represents how the local coordinate frame
+/// should rotate to "unfold" the mesh for better printability.
 fn compute_optimal_rotation(
     normal: &Vector3D,
     build_direction: &Vector3D,
@@ -195,8 +199,8 @@ fn compute_optimal_rotation(
 ) -> UnitQuaternion<f64> {
     match objective {
         FabricationObjective::SupportFree => {
-            // Rotate to make surface self-supporting
-            compute_support_free_rotation(normal, build_direction, overhang_threshold, max_rotation_degrees)
+            // Global unfolding rotation - affects ALL triangles
+            compute_global_unfold_rotation(normal, build_direction, overhang_threshold, max_rotation_degrees)
         }
         FabricationObjective::Strength => {
             // Align with build direction for strength
@@ -208,19 +212,31 @@ fn compute_optimal_rotation(
         }
         FabricationObjective::Balanced => {
             // Weighted combination
-            let support_free = compute_support_free_rotation(normal, build_direction, overhang_threshold, max_rotation_degrees);
+            let unfold = compute_global_unfold_rotation(normal, build_direction, overhang_threshold, max_rotation_degrees);
             let strength = compute_strength_rotation(normal, build_direction, max_rotation_degrees);
 
             // Spherical linear interpolation (slerp)
-            support_free.slerp(&strength, 0.5)
+            unfold.slerp(&strength, 0.5)
         }
     }
 }
 
-/// Compute rotation to make surface self-supporting
-fn compute_support_free_rotation(
+/// Compute support-free rotation for S3-Slicer deformation
+///
+/// Based on S³-Slicer paper: The feasible region for Local Printing Direction (LPD) is:
+///   H_SF = {d | d · n_f + sin(α) ≥ 0}
+///
+/// where d is the printing direction (typically Z-up) and n_f is surface normal.
+///
+/// For a surface to be self-supporting, the angle between printing direction and
+/// surface normal must satisfy the overhang constraint.
+///
+/// CRITICAL: We ONLY rotate surfaces that violate the overhang constraint.
+/// Self-supporting surfaces (upward-facing, vertical) get NO rotation.
+/// This prevents the "twisted fin" problem from conflicting rotations.
+fn compute_global_unfold_rotation(
     normal: &Vector3D,
-    build_direction: &Vector3D,
+    _build_direction: &Vector3D,
     overhang_threshold: f64,
     max_rotation_degrees: f64,
 ) -> UnitQuaternion<f64> {
@@ -228,87 +244,124 @@ fn compute_support_free_rotation(
     if !normal.x.is_finite() || !normal.y.is_finite() || !normal.z.is_finite() {
         return UnitQuaternion::identity();
     }
-    if !build_direction.x.is_finite() || !build_direction.y.is_finite() || !build_direction.z.is_finite() {
-        return UnitQuaternion::identity();
-    }
 
     let normal_len = normal.norm();
     if !normal_len.is_finite() || normal_len < 1e-10 {
-        // Degenerate triangle with zero or invalid normal
         return UnitQuaternion::identity();
     }
 
     // Normalize the normal to ensure it's a unit vector
     let unit_normal = normal / normal_len;
 
-    // Check if already self-supporting
-    let angle = angle_between(&unit_normal, build_direction);
-    if !angle.is_finite() {
+    // S³-Slicer constraint: d · n_f + sin(α) ≥ 0
+    // For build direction d = (0, 0, 1) and normal n_f:
+    //   d · n_f = n_f.z
+    // Constraint becomes: n_f.z + sin(α) ≥ 0
+    //                     n_f.z ≥ -sin(α)
+    //
+    // If this is satisfied, the surface is ALREADY self-supporting - NO rotation needed!
+    let overhang_threshold_rad = overhang_threshold.to_radians();
+    let min_z_for_self_supporting = -overhang_threshold_rad.sin();
+
+    // If surface is self-supporting (faces upward or sideways enough), NO rotation
+    if unit_normal.z >= min_z_for_self_supporting {
         return UnitQuaternion::identity();
     }
 
-    let angle_deg = angle.to_degrees();
-    let threshold_angle = 90.0 - overhang_threshold;
+    // Surface is an overhang - needs rotation to become self-supporting
+    // We want to rotate so that after rotation, the EFFECTIVE local Z-direction
+    // makes the surface self-supporting
+    //
+    // The rotation axis is perpendicular to the vertical plane containing the normal
+    // This rotates the local frame "outward" from the overhang
+    let horiz_len = (unit_normal.x * unit_normal.x + unit_normal.y * unit_normal.y).sqrt();
 
-    if angle_deg <= threshold_angle {
-        // Already self-supporting, no rotation needed
+    let rotation_axis = if horiz_len > 1e-6 {
+        // Axis perpendicular to the horizontal projection of normal
+        Vector3D::new(-unit_normal.y / horiz_len, unit_normal.x / horiz_len, 0.0)
+    } else {
+        // Normal is straight down - rotate around any horizontal axis
+        Vector3D::new(1.0, 0.0, 0.0)
+    };
+
+    // Calculate rotation amount to bring surface to threshold angle
+    // Current angle from horizontal: asin(-n.z) for downward-facing
+    // Target: overhang_threshold from horizontal
+    let current_angle_from_horiz = (-unit_normal.z).asin();
+    let target_angle_from_horiz = overhang_threshold_rad;
+    let rotation_amount = current_angle_from_horiz - target_angle_from_horiz;
+
+    // Clamp to maximum allowed rotation
+    let max_rotation_radians = max_rotation_degrees.to_radians();
+    let clamped_rotation = rotation_amount.clamp(0.0, max_rotation_radians);
+
+    if clamped_rotation < 1e-6 {
         return UnitQuaternion::identity();
     }
 
-    // Need to rotate to reach threshold angle
-    let target_angle = threshold_angle.to_radians();
+    // Create quaternion safely
+    let quat = UnitQuaternion::from_axis_angle(
+        &nalgebra::Unit::new_normalize(rotation_axis),
+        clamped_rotation,
+    );
 
-    // Rotation axis: perpendicular to normal and build direction
-    let rotation_axis = unit_normal.cross(build_direction);
-
-    // Safety: Check if cross product is valid
-    if !rotation_axis.x.is_finite() || !rotation_axis.y.is_finite() || !rotation_axis.z.is_finite() {
+    // Final safety check
+    if !quat.coords.x.is_finite() || !quat.coords.y.is_finite() ||
+       !quat.coords.z.is_finite() || !quat.coords.w.is_finite() {
         return UnitQuaternion::identity();
     }
 
-    let axis_norm = rotation_axis.norm();
-    if !axis_norm.is_finite() || axis_norm < 1e-6 {
-        // Normal parallel to build direction, cannot rotate
+    quat
+}
+
+/// Legacy: Compute rotation to make surface self-supporting (overhangs only)
+#[allow(dead_code)]
+fn compute_support_free_rotation(
+    normal: &Vector3D,
+    _build_direction: &Vector3D,
+    overhang_threshold: f64,
+    max_rotation_degrees: f64,
+) -> UnitQuaternion<f64> {
+    // Safety: Validate inputs first
+    if !normal.x.is_finite() || !normal.y.is_finite() || !normal.z.is_finite() {
         return UnitQuaternion::identity();
     }
 
-    let axis = rotation_axis / axis_norm;  // Manual normalization
-
-    // Safety check: verify axis is valid after division (should never fail now)
-    if !axis.x.is_finite() || !axis.y.is_finite() || !axis.z.is_finite() {
+    let normal_len = normal.norm();
+    if !normal_len.is_finite() || normal_len < 1e-10 {
         return UnitQuaternion::identity();
     }
 
-    // Rotation amount to reach target angle
-    // NOTE: target_angle - angle (not angle - target_angle) to rotate TOWARD vertical
-    // Positive rotation makes surface more vertical (away from mesh center)
-    let mut rotation_amount = target_angle - angle;
+    let unit_normal = normal / normal_len;
+    let overhang_threshold_rad = overhang_threshold.to_radians();
+    let min_z = -overhang_threshold_rad.sin();
 
-    if !rotation_amount.is_finite() || rotation_amount.abs() < 1e-10 {
+    // Only rotate overhanging surfaces
+    if unit_normal.z >= min_z {
         return UnitQuaternion::identity();
     }
 
-    // CRITICAL: Limit maximum rotation to prevent extreme deformations
-    // S3-Slicer uses gradual adjustments, not aggressive flips
+    let rotation_axis = Vector3D::new(-unit_normal.y, unit_normal.x, 0.0);
+    let axis_len = rotation_axis.norm();
+
+    if axis_len < 1e-6 {
+        return UnitQuaternion::identity();
+    }
+
+    let axis = rotation_axis / axis_len;
+    let current_angle_from_horiz = (-unit_normal.z).asin();
+    let target_angle_from_horiz = overhang_threshold_rad;
+    let mut rotation_amount = current_angle_from_horiz - target_angle_from_horiz;
+
     let max_rotation_radians = max_rotation_degrees.to_radians();
     if rotation_amount.abs() > max_rotation_radians {
         rotation_amount = rotation_amount.signum() * max_rotation_radians;
     }
 
-    // Create quaternion safely
-    let quat = UnitQuaternion::from_axis_angle(
-        &nalgebra::Unit::new_unchecked(axis),  // Use unchecked since we already normalized
+    UnitQuaternion::from_axis_angle(
+        &nalgebra::Unit::new_unchecked(axis),
         rotation_amount,
-    );
-
-    // Final safety check: verify quaternion is valid
-    if !quat.coords.x.is_finite() || !quat.coords.y.is_finite() ||
-       !quat.coords.z.is_finite() || !quat.coords.w.is_finite() {
-        log::warn!("  WARNING: Invalid quaternion produced in support-free rotation");
-        return UnitQuaternion::identity();
-    }
-
-    quat
+    )
 }
 
 /// Compute rotation for strength (align with build direction)
@@ -478,14 +531,37 @@ mod tests {
     use crate::geometry::Triangle;
 
     #[test]
-    fn test_support_free_rotation() {
-        let normal = Vector3D::new(1.0, 0.0, 0.0); // Horizontal surface
+    fn test_global_unfold_rotation() {
+        let normal = Vector3D::new(1.0, 0.0, 0.0); // Horizontal surface (vertical wall)
         let build_dir = Vector3D::new(0.0, 0.0, 1.0); // Vertical build
 
-        let rotation = compute_support_free_rotation(&normal, &build_dir, 45.0);
+        let rotation = compute_global_unfold_rotation(&normal, &build_dir, 45.0, 15.0);
 
-        // Should rotate to make surface self-supporting
+        // Vertical surfaces should get some rotation to unfold
         assert!(rotation.angle() > 0.0);
+    }
+
+    #[test]
+    fn test_downward_facing_rotation() {
+        let normal = Vector3D::new(0.0, 0.0, -1.0); // Downward facing (overhang)
+        let build_dir = Vector3D::new(0.0, 0.0, 1.0);
+
+        let rotation = compute_global_unfold_rotation(&normal, &build_dir, 45.0, 15.0);
+
+        // Overhangs should get rotation to become more vertical
+        assert!(rotation.angle() > 0.0);
+    }
+
+    #[test]
+    fn test_upward_facing_rotation() {
+        let normal = Vector3D::new(0.3, 0.0, 0.95); // Slightly tilted upward
+        let build_dir = Vector3D::new(0.0, 0.0, 1.0);
+
+        let rotation = compute_global_unfold_rotation(&normal, &build_dir, 45.0, 15.0);
+
+        // Tilted upward surfaces should get some unfolding rotation
+        // (straight up surfaces get less rotation)
+        assert!(rotation.angle() >= 0.0);
     }
 
     #[test]

@@ -32,21 +32,29 @@ pub struct S3SlicerDeformation {
 
 impl S3SlicerDeformation {
     /// Create deformation system from mesh and quaternion field
-    /// This computes VIRTUAL deformation - a scalar field representing virtual heights
+    ///
+    /// S3-Slicer Workflow:
+    /// 1. Forward deformation: Apply quaternion field to create deformed mesh
+    /// 2. Inverse deformation: Map deformed heights back to original mesh as scalar field
+    /// 3. Slicing uses the scalar field on the ORIGINAL mesh
     pub fn new(mesh: Mesh, quaternion_field: QuaternionField) -> Self {
-        log::info!("Computing virtual deformation (S3-Slicer)...");
+        log::info!("Computing S3-Slicer virtual deformation...");
 
-        // Compute virtual height field (scalar field) WITHOUT physically deforming the mesh
-        let scalar_field = compute_virtual_height_field(&mesh, &quaternion_field);
-
-        // Create a preview mesh for visualization only (not used in slicing)
+        // Step 1: Forward deformation - create physically deformed mesh
+        log::info!("  Step 1/2: Forward deformation (applying quaternion field)...");
         let deformed_mesh_preview = create_deformed_preview(&mesh, &quaternion_field);
 
-        log::info!("Virtual deformation complete:");
+        // Step 2: Inverse deformation - extract scalar field from deformed heights
+        log::info!("  Step 2/2: Inverse deformation (mapping heights back)...");
+        let scalar_field = compute_scalar_from_deformed(&mesh, &deformed_mesh_preview);
+
+        let min_scalar = scalar_field.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_scalar = scalar_field.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+        log::info!("S3-Slicer deformation complete:");
         log::info!("  Scalar field size: {} triangles", scalar_field.len());
-        log::info!("  Height range: {:.2} to {:.2}",
-            scalar_field.iter().copied().fold(f64::INFINITY, f64::min),
-            scalar_field.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+        log::info!("  Virtual height range: {:.2} to {:.2} mm", min_scalar, max_scalar);
+        log::info!("  Slicing will use this scalar field on the ORIGINAL mesh");
 
         Self {
             original_mesh: mesh,
@@ -94,63 +102,79 @@ impl S3SlicerDeformation {
     }
 }
 
-/// Compute scalar field for slicing using Heat Method for geodesic distances
-/// This is the KEY improvement - using proper geodesic distances instead of simple Z-heights
+/// Compute scalar field using INVERSE DEFORMATION
+///
+/// S3-Slicer workflow:
+/// 1. Forward deformation: Original mesh → Deformed mesh (using quaternion field)
+/// 2. Get Z-heights in deformed space
+/// 3. INVERSE MAP: Assign those heights back to original mesh triangles
+///
+/// The scalar field represents "virtual heights" - the Z-coordinate each point
+/// WOULD have if the mesh were physically deformed. Slicing the original mesh
+/// with constant scalar values produces curved layers.
 fn compute_virtual_height_field(
     mesh: &Mesh,
-    _quaternion_field: &QuaternionField,
+    quaternion_field: &QuaternionField,
 ) -> Vec<f64> {
-    log::info!("Computing scalar field for S3-Slicer:");
-    log::info!("  Using Heat Method for geodesic distances");
+    log::info!("Computing scalar field via INVERSE DEFORMATION:");
 
-    // Find bottom vertices as sources (lowest Z values)
-    let min_z = mesh.triangles.iter()
-        .flat_map(|t| [t.v0.z, t.v1.z, t.v2.z])
-        .fold(f64::INFINITY, f64::min);
+    // Step 1: Create deformed mesh (forward deformation)
+    log::info!("  Step 1: Forward deformation...");
+    let deformed_mesh = create_deformed_preview(mesh, quaternion_field);
 
-    // Build vertex list to find source indices
-    let mut vertex_list = Vec::new();
-    let mut vertex_map = HashMap::new();
+    // Step 2: Get Z-heights from deformed mesh for each triangle
+    log::info!("  Step 2: Extracting heights from deformed space...");
+    let mut scalar_values: Vec<f64> = Vec::with_capacity(mesh.triangles.len());
 
-    for triangle in &mesh.triangles {
-        for &vertex in &[triangle.v0, triangle.v1, triangle.v2] {
-            let hash = hash_point(&vertex);
-            vertex_map.entry(hash).or_insert_with(|| {
-                let idx = vertex_list.len();
-                vertex_list.push(vertex);
-                idx
-            });
-        }
+    // For each triangle, get its centroid Z in the deformed mesh
+    // This IS the inverse mapping - we're getting deformed heights for original triangles
+    for deformed_tri in &deformed_mesh.triangles {
+        // Average Z of the deformed triangle vertices
+        let avg_z = (deformed_tri.v0.z + deformed_tri.v1.z + deformed_tri.v2.z) / 3.0;
+        scalar_values.push(avg_z);
     }
 
-    // Find vertices near the bottom (within 1mm of minimum Z)
-    let mut sources = Vec::new();
-    for (idx, vertex) in vertex_list.iter().enumerate() {
-        if (vertex.z - min_z).abs() < 1.0 {
-            sources.push(idx);
-        }
+    // Normalize to start from 0
+    let min_z = scalar_values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_z = scalar_values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+    for value in &mut scalar_values {
+        *value -= min_z;
     }
 
-    log::info!("  Found {} source vertices at bottom (Z={:.2})", sources.len(), min_z);
+    log::info!("  Step 3: Inverse mapping complete");
+    log::info!("  Virtual height range: {:.2} to {:.2} mm", 0.0, max_z - min_z);
+    log::info!("  This scalar field encodes DEFORMED heights on ORIGINAL mesh");
 
-    // Configure and run heat method
-    use crate::s3_slicer::heat_method::{compute_geodesic_distances, HeatMethodConfig};
+    scalar_values
+}
 
-    let config = HeatMethodConfig {
-        time_step: 0.0, // Auto-compute from mean edge length
-        sources,
-        use_implicit: true,
-        smoothing_iterations: 3,
-    };
+/// Compute scalar field from an already-deformed mesh (inverse mapping step)
+///
+/// This is the INVERSE DEFORMATION step:
+/// - Takes the Z-coordinates from the deformed mesh
+/// - Maps them back to the original mesh triangles
+/// - The result is a scalar field on the original mesh representing "virtual heights"
+fn compute_scalar_from_deformed(
+    _original_mesh: &Mesh,
+    deformed_mesh: &Mesh,
+) -> Vec<f64> {
+    let mut scalar_values: Vec<f64> = Vec::with_capacity(deformed_mesh.triangles.len());
 
-    let result = compute_geodesic_distances(mesh, config);
+    // For each triangle, get its centroid Z in the deformed mesh
+    for deformed_tri in &deformed_mesh.triangles {
+        let avg_z = (deformed_tri.v0.z + deformed_tri.v1.z + deformed_tri.v2.z) / 3.0;
+        scalar_values.push(avg_z);
+    }
 
-    log::info!("  Geodesic distance range: {:.2} to {:.2} mm",
-        result.min_distance,
-        result.max_distance);
+    // Normalize to start from 0
+    let min_z = scalar_values.iter().copied().fold(f64::INFINITY, f64::min);
 
-    // Return per-triangle scalar values
-    result.triangle_scalars
+    for value in &mut scalar_values {
+        *value -= min_z;
+    }
+
+    scalar_values
 }
 
 /// Create a properly deformed mesh using scale-controlled deformation
@@ -214,24 +238,49 @@ fn build_vertex_triangle_map(mesh: &Mesh) -> HashMap<u64, Vec<usize>> {
 }
 
 /// Compute target positions for vertices based on quaternion field
-/// Each vertex's target is computed from the average rotation of its adjacent triangles
+///
+/// S3-Slicer deformation strategy (from the paper):
+/// 1. FIXED BOTTOM: Vertices at bottom boundary don't move
+/// 2. PROGRESSIVE DEFORMATION: Higher vertices move more
+/// 3. STRETCH UPWARD: Deformation "unfolds" overhangs by stretching up
+///
+/// This makes overhanging surfaces more vertical (wall-like) by
+/// pulling the mesh upward while keeping the bottom fixed.
 fn compute_vertex_target_positions(
     mesh: &Mesh,
     quaternion_field: &QuaternionField,
     vertex_map: &HashMap<u64, Vec<usize>>,
 ) -> HashMap<u64, Point3D> {
-    let mesh_center = Point3D::new(
-        (mesh.bounds_min.x + mesh.bounds_max.x) / 2.0,
-        (mesh.bounds_min.y + mesh.bounds_max.y) / 2.0,
-        (mesh.bounds_min.z + mesh.bounds_max.z) / 2.0,
-    );
+    let min_z = mesh.bounds_min.z;
+    let max_z = mesh.bounds_max.z;
+    let height_range = max_z - min_z;
+
+    // Bottom anchor point (fixed during deformation)
+    let anchor_x = (mesh.bounds_min.x + mesh.bounds_max.x) / 2.0;
+    let anchor_y = (mesh.bounds_min.y + mesh.bounds_max.y) / 2.0;
+    let anchor = Point3D::new(anchor_x, anchor_y, min_z);
+
+    // Fixed boundary threshold (vertices within this Z range from bottom are fixed)
+    let fixed_threshold = 2.0; // mm
 
     vertex_map
         .par_iter()
         .map(|(vertex_hash, triangle_indices)| {
             // Get original vertex position
             let original_pos = get_vertex_from_triangle(mesh, triangle_indices[0], *vertex_hash)
-                .unwrap_or(mesh_center);
+                .unwrap_or(anchor);
+
+            // Height parameter: 0 at bottom, 1 at top
+            let height_param = if height_range > 0.0 {
+                ((original_pos.z - min_z) / height_range).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+
+            // FIXED BOTTOM: Vertices near bottom don't move
+            if original_pos.z - min_z < fixed_threshold {
+                return (*vertex_hash, original_pos);
+            }
 
             // Compute average quaternion from all adjacent triangles
             let quaternions: Vec<UnitQuaternion<f64>> = triangle_indices
@@ -239,8 +288,8 @@ fn compute_vertex_target_positions(
                 .filter_map(|&tri_idx| quaternion_field.rotation_at(tri_idx))
                 .copied()
                 .filter(|q| {
-                    // Safety: filter out any quaternions with NaN components
-                    q.coords.x.is_finite() && q.coords.y.is_finite() && q.coords.z.is_finite() && q.coords.w.is_finite()
+                    q.coords.x.is_finite() && q.coords.y.is_finite() &&
+                    q.coords.z.is_finite() && q.coords.w.is_finite()
                 })
                 .collect();
 
@@ -250,10 +299,15 @@ fn compute_vertex_target_positions(
                 average_quaternions(&quaternions)
             };
 
-            // Apply rotation around mesh center to get target position
-            let relative = original_pos - mesh_center;
-            let rotated = avg_quaternion * relative;
-            let target_pos = Point3D::from(rotated) + mesh_center.coords;
+            // PROGRESSIVE DEFORMATION: Apply rotation scaled by height
+            // Higher vertices get more deformation, creating the "stretch" effect
+            let scaled_quaternion = UnitQuaternion::identity().slerp(&avg_quaternion, height_param);
+
+            // Apply rotation around the BOTTOM anchor point (not mesh center!)
+            // This creates the upward stretch with fixed bottom
+            let relative = original_pos - anchor;
+            let rotated = scaled_quaternion * relative;
+            let target_pos = Point3D::from(rotated) + anchor.coords;
 
             // Safety check: if target position has NaN, use original position
             let safe_target = if target_pos.x.is_finite() && target_pos.y.is_finite() && target_pos.z.is_finite() {
