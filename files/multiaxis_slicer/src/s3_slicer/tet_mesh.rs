@@ -186,7 +186,7 @@ impl TetMesh {
     /// complex geometry. Tries increasingly coarse grids until TetGen succeeds.
     #[cfg(feature = "tetgen")]
     pub fn from_surface_mesh(surface_mesh: &Mesh) -> Result<Self, String> {
-        use crate::s3_slicer::voxel_remesh::{voxel_remesh, auto_grid_resolution};
+        use crate::s3_slicer::voxel_remesh::{voxel_remesh_indexed, auto_grid_resolution};
 
         log::info!("Tetrahedralizing surface mesh with TetGen...");
         log::info!("  Surface triangles: {}", surface_mesh.triangles.len());
@@ -207,24 +207,28 @@ impl TetMesh {
 
         // ── Strategy 2: Voxel reconstruction (primary approach) ─────────
         // Converts mesh to SDF on regular grid, then extracts a clean
-        // manifold surface via Surface Nets. Guarantees no self-intersections
-        // regardless of input mesh quality. Fast (~2-5 seconds).
+        // manifold surface via Marching Cubes. Uses indexed output to bypass
+        // hash_point vertex merging which can break MC topology.
         log::info!("  Attempting voxel reconstruction before TetGen...");
         let base_res = auto_grid_resolution(surface_mesh);
         for &res in &[base_res, (base_res * 3 / 4).max(32), (base_res / 2).max(32)] {
             log::info!("  Voxel remesh (resolution: {})...", res);
-            let voxel_mesh = voxel_remesh(surface_mesh, res);
+            let (vertices, faces) = voxel_remesh_indexed(surface_mesh, res);
 
-            if voxel_mesh.triangles.len() < 4 {
-                log::warn!("  Voxel mesh too small ({} tris), trying next resolution",
-                    voxel_mesh.triangles.len());
+            if faces.len() < 4 {
+                log::warn!("  Voxel mesh too small ({} faces), trying next resolution",
+                    faces.len());
                 continue;
             }
 
-            log::info!("  Voxel reconstructed: {} → {} triangles",
-                surface_mesh.triangles.len(), voxel_mesh.triangles.len());
+            log::info!("  Voxel reconstructed: {} → {} faces ({} vertices)",
+                surface_mesh.triangles.len(), faces.len(), vertices.len());
 
-            match Self::run_tetgen(&voxel_mesh) {
+            // Compute volume for quality constraints
+            let extent = surface_mesh.bounds_max - surface_mesh.bounds_min;
+            let mesh_volume = extent.x * extent.y * extent.z;
+
+            match Self::run_tetgen_indexed(&vertices, &faces, Some(mesh_volume / 5000.0), Some(15.0)) {
                 Ok(mesh) => {
                     log::info!("  TetGen succeeded on voxel mesh (resolution {})", res);
                     return Ok(mesh);
@@ -296,6 +300,102 @@ impl TetMesh {
         Self::run_tetgen_opts(surface_mesh, Some(mesh_volume / 5000.0), Some(15.0))
     }
 
+    /// Run TetGen from pre-indexed vertices and faces (bypasses hash_point).
+    /// Use this for Marching Cubes output where vertices are already properly shared.
+    #[cfg(feature = "tetgen")]
+    fn run_tetgen_indexed(
+        vertices: &[Point3D],
+        facets: &[[usize; 3]],
+        max_tet_volume: Option<f64>,
+        min_angle: Option<f64>,
+    ) -> Result<Self, String> {
+        let npoint = vertices.len();
+        let nfacet = facets.len();
+        log::info!("  Indexed input: {} vertices, {} facets (no hash_point)", npoint, nfacet);
+
+        if npoint < 4 || nfacet < 4 {
+            return Err("Too few vertices/facets for tetrahedralization".to_string());
+        }
+
+        let facet_npoint: Vec<usize> = vec![3; nfacet];
+
+        let mut tetgen = tritet::Tetgen::new(
+            npoint,
+            Some(facet_npoint),
+            None,
+            None,
+        ).map_err(|e| format!("TetGen init error: {}", e))?;
+
+        for (i, v) in vertices.iter().enumerate() {
+            tetgen.set_point(i, 0, v.x, v.y, v.z)
+                .map_err(|e| format!("TetGen set_point error: {}", e))?;
+        }
+
+        for (fi, face) in facets.iter().enumerate() {
+            for (m, &pidx) in face.iter().enumerate() {
+                tetgen.set_facet_point(fi, m, pidx)
+                    .map_err(|e| format!("TetGen set_facet_point error: {}", e))?;
+            }
+        }
+
+        log::info!("  Generating tet mesh (max_vol={}, min_angle={})...",
+            max_tet_volume.map_or("none".to_string(), |v| format!("{:.4}", v)),
+            min_angle.map_or("none".to_string(), |a| format!("{:.1}", a)));
+
+        tetgen.generate_mesh(
+            false,
+            false,
+            max_tet_volume,
+            min_angle,
+        ).map_err(|e| format!("TetGen generate_mesh error: {}", e))?;
+
+        let out_npoint = tetgen.out_npoint();
+        let out_ncell = tetgen.out_ncell();
+        let cell_npoint = tetgen.out_cell_npoint();
+
+        log::info!("  TetGen output: {} vertices, {} tetrahedra ({} nodes/tet)",
+            out_npoint, out_ncell, cell_npoint);
+
+        if cell_npoint != 4 {
+            return Err(format!("Expected 4 nodes per tet, got {}", cell_npoint));
+        }
+
+        if out_ncell == 0 {
+            return Err("TetGen produced 0 tetrahedra (mesh may have self-intersecting facets)".to_string());
+        }
+
+        let mut out_vertices = Vec::with_capacity(out_npoint);
+        for i in 0..out_npoint {
+            out_vertices.push(Point3D::new(
+                tetgen.out_point(i, 0),
+                tetgen.out_point(i, 1),
+                tetgen.out_point(i, 2),
+            ));
+        }
+
+        let mut out_tets = Vec::with_capacity(out_ncell);
+        for i in 0..out_ncell {
+            out_tets.push(Tetrahedron::new(
+                tetgen.out_cell_point(i, 0),
+                tetgen.out_cell_point(i, 1),
+                tetgen.out_cell_point(i, 2),
+                tetgen.out_cell_point(i, 3),
+            ));
+        }
+
+        let mesh = Self::new(out_vertices, out_tets);
+
+        let quality = mesh.check_quality();
+        log::info!("  Tet mesh quality:");
+        log::info!("    Vertices: {}", quality.num_vertices);
+        log::info!("    Tetrahedra: {}", quality.num_tets);
+        log::info!("    Surface triangles: {}", quality.num_surface_triangles);
+        log::info!("    Volume range: {:.6} to {:.6}", quality.min_tet_volume, quality.max_tet_volume);
+        log::info!("    Degenerate tets: {}", quality.degenerate_tets);
+
+        Ok(mesh)
+    }
+
     /// Run TetGen with explicit quality options.
     /// Pass None for max_tet_volume and min_angle to skip quality refinement
     /// (pure constrained Delaunay, safer for edge-case geometry like convex hulls).
@@ -328,6 +428,20 @@ impl TetMesh {
             {
                 facets.push(face_indices);
             }
+        }
+
+        // Remove duplicate faces (same sorted vertex triple after deduplication)
+        let before_dedup = facets.len();
+        {
+            let mut seen = std::collections::HashSet::new();
+            facets.retain(|f| {
+                let mut key = *f;
+                key.sort();
+                seen.insert(key)
+            });
+        }
+        if facets.len() < before_dedup {
+            log::info!("  Removed {} duplicate facets", before_dedup - facets.len());
         }
 
         let npoint = vertices.len();

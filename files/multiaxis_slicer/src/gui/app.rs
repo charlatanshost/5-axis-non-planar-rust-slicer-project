@@ -7,7 +7,7 @@ use crate::gcode::GCodeGenerator;
 use crate::gui::{viewport_3d::Viewport3D, theme};
 use crate::support_generation::{SupportGenerator, SupportResult, OverhangConfig};
 use crate::s3_slicer::{
-    execute_s3_pipeline, S3PipelineConfig, FabricationObjective,
+    execute_s3_pipeline, execute_s4_pipeline, S3PipelineConfig, FabricationObjective,
     quaternion_field::{QuaternionField, QuaternionFieldConfig},
     deformation_v2::S3SlicerDeformation,
 };
@@ -72,6 +72,8 @@ pub enum SlicingMode {
     Planar,
     /// Curved layer slicing (S3-Slicer)
     Curved,
+    /// S4 non-planar slicing (Deform → Slice → Un-Deform)
+    S4,
 }
 
 /// Main application state
@@ -150,6 +152,14 @@ pub struct SlicerApp {
     pub s3_asap_max_iterations: usize,     // 5-20
     pub s3_asap_convergence: f64,          // 1e-5 to 1e-3
 
+    // S4-Slicer configuration (separate from S3)
+    pub s4_overhang_threshold: f64,        // degrees (30-60)
+    pub s4_max_rotation_degrees: f64,      // degrees (5-45)
+    pub s4_smoothing_iterations: usize,    // 5-50
+    pub s4_smoothness_weight: f64,         // 0.0-1.0
+    pub s4_asap_max_iterations: usize,     // 3-20
+    pub s4_asap_convergence: f64,          // 1e-5 to 1e-3
+
     // Face orientation mode
     pub face_orientation_mode: bool,       // Whether we're in "select face to orient" mode
     pub selected_face_index: Option<usize>, // Index of the selected triangle
@@ -223,6 +233,14 @@ impl Default for SlicerApp {
             s3_use_asap_deformation: false, // DEPRECATED
             s3_asap_max_iterations: 10,
             s3_asap_convergence: 1e-4,
+
+            // S4-Slicer defaults
+            s4_overhang_threshold: 45.0,
+            s4_max_rotation_degrees: 15.0,
+            s4_smoothing_iterations: 25,
+            s4_smoothness_weight: 0.5,
+            s4_asap_max_iterations: 10,
+            s4_asap_convergence: 1e-4,
 
             // Face orientation defaults
             face_orientation_mode: false,
@@ -312,6 +330,10 @@ impl SlicerApp {
             SlicingMode::Curved => {
                 self.log("Starting curved layer slicing (S3-Slicer)...".to_string());
                 self.start_curved_slicing();
+            }
+            SlicingMode::S4 => {
+                self.log("Starting S4 non-planar slicing (Deform + Slice + Un-Deform)...".to_string());
+                self.start_s4_slicing();
             }
         }
     }
@@ -470,6 +492,96 @@ impl SlicerApp {
         });
     }
 
+    /// Start S4 non-planar slicing (Deform → Slice → Un-Deform)
+    fn start_s4_slicing(&mut self) {
+        let mesh = self.mesh.clone().unwrap();
+        let layer_height = self.config.layer_height;
+        let progress = self.slicing_progress.clone();
+
+        // Get S4-specific configuration
+        let overhang_threshold = self.s4_overhang_threshold;
+        let max_rotation_degrees = self.s4_max_rotation_degrees;
+        let smoothing_iterations = self.s4_smoothing_iterations;
+        let smoothness_weight = self.s4_smoothness_weight;
+        let asap_max_iterations = self.s4_asap_max_iterations;
+        let asap_convergence = self.s4_asap_convergence;
+
+        let (tx, rx) = mpsc::channel();
+        self.layers_receiver = Some(rx);
+
+        std::thread::spawn(move || {
+            {
+                let mut p = progress.lock().unwrap();
+                p.operation = "S4 Non-Planar Slicing".to_string();
+                p.percentage = 5.0;
+                p.message = "Initializing S4 pipeline...".to_string();
+            }
+
+            // S4 pipeline config
+            let pipeline_config = S3PipelineConfig {
+                objective: FabricationObjective::SupportFree,
+                layer_height,
+                optimization_iterations: smoothing_iterations * 2, // maps to S4 smoothing iterations
+                overhang_threshold,
+                smoothness_weight,
+                max_rotation_degrees,
+                deformation_method: crate::s3_slicer::DeformationMethod::S4Deform,
+                use_asap_deformation: false,
+                asap_max_iterations,
+                asap_convergence_threshold: asap_convergence,
+            };
+
+            {
+                let mut p = progress.lock().unwrap();
+                p.percentage = 10.0;
+                p.message = "Running S4 pipeline (Deform + Slice + Un-Deform)...".to_string();
+            }
+
+            // Call S4 pipeline directly (not through execute_s3_pipeline)
+            let result = std::panic::catch_unwind(|| {
+                execute_s4_pipeline(mesh, pipeline_config)
+            });
+
+            match result {
+                Ok(pipeline_result) => {
+                    {
+                        let mut p = progress.lock().unwrap();
+                        p.percentage = 90.0;
+                        p.message = "Finalizing layers...".to_string();
+                    }
+
+                    let layers = pipeline_result.layers;
+                    let layer_count = layers.len();
+
+                    log::info!("S4 pipeline completed with {} layers", layer_count);
+
+                    if let Err(e) = tx.send(layers) {
+                        log::error!("Failed to send layers to main thread: {:?}", e);
+                        let mut p = progress.lock().unwrap();
+                        p.operation = "Error".to_string();
+                        p.message = "Failed to send layers to main thread".to_string();
+                        return;
+                    }
+
+                    {
+                        let mut p = progress.lock().unwrap();
+                        p.operation = "Complete".to_string();
+                        p.percentage = 100.0;
+                        p.layers_completed = layer_count;
+                        p.total_layers = layer_count;
+                        p.message = format!("Generated {} curved layers (S4 Non-Planar)", layer_count);
+                    }
+                }
+                Err(e) => {
+                    log::error!("S4 pipeline panicked: {:?}", e);
+                    let mut p = progress.lock().unwrap();
+                    p.operation = "Error".to_string();
+                    p.message = "S4 pipeline failed (panic)".to_string();
+                }
+            }
+        });
+    }
+
     /// Deform mesh using S3-Slicer algorithm (for preview before slicing)
     pub fn deform_mesh_preview(&mut self) {
         let mesh = match &self.mesh {
@@ -486,6 +598,81 @@ impl SlicerApp {
             self.log("Slicing will work correctly - curved layers are computed from virtual heights.".to_string());
             self.deformed_mesh = None;
             self.show_deformed_mesh = false;
+            return;
+        }
+
+        // For S4 mode or S4Deform method, run the S4-style deformation pipeline for preview
+        let is_s4 = self.slicing_mode == SlicingMode::S4
+            || matches!(self.s3_deformation_method, crate::s3_slicer::DeformationMethod::S4Deform);
+        if is_s4 {
+            self.log("S4: Running Dijkstra-based deformation preview...".to_string());
+            self.is_deforming = true;
+            let mesh_clone = mesh.clone();
+            // Use S4-specific config when in S4 mode, fall back to S3 config for legacy S4Deform
+            let (overhang_threshold, smoothness_weight, optimization_iterations,
+                 max_rotation_degrees, asap_max_iterations, asap_convergence) =
+                if self.slicing_mode == SlicingMode::S4 {
+                    (self.s4_overhang_threshold, self.s4_smoothness_weight,
+                     self.s4_smoothing_iterations * 2, self.s4_max_rotation_degrees,
+                     self.s4_asap_max_iterations, self.s4_asap_convergence)
+                } else {
+                    (self.s3_overhang_threshold, self.s3_smoothness_weight,
+                     self.s3_optimization_iterations, self.config.max_rotation_degrees,
+                     self.s3_asap_max_iterations, self.s3_asap_convergence)
+                };
+
+            let (tx, rx) = mpsc::channel();
+            self.deformed_mesh_receiver = Some(rx);
+
+            std::thread::spawn(move || {
+                use crate::s3_slicer::TetMesh;
+                use crate::s3_slicer::tet_dijkstra_field::TetDijkstraField;
+                use crate::s3_slicer::s4_rotation_field::{S4RotationField, S4RotationConfig};
+                use crate::s3_slicer::pipeline::deform_tet_mesh_direct;
+
+                log::info!("=== S4 Deform Preview ===");
+
+                // Step 1: Tetrahedralize
+                log::info!("Step 1/4: Tetrahedralizing...");
+                let tet_mesh = match TetMesh::from_surface_mesh(&mesh_clone) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        log::error!("S4 preview failed: {}. No deformation preview available.", e);
+                        let _ = tx.send(mesh_clone);
+                        return;
+                    }
+                };
+                log::info!("  → {} vertices, {} tets", tet_mesh.vertices.len(), tet_mesh.tets.len());
+
+                // Step 2: Dijkstra field
+                log::info!("Step 2/4: Computing Dijkstra field...");
+                let dijkstra_field = TetDijkstraField::compute(&tet_mesh);
+
+                // Step 3: S4 rotation field
+                log::info!("Step 3/4: Computing S4 rotation field...");
+                let s4_config = S4RotationConfig {
+                    build_direction: crate::geometry::Vector3D::new(0.0, 0.0, 1.0),
+                    overhang_threshold,
+                    max_rotation_degrees,
+                    smoothing_iterations: optimization_iterations / 2,
+                    smoothness_weight,
+                };
+                let rotation_field = S4RotationField::compute(&tet_mesh, &dijkstra_field, &s4_config);
+
+                // Step 4: Direct vertex rotation deformation
+                log::info!("Step 4/4: Applying direct vertex rotation...");
+                let deformed_tet = deform_tet_mesh_direct(&tet_mesh, &rotation_field.rotations);
+
+                let quality = deformed_tet.check_quality();
+                log::info!("  → Inverted: {}, degenerate: {}",
+                    quality.inverted_tets, quality.degenerate_tets);
+
+                let deformed_surface = deformed_tet.to_surface_mesh();
+                log::info!("  → Deformed surface: {} triangles", deformed_surface.triangles.len());
+                log::info!("S4 deformation preview complete");
+
+                let _ = tx.send(deformed_surface);
+            });
             return;
         }
 
@@ -618,7 +805,8 @@ impl SlicerApp {
                     deformation.get_deformed_mesh().clone()
                 }
                 crate::s3_slicer::DeformationMethod::VirtualScalarField |
-                crate::s3_slicer::DeformationMethod::TetVolumetric => {
+                crate::s3_slicer::DeformationMethod::TetVolumetric |
+                crate::s3_slicer::DeformationMethod::S4Deform => {
                     // These shouldn't happen (handled above), but just in case
                     log::info!("Step 2/2: No surface mesh deformation for this method");
                     mesh.clone()
@@ -939,11 +1127,10 @@ impl eframe::App for SlicerApp {
                 self.log("💡 Tip: Use the toggle button to switch between original and deformed views".to_string());
                 self.deformed_mesh_receiver = None; // Clear the receiver
 
-                // Update viewport to show deformed mesh
+                // Viewport will pick up the deformed mesh on next render frame
+                // (via show_deformed_mesh flag in viewport_3d render logic)
                 if let Some(viewport) = &mut self.viewport_3d {
-                    if let Some(ref deformed) = self.deformed_mesh {
-                        viewport.set_mesh(deformed);
-                    }
+                    viewport.clear_mesh(); // Force reload on next frame
                 }
             }
         }

@@ -141,20 +141,82 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                     egui::ComboBox::from_id_salt("slicing_mode")
                         .selected_text(match app.slicing_mode {
                             crate::gui::app::SlicingMode::Planar => "Planar (Traditional)",
-                            crate::gui::app::SlicingMode::Curved => "Curved (S3-Slicer)",
+                            crate::gui::app::SlicingMode::S4 => "S4 Non-Planar",
+                            crate::gui::app::SlicingMode::Curved => "S3 Curved Layer",
                         })
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::Planar, "Planar (Traditional)");
-                            ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::Curved, "Curved (S3-Slicer)");
+                            ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::Planar, "Planar (Traditional)")
+                                .on_hover_text("Standard planar slicing — flat layers at constant Z height");
+                            ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::S4, "S4 Non-Planar")
+                                .on_hover_text("S4-style: Deform mesh → Planar slice → Un-deform toolpaths.\nSimpler approach, uses Dijkstra distance field for rotation direction.");
+                            ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::Curved, "S3 Curved Layer")
+                                .on_hover_text("S3-Slicer: Quaternion field optimization → Deformation → Curved layers.\nMore complex, multiple deformation methods available.");
                         });
                 });
 
                 ui.add_space(5.0);
 
-                // S3-Slicer Configuration (only shown in Curved mode)
+                // S4 Configuration (only shown in S4 mode)
+                if app.slicing_mode == crate::gui::app::SlicingMode::S4 {
+                    ui.collapsing("S4 Non-Planar Configuration", |ui| {
+                        ui.label(egui::RichText::new("Pipeline: Deform → Slice → Un-Deform").weak());
+                        ui.add_space(3.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label("Overhang threshold:");
+                            ui.add(egui::Slider::new(&mut app.s4_overhang_threshold, 30.0..=60.0)
+                                .suffix("°"))
+                                .on_hover_text("Surface faces steeper than this angle get rotated to reduce overhangs");
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Max rotation:");
+                            ui.add(egui::Slider::new(&mut app.s4_max_rotation_degrees, 5.0..=45.0)
+                                .suffix("°")
+                                .step_by(1.0))
+                                .on_hover_text("Maximum rotation per tet to fix overhangs.\nLower = gentler deformation, Higher = more aggressive.");
+                        });
+
+                        ui.separator();
+                        ui.label(egui::RichText::new("Smoothing").weak());
+
+                        ui.horizontal(|ui| {
+                            ui.label("Smoothing iterations:");
+                            ui.add(egui::Slider::new(&mut app.s4_smoothing_iterations, 5..=50))
+                                .on_hover_text("SLERP smoothing passes over the rotation field.\nMore = smoother transitions between tets (25 recommended).");
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Smoothness weight:");
+                            ui.add(egui::Slider::new(&mut app.s4_smoothness_weight, 0.0..=1.0))
+                                .on_hover_text("How much to blend with neighbors per iteration.\n0.0 = no smoothing, 1.0 = heavy smoothing.");
+                        });
+
+                        ui.separator();
+                        ui.label(egui::RichText::new("ASAP Deformation").weak());
+
+                        ui.horizontal(|ui| {
+                            ui.label("ASAP iterations:");
+                            ui.add(egui::Slider::new(&mut app.s4_asap_max_iterations, 3..=20))
+                                .on_hover_text("Iterations for the As-Rigid-As-Possible deformation solver.\nMore = better shape preservation (10 recommended).");
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Convergence:");
+                            ui.add(egui::Slider::new(&mut app.s4_asap_convergence, 1e-5..=1e-3)
+                                .logarithmic(true)
+                                .custom_formatter(|n, _| format!("{:.1e}", n)))
+                                .on_hover_text("ASAP solver convergence threshold (lower = more precise)");
+                        });
+                    });
+
+                    ui.add_space(5.0);
+                }
+
+                // S3-Slicer Configuration (only shown in Curved/S3 mode)
                 if app.slicing_mode == crate::gui::app::SlicingMode::Curved {
-                    ui.collapsing("S3-Slicer Configuration", |ui| {
-                        ui.label(egui::RichText::new("Deformation Parameters").weak());
+                    ui.collapsing("S3 Curved Layer Configuration", |ui| {
+                        ui.label(egui::RichText::new("Quaternion Field Parameters").weak());
 
                         ui.horizontal(|ui| {
                             ui.label("Objective:");
@@ -200,20 +262,21 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                         ui.separator();
                         ui.label(egui::RichText::new("Deformation Method").weak());
 
-                        // Deformation method combo box
+                        // Deformation method combo box (S4Deform removed - use S4 mode instead)
                         egui::ComboBox::from_label("")
                             .selected_text(match app.s3_deformation_method {
                                 crate::s3_slicer::DeformationMethod::TetVolumetric => "Tet Volumetric (Best)",
                                 crate::s3_slicer::DeformationMethod::VirtualScalarField => "Virtual",
                                 crate::s3_slicer::DeformationMethod::AsapDeformation => "ASAP Deformation",
                                 crate::s3_slicer::DeformationMethod::ScaleControlled => "Scale-Controlled",
+                                crate::s3_slicer::DeformationMethod::S4Deform => "S4 (use S4 mode)",
                             })
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(
                                     &mut app.s3_deformation_method,
                                     crate::s3_slicer::DeformationMethod::TetVolumetric,
                                     "Tet Volumetric (Best)"
-                                ).on_hover_text("Full volumetric pipeline from the original S3-Slicer paper.\nUses tetrahedral mesh, per-tet ASAP deformation with scaling,\nand marching tetrahedra for layer extraction.\nMost accurate, avoids surface mesh collapse.");
+                                ).on_hover_text("Full volumetric pipeline from the original S3-Slicer paper.\nUses tetrahedral mesh, per-tet ASAP deformation with scaling,\nand marching tetrahedra for layer extraction.");
 
                                 ui.selectable_value(
                                     &mut app.s3_deformation_method,
@@ -259,13 +322,13 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
 
                         // Show hints for each method
                         if matches!(app.s3_deformation_method, crate::s3_slicer::DeformationMethod::TetVolumetric) {
-                            ui.label(egui::RichText::new("✓ Tet Volumetric: Full volume mesh pipeline (original paper algorithm)")
+                            ui.label(egui::RichText::new("Tet Volumetric: Full volume mesh pipeline (original paper algorithm)")
                                 .small()
                                 .color(egui::Color32::from_rgb(100, 200, 255)));
                         }
 
                         if matches!(app.s3_deformation_method, crate::s3_slicer::DeformationMethod::VirtualScalarField) {
-                            ui.label(egui::RichText::new("✓ Virtual mode: No mesh deformation preview, but slicing works correctly")
+                            ui.label(egui::RichText::new("Virtual mode: No mesh deformation preview, but slicing works correctly")
                                 .small()
                                 .color(egui::Color32::from_rgb(100, 200, 100)));
                         }
@@ -294,7 +357,7 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
 
                 ui.checkbox(&mut app.config.adaptive, "Adaptive slicing");
 
-                // S3-Slicer specific parameter (only shown/used in Curved mode)
+                // S3-Slicer specific parameter (only shown/used in S3 Curved mode — S4 has its own)
                 if app.slicing_mode == crate::gui::app::SlicingMode::Curved {
                     ui.horizontal(|ui| {
                         ui.label("Max rotation:");
@@ -475,20 +538,38 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                 ui.separator();
 
                 let can_slice = app.mesh.is_some() && !app.is_slicing;
-                let can_deform = app.mesh.is_some() && !app.is_deforming && app.slicing_mode == crate::gui::app::SlicingMode::Curved;
+                let is_nonplanar = app.slicing_mode == crate::gui::app::SlicingMode::Curved
+                    || app.slicing_mode == crate::gui::app::SlicingMode::S4;
+                let can_deform = app.mesh.is_some() && !app.is_deforming && is_nonplanar;
 
-                // Compute S3-Slicer quaternion field (only for Curved mode)
-                if app.slicing_mode == crate::gui::app::SlicingMode::Curved {
-                    if ui.add_enabled(can_deform, egui::Button::new("🧮 Compute Quaternion Field").min_size(egui::vec2(ui.available_width(), 30.0))).clicked() {
+                // Deformation preview (for S3 Curved and S4 modes)
+                if is_nonplanar {
+                    let button_label = if app.slicing_mode == crate::gui::app::SlicingMode::S4 {
+                        "🔄 Preview Deformation (S4)"
+                    } else {
+                        "🧮 Compute Quaternion Field"
+                    };
+
+                    if ui.add_enabled(can_deform, egui::Button::new(button_label).min_size(egui::vec2(ui.available_width(), 30.0))).clicked() {
                         app.deform_mesh_preview();
                     }
 
                     if app.is_deforming {
-                        ui.label(egui::RichText::new("⏳ Computing quaternion field...").italics());
+                        let msg = if app.slicing_mode == crate::gui::app::SlicingMode::S4 {
+                            "⏳ Running S4 deformation preview..."
+                        } else {
+                            "⏳ Computing quaternion field..."
+                        };
+                        ui.label(egui::RichText::new(msg).italics());
                     }
 
                     if app.deformed_mesh.is_some() {
-                        ui.label(egui::RichText::new("✓ Quaternion field ready").color(egui::Color32::from_rgb(100, 200, 100)));
+                        let msg = if app.slicing_mode == crate::gui::app::SlicingMode::S4 {
+                            "✓ S4 deformation preview ready"
+                        } else {
+                            "✓ Quaternion field ready"
+                        };
+                        ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(100, 200, 100)));
                     }
 
                     ui.add_space(5.0);

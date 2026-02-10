@@ -90,6 +90,21 @@ impl S3SlicerDeformation {
         Some(*scalar_value)
     }
 
+    /// Create a lightweight placeholder deformation (no computation).
+    /// Used by the S4 pipeline which has its own deformation approach.
+    pub fn placeholder(mesh: Mesh, quaternion_field: QuaternionField) -> Self {
+        let scalar_field: Vec<f64> = mesh.triangles.iter()
+            .map(|tri| (tri.v0.z + tri.v1.z + tri.v2.z) / 3.0 - mesh.bounds_min.z)
+            .collect();
+        let deformed_mesh_preview = mesh.clone();
+        Self {
+            original_mesh: mesh,
+            deformed_mesh_preview,
+            quaternion_field,
+            scalar_field,
+        }
+    }
+
     /// Get the deformed mesh PREVIEW for visualization only
     /// WARNING: This should NOT be used for slicing! Use get_original_mesh() for slicing.
     pub fn get_deformed_mesh(&self) -> &Mesh {

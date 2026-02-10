@@ -714,11 +714,18 @@ impl Viewport3D {
         }
 
         // Update mesh if it changed
-        if let Some(mesh) = &app.mesh {
+        // When showing deformed mesh, display that instead of the original
+        let display_mesh = if app.show_deformed_mesh {
+            app.deformed_mesh.as_ref().or(app.mesh.as_ref())
+        } else {
+            app.mesh.as_ref()
+        };
+        if let Some(mesh) = display_mesh {
             if self.mesh_bounds.is_none() || mesh.triangles.len() != self.last_mesh_triangle_count {
-                log::info!("Reloading mesh to viewport (bounds_none={}, count_changed={})",
+                log::info!("Reloading mesh to viewport (bounds_none={}, count_changed={}, deformed={})",
                     self.mesh_bounds.is_none(),
-                    mesh.triangles.len() != self.last_mesh_triangle_count);
+                    mesh.triangles.len() != self.last_mesh_triangle_count,
+                    app.show_deformed_mesh && app.deformed_mesh.is_some());
                 self.set_mesh(mesh);
             }
         } else {

@@ -50,7 +50,12 @@
       "WebFetch(domain:hackaday.com)",
       "WebFetch(domain:dl.acm.org)",
       "WebFetch(domain:tetgen.pyvista.org)",
-      "Bash(del:*)"
+      "Bash(del:*)",
+      "WebFetch(domain:en.wikipedia.org)",
+      "WebFetch(domain:kilian.ac)",
+      "WebFetch(domain:grok.com)",
+      "Bash(\"c:/Users/danie/Documents/Non-planar slicer project/parse_nb.ps1\" << 'ENDSCRIPT'\n$raw = Get-Content \"c:\\\\Users\\\\danie\\\\Documents\\\\Non-planar slicer project\\\\s4_notebook.ipynb\" -Raw\n$nb = $raw | ConvertFrom-Json\n$cellNum = 0\nforeach\\($cell in $nb.cells\\) {\n    $cellNum++\n    $type = $cell.cell_type\n    Write-Host \"===== CELL $cellNum [$type] =====\"\n    foreach\\($line in $cell.source\\) {\n        Write-Host $line -NoNewline\n    }\n    Write-Host \"\"\n    Write-Host \"\"\n}\nENDSCRIPT)",
+      "Bash(CARGO_TARGET_DIR=C:/temp/multiaxis-slicer-target cargo build:*)"
     ]
   }
 }

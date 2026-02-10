@@ -6,7 +6,7 @@ High-performance 5-axis non-planar slicer written in Rust, featuring curved-laye
 
 - **S3-Slicer curved-layer pipeline** - Full implementation of the "S3-Slicer: A General Slicing Framework for Multi-Axis 3D Printing" paper
 - **Tetrahedral volumetric deformation** - Per-tetrahedron ASAP (As-Similar-As-Possible) deformation with scaling, matching the original paper's approach
-- **Voxel-based mesh reconstruction** - SDF + Surface Nets preprocessing that guarantees clean, manifold input for TetGen, even from self-intersecting STL files
+- **Voxel-based mesh reconstruction** - SDF + Marching Cubes preprocessing that guarantees clean, manifold input for TetGen, even from self-intersecting STL files
 - **Interactive GUI** - egui-based application with 3D viewport, real-time mesh preview, and parameter controls
 - **Fast mesh slicing** - O(n log k + k + m) algorithm from optimal slicing paper
 - **Centroidal axis computation** - 100x faster than medial axis
@@ -52,7 +52,7 @@ The core of this project is a full implementation of the S3-Slicer algorithm for
 
 The full volumetric pipeline from the original paper:
 
-1. **Mesh preprocessing** - Voxel reconstruction (SDF + Surface Nets) produces a clean, manifold surface from potentially self-intersecting STL files
+1. **Mesh preprocessing** - Voxel reconstruction (SDF + Marching Cubes) produces a clean, manifold surface from potentially self-intersecting STL files
 2. **Tetrahedralization** - TetGen (via `tritet` crate) generates a constrained Delaunay tet mesh
 3. **Quaternion field optimization** - Per-tetrahedron rotation field optimized for fabrication objectives (support-free, strength, etc.)
 4. **Volumetric ASAP deformation** - Per-tet As-Similar-As-Possible deformation with scaling via SVD of deformation gradients
@@ -86,7 +86,7 @@ multiaxis_slicer/
 │   │
 │   ├── s3_slicer/                # S3-Slicer curved-layer pipeline
 │   │   ├── pipeline.rs           # Main pipeline orchestration
-│   │   ├── voxel_remesh.rs       # SDF + Surface Nets mesh reconstruction
+│   │   ├── voxel_remesh.rs       # SDF + Marching Cubes mesh reconstruction
 │   │   ├── tet_mesh.rs           # TetMesh struct, TetGen integration
 │   │   ├── tet_quaternion_field.rs  # Per-tet quaternion field optimization
 │   │   ├── tet_asap_deformation.rs  # Volumetric ASAP with per-tet scaling
