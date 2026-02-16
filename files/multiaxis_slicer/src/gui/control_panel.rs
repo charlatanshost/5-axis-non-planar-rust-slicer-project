@@ -142,15 +142,21 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                         .selected_text(match app.slicing_mode {
                             crate::gui::app::SlicingMode::Planar => "Planar (Traditional)",
                             crate::gui::app::SlicingMode::S4 => "S4 Non-Planar",
+                            crate::gui::app::SlicingMode::Conical => "Conical (RotBot)",
                             crate::gui::app::SlicingMode::Curved => "S3 Curved Layer",
+                            crate::gui::app::SlicingMode::Geodesic => "Geodesic (Heat Method)",
                         })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::Planar, "Planar (Traditional)")
                                 .on_hover_text("Standard planar slicing — flat layers at constant Z height");
+                            ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::Conical, "Conical (RotBot)")
+                                .on_hover_text("Conical slicing: Shift Z by r*tan(angle) → Planar slice → Reverse shift.\nSimple & fast, great for radially symmetric overhangs.");
                             ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::S4, "S4 Non-Planar")
                                 .on_hover_text("S4-style: Deform mesh → Planar slice → Un-deform toolpaths.\nSimpler approach, uses Dijkstra distance field for rotation direction.");
                             ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::Curved, "S3 Curved Layer")
                                 .on_hover_text("S3-Slicer: Quaternion field optimization → Deformation → Curved layers.\nMore complex, multiple deformation methods available.");
+                            ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::Geodesic, "Geodesic (Heat Method)")
+                                .on_hover_text("Geodesic slicing: layers follow surface curvature via Heat Method distance field.\nLayers are equidistant along the mesh surface, not through air.");
                         });
                 });
 
@@ -207,6 +213,112 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                                 .logarithmic(true)
                                 .custom_formatter(|n, _| format!("{:.1e}", n)))
                                 .on_hover_text("ASAP solver convergence threshold (lower = more precise)");
+                        });
+                    });
+
+                    ui.add_space(5.0);
+                }
+
+                // Conical Configuration (only shown in Conical mode)
+                if app.slicing_mode == crate::gui::app::SlicingMode::Conical {
+                    ui.collapsing("Conical Slicing Configuration", |ui| {
+                        ui.label(egui::RichText::new("Pipeline: Z-shift → Planar slice → Reverse shift").weak());
+                        ui.add_space(3.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label("Cone angle:");
+                            ui.add(egui::Slider::new(&mut app.conical_angle_degrees, 5.0..=60.0)
+                                .suffix("°")
+                                .step_by(1.0))
+                                .on_hover_text("Half-angle of the slicing cone.\n45° is most common. Lower = gentler cones, higher = steeper.");
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Direction:");
+                            use crate::conical::ConicalDirection;
+                            egui::ComboBox::from_id_salt("conical_direction")
+                                .selected_text(match app.conical_direction {
+                                    ConicalDirection::Outward => "Outward",
+                                    ConicalDirection::Inward => "Inward",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut app.conical_direction, ConicalDirection::Outward, "Outward")
+                                        .on_hover_text("Layers cone outward — outer regions pushed down.\nBest for overhangs radiating away from center.");
+                                    ui.selectable_value(&mut app.conical_direction, ConicalDirection::Inward, "Inward")
+                                        .on_hover_text("Layers cone inward — outer regions pushed up.\nBest for central peaks or spires.");
+                                });
+                        });
+
+                        ui.separator();
+                        ui.label(egui::RichText::new("Cone Center").weak());
+
+                        ui.checkbox(&mut app.conical_auto_center, "Auto-center on mesh")
+                            .on_hover_text("Automatically use the mesh centroid as cone center");
+
+                        if !app.conical_auto_center {
+                            ui.horizontal(|ui| {
+                                ui.label("Center X:");
+                                ui.add(egui::DragValue::new(&mut app.conical_center_x).speed(0.5).suffix(" mm"));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Center Y:");
+                                ui.add(egui::DragValue::new(&mut app.conical_center_y).speed(0.5).suffix(" mm"));
+                            });
+                        }
+                    });
+
+                    ui.add_space(5.0);
+                }
+
+                // Geodesic Configuration (only shown in Geodesic mode)
+                if app.slicing_mode == crate::gui::app::SlicingMode::Geodesic {
+                    ui.collapsing("Geodesic Slicing Configuration", |ui| {
+                        ui.label(egui::RichText::new("Pipeline: Heat Method → Distance Field → Level Sets").weak());
+                        ui.add_space(3.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label("Source mode:");
+                            egui::ComboBox::from_id_salt("geodesic_source")
+                                .selected_text(if app.geodesic_source_mode == 0 { "Bottom Boundary" } else { "Point Source" })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut app.geodesic_source_mode, 0, "Bottom Boundary")
+                                        .on_hover_text("Layers grow from the bottom of the mesh, conforming to surface curvature.");
+                                    ui.selectable_value(&mut app.geodesic_source_mode, 1, "Point Source")
+                                        .on_hover_text("Layers radiate outward from a specified point on the mesh.");
+                                });
+                        });
+
+                        if app.geodesic_source_mode == 0 {
+                            ui.horizontal(|ui| {
+                                ui.label("Bottom tolerance:");
+                                ui.add(egui::Slider::new(&mut app.geodesic_bottom_tolerance, 0.1..=5.0)
+                                    .suffix(" mm")
+                                    .step_by(0.1))
+                                    .on_hover_text("Z tolerance for detecting bottom boundary vertices.\nLarger = more source vertices at the base.");
+                            });
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label("Source X:");
+                                ui.add(egui::DragValue::new(&mut app.geodesic_source_point[0]).speed(0.5).suffix(" mm"));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Source Y:");
+                                ui.add(egui::DragValue::new(&mut app.geodesic_source_point[1]).speed(0.5).suffix(" mm"));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Source Z:");
+                                ui.add(egui::DragValue::new(&mut app.geodesic_source_point[2]).speed(0.5).suffix(" mm"));
+                            });
+                        }
+
+                        ui.separator();
+                        ui.label(egui::RichText::new("Advanced").weak());
+
+                        ui.horizontal(|ui| {
+                            ui.label("Heat timestep:");
+                            ui.add(egui::Slider::new(&mut app.geodesic_heat_factor, 0.1..=10.0)
+                                .step_by(0.1))
+                                .on_hover_text("Multiplier on avg_edge_length² for heat diffusion timestep.\n1.0 is default. Larger = smoother but less accurate distances.");
                         });
                     });
 
@@ -409,12 +521,43 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                         .suffix(" mm"));
                 });
 
-                if app.toolpath_pattern == crate::toolpath_patterns::ToolpathPattern::Zigzag {
+                // Wall loops (shown for Contour pattern)
+                if app.toolpath_pattern == crate::toolpath_patterns::ToolpathPattern::Contour {
                     ui.horizontal(|ui| {
-                        ui.label("Infill density:");
-                        ui.add(egui::Slider::new(&mut app.toolpath_infill_density, 0.0..=1.0)
-                            .suffix("%")
-                            .custom_formatter(|v, _| format!("{:.0}", v * 100.0)));
+                        ui.label("Wall loops:");
+                        let mut wall_count_f = app.wall_count as f64;
+                        if ui.add(egui::Slider::new(&mut wall_count_f, 1.0..=10.0)
+                            .step_by(1.0))
+                            .changed() {
+                            app.wall_count = wall_count_f as usize;
+                        }
+                    });
+                }
+
+                // Infill density (always visible)
+                ui.horizontal(|ui| {
+                    ui.label("Infill density:");
+                    ui.add(egui::Slider::new(&mut app.toolpath_infill_density, 0.0..=1.0)
+                        .suffix("%")
+                        .custom_formatter(|v, _| format!("{:.0}", v * 100.0)))
+                        .on_hover_text("0% = no infill (hollow), 100% = solid fill");
+                });
+
+                // Infill pattern selector (shown when Contour pattern and density > 0)
+                if app.toolpath_pattern == crate::toolpath_patterns::ToolpathPattern::Contour
+                    && app.toolpath_infill_density > 0.01
+                {
+                    ui.horizontal(|ui| {
+                        ui.label("Infill pattern:");
+                        use crate::toolpath_patterns::InfillPattern;
+                        egui::ComboBox::from_id_salt("infill_pattern")
+                            .selected_text(match app.infill_pattern {
+                                InfillPattern::Rectilinear => "Rectilinear",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut app.infill_pattern, InfillPattern::Rectilinear, "Rectilinear")
+                                    .on_hover_text("Alternating-direction horizontal lines");
+                            });
                     });
                 }
 
@@ -538,12 +681,12 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                 ui.separator();
 
                 let can_slice = app.mesh.is_some() && !app.is_slicing;
-                let is_nonplanar = app.slicing_mode == crate::gui::app::SlicingMode::Curved
+                let needs_deform_preview = app.slicing_mode == crate::gui::app::SlicingMode::Curved
                     || app.slicing_mode == crate::gui::app::SlicingMode::S4;
-                let can_deform = app.mesh.is_some() && !app.is_deforming && is_nonplanar;
+                let can_deform = app.mesh.is_some() && !app.is_deforming && needs_deform_preview;
 
-                // Deformation preview (for S3 Curved and S4 modes)
-                if is_nonplanar {
+                // Deformation preview (for S3 Curved and S4 modes only — Conical doesn't need it)
+                if needs_deform_preview {
                     let button_label = if app.slicing_mode == crate::gui::app::SlicingMode::S4 {
                         "🔄 Preview Deformation (S4)"
                     } else {

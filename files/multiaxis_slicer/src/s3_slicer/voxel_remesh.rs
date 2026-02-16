@@ -28,12 +28,22 @@ pub fn voxel_remesh(mesh: &Mesh, grid_res: usize) -> Mesh {
 
 /// Like `voxel_remesh` but returns indexed data (vertices + face indices).
 /// This avoids lossy vertex deduplication when passing to TetGen.
+/// Includes post-processing cleanup to fix issues that cause TetGen to reject:
+/// - Merges vertices closer than 5% of cell_size (fixes TetGen status=4 "small feature")
+/// - Removes degenerate and duplicate faces (fixes TetGen status=3 "duplicate facets")
+/// - Removes very small triangles
 pub fn voxel_remesh_indexed(mesh: &Mesh, grid_res: usize) -> (Vec<Point3D>, Vec<[usize; 3]>) {
     log::info!("Voxel remeshing: resolution={}", grid_res);
     log::info!("  Input: {} triangles", mesh.triangles.len());
 
     let grid = SdfGrid::from_mesh(mesh, grid_res);
-    grid.extract_marching_cubes_indexed()
+    let cell_size = grid.cell_size;
+    let (mut vertices, mut faces) = grid.extract_marching_cubes_indexed();
+
+    // Post-process: clean up MC output for TetGen compatibility
+    clean_mc_output(&mut vertices, &mut faces, cell_size);
+
+    (vertices, faces)
 }
 
 /// Compute a good grid resolution from the mesh bounding box.
@@ -507,6 +517,134 @@ impl SdfGrid {
 
         (vertices, faces)
     }
+}
+
+// ============================================================================
+// Marching Cubes output cleanup for TetGen compatibility
+// ============================================================================
+
+/// Clean up Marching Cubes output to avoid TetGen failures:
+/// - Merge vertices closer than `merge_dist` (fixes status=4 "very small feature")
+/// - Remove degenerate faces (two or more identical vertex indices)
+/// - Remove duplicate faces (fixes status=3 "duplicated facets")
+/// - Remove very small triangles (area < threshold)
+fn clean_mc_output(vertices: &mut Vec<Point3D>, faces: &mut Vec<[usize; 3]>, cell_size: f64) {
+    let orig_verts = vertices.len();
+    let orig_faces = faces.len();
+
+    // Step 1: Merge close vertices using spatial hashing
+    // When the isosurface passes very close to a grid vertex, MC creates
+    // vertices nearly at the same position, leading to very short edges
+    // that TetGen rejects (status=4).
+    let merge_dist = cell_size * 0.15;
+    let remap = merge_close_vertices(vertices, merge_dist);
+
+    // Remap face indices
+    for face in faces.iter_mut() {
+        face[0] = remap[face[0]];
+        face[1] = remap[face[1]];
+        face[2] = remap[face[2]];
+    }
+
+    // Step 2: Remove degenerate faces (collapsed by merging)
+    faces.retain(|f| f[0] != f[1] && f[1] != f[2] && f[0] != f[2]);
+
+    // Step 3: Remove duplicate faces
+    // Two cubes can produce the same triangle in degenerate MC configurations
+    let mut seen = std::collections::HashSet::new();
+    faces.retain(|f| {
+        let mut sorted = *f;
+        sorted.sort();
+        seen.insert((sorted[0], sorted[1], sorted[2]))
+    });
+
+    // Step 4: Remove very small triangles (needle-like or tiny)
+    let min_area = (cell_size * 0.05) * (cell_size * 0.05);
+    faces.retain(|f| {
+        let v0 = vertices[f[0]];
+        let v1 = vertices[f[1]];
+        let v2 = vertices[f[2]];
+        let e1 = v1 - v0;
+        let e2 = v2 - v0;
+        let area = e1.cross(&e2).norm() * 0.5;
+        area > min_area
+    });
+
+    // Step 5: Remove needle-like triangles (very high aspect ratio)
+    // These have small area relative to their longest edge, creating
+    // thin features that TetGen rejects (status=4).
+    let min_edge_ratio = cell_size * 0.1; // Minimum shortest edge
+    faces.retain(|f| {
+        let v0 = vertices[f[0]];
+        let v1 = vertices[f[1]];
+        let v2 = vertices[f[2]];
+        let e01 = (v1 - v0).norm();
+        let e12 = (v2 - v1).norm();
+        let e20 = (v0 - v2).norm();
+        let shortest = e01.min(e12).min(e20);
+        shortest > min_edge_ratio
+    });
+
+    if vertices.len() != orig_verts || faces.len() != orig_faces {
+        log::info!("  MC cleanup: {}→{} vertices, {}→{} faces",
+            orig_verts, vertices.len(), orig_faces, faces.len());
+    }
+}
+
+/// Merge vertices closer than `epsilon` using spatial hashing.
+/// Returns a remap array: old_index → new_index.
+fn merge_close_vertices(vertices: &mut Vec<Point3D>, epsilon: f64) -> Vec<usize> {
+    let n = vertices.len();
+    let mut remap: Vec<usize> = (0..n).collect();
+
+    if n == 0 || epsilon <= 0.0 {
+        return remap;
+    }
+
+    // Build spatial hash grid
+    let inv_cell = 1.0 / epsilon;
+    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+
+    let mut new_vertices: Vec<Point3D> = Vec::with_capacity(n);
+    let mut old_to_new: Vec<usize> = vec![usize::MAX; n];
+    let eps_sq = epsilon * epsilon;
+
+    for i in 0..n {
+        let p = vertices[i];
+        let gx = (p.x * inv_cell).floor() as i64;
+        let gy = (p.y * inv_cell).floor() as i64;
+        let gz = (p.z * inv_cell).floor() as i64;
+
+        // Search neighborhood for existing vertex to merge with
+        let mut merged = false;
+        'search: for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(candidates) = grid.get(&(gx + dx, gy + dy, gz + dz)) {
+                        for &ci in candidates {
+                            let cp = new_vertices[ci];
+                            let d2 = (p.x - cp.x).powi(2) + (p.y - cp.y).powi(2) + (p.z - cp.z).powi(2);
+                            if d2 < eps_sq {
+                                old_to_new[i] = ci;
+                                merged = true;
+                                break 'search;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !merged {
+            let new_idx = new_vertices.len();
+            old_to_new[i] = new_idx;
+            new_vertices.push(p);
+            grid.entry((gx, gy, gz)).or_default().push(new_idx);
+        }
+    }
+
+    *vertices = new_vertices;
+    old_to_new
 }
 
 // ============================================================================

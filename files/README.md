@@ -1,16 +1,25 @@
 # MultiAxis Slicer
 
-High-performance 5-axis non-planar slicer written in Rust, featuring curved-layer slicing based on the S3-Slicer algorithm (SIGGRAPH Asia 2022 Best Paper).
+High-performance multi-axis non-planar 3D printing slicer written in Rust, featuring multiple slicing methods including curved-layer (S3/S4), conical, and geodesic slicing.
 
 ## Features
 
-- **S3-Slicer curved-layer pipeline** - Full implementation of the "S3-Slicer: A General Slicing Framework for Multi-Axis 3D Printing" paper
-- **Tetrahedral volumetric deformation** - Per-tetrahedron ASAP (As-Similar-As-Possible) deformation with scaling, matching the original paper's approach
-- **Voxel-based mesh reconstruction** - SDF + Marching Cubes preprocessing that guarantees clean, manifold input for TetGen, even from self-intersecting STL files
-- **Interactive GUI** - egui-based application with 3D viewport, real-time mesh preview, and parameter controls
-- **Fast mesh slicing** - O(n log k + k + m) algorithm from optimal slicing paper
-- **Centroidal axis computation** - 100x faster than medial axis
-- **Parallel processing** - Multi-threaded computation with Rayon
+### 5 Slicing Modes
+- **Planar (Traditional)** - Fast flat-layer slicing at constant Z height
+- **Conical (RotBot)** - Cone-based Z-shift for radially symmetric overhangs
+- **S4 Non-Planar** - Deform mesh via Dijkstra distance field, planar slice, un-deform toolpaths back to original space
+- **S3 Curved Layer** - Full S3-Slicer pipeline: quaternion field optimization, volumetric ASAP deformation, isosurface extraction
+- **Geodesic (Heat Method)** - NEW: Layers follow surface curvature via geodesic distance field (Crane et al. 2013). Two source modes: bottom boundary or point source
+
+### Core Capabilities
+- **S3-Slicer curved-layer pipeline** - Full implementation of the SIGGRAPH Asia 2022 paper
+- **Tetrahedral volumetric deformation** - Per-tet ASAP deformation with SVD-based scaling
+- **Grid-based tet mesh** - Freudenthal 6-tet decomposition bypasses TetGen for self-intersecting meshes
+- **Voxel-based mesh reconstruction** - SDF + Marching Cubes for clean manifold input
+- **Geodesic distance field** - Heat Method with cotangent Laplacian and Conjugate Gradient solver
+- **Wall loops and infill** - Configurable perimeter count and rectilinear infill density
+- **Interactive GUI** - egui-based application with 3D viewport and parameter controls
+- **Fast mesh slicing** - O(n log k + k + m) algorithm
 - **5-axis toolpath generation** - Support for A/B rotation axes
 - **G-code generation** - Direct output for CNC/3D printers
 - **Support generation** - Overhang detection and tree-based support structures
@@ -44,26 +53,31 @@ cargo build --release
 
 The GUI will open with a 3D viewport. Load an STL file and select a deformation method to start slicing.
 
-## S3-Slicer Pipeline
+## Slicing Pipelines
 
-The core of this project is a full implementation of the S3-Slicer algorithm for curved-layer non-planar 3D printing. The pipeline supports multiple deformation methods:
+### Geodesic (Heat Method) - NEW
+Layers follow the mesh surface curvature using geodesic distance:
+1. **Build topology** - Weld vertices, compute adjacency and normals
+2. **Cotangent Laplacian** - Build sparse symmetric matrix with lumped mass
+3. **Heat Method** - Diffuse heat from source, normalize gradient, Poisson solve (CG solver)
+4. **Level set extraction** - Marching triangles at uniform geodesic spacing
 
-### Tet Volumetric (Recommended)
+### S4 Non-Planar (Deform + Slice + Untransform)
+1. **Grid tet mesh** - Freudenthal 6-tet decomposition (bypasses TetGen)
+2. **Dijkstra distance field** - Per-tet gradients from base
+3. **Rotation field** - Overhang-based rotations with SLERP smoothing
+4. **Deform + slice + untransform** - Barycentric interpolation preserves original mesh topology
 
-The full volumetric pipeline from the original paper:
+### S3 Curved Layer (Tet Volumetric)
+Full S3-Slicer paper implementation:
+1. **Mesh preprocessing** - Voxel reconstruction for clean manifold input
+2. **Tetrahedralization** - TetGen or grid-based tet mesh
+3. **Quaternion field optimization** - Per-tet rotations for fabrication objectives
+4. **Volumetric ASAP deformation** - Per-tet deformation with SVD scaling
+5. **Scalar field + Marching tetrahedra** - Isosurface extraction
 
-1. **Mesh preprocessing** - Voxel reconstruction (SDF + Marching Cubes) produces a clean, manifold surface from potentially self-intersecting STL files
-2. **Tetrahedralization** - TetGen (via `tritet` crate) generates a constrained Delaunay tet mesh
-3. **Quaternion field optimization** - Per-tetrahedron rotation field optimized for fabrication objectives (support-free, strength, etc.)
-4. **Volumetric ASAP deformation** - Per-tet As-Similar-As-Possible deformation with scaling via SVD of deformation gradients
-5. **Scalar field computation** - Volume-based scalar field with Laplacian smoothing
-6. **Marching tetrahedra** - Isosurface extraction produces curved layers
-
-### Other Methods
-
-- **Virtual Scalar Field** - Computes scalar field directly without mesh deformation. Good fallback for complex models.
-- **ASAP Deformation** - Surface-based ASAP solver. Can cause mesh collapse on complex geometry.
-- **Scale-Controlled** - Local deformation with scale control.
+### Conical (RotBot)
+Simple Z-shift by `r * tan(angle)`, planar slice, reverse shift. Fast and effective for radially symmetric overhangs.
 
 ## Architecture
 
@@ -76,8 +90,11 @@ multiaxis_slicer/
 │   ├── geometry.rs               # Geometric primitives (Triangle, Point3D, etc.)
 │   ├── mesh.rs                   # Mesh loading (STL) and manipulation
 │   ├── slicing.rs                # Core planar slicing algorithms
-│   ├── toolpath.rs               # Toolpath generation
+│   ├── toolpath.rs               # Toolpath generation (walls + infill)
 │   ├── toolpath_patterns.rs      # Infill patterns (linear, concentric, etc.)
+│   ├── contour_offset.rs         # 2D polygon offset for wall loops
+│   ├── geodesic.rs               # Geodesic slicing (Heat Method + level sets)
+│   ├── conical.rs                # Conical slicing pipeline
 │   ├── gcode.rs                  # G-code output
 │   ├── centroidal_axis.rs        # Centroidal axis computation
 │   ├── ruled_surface.rs          # Ruled surface detection
@@ -137,13 +154,13 @@ multiaxis_slicer/
 ## Testing
 
 ```bash
-# Run all library tests (skips examples that have known compile issues)
+# Run all library tests (93 pass, 3 pre-existing failures; skips examples)
 cargo test --lib
 
 # Run specific test module
+cargo test --lib -- geodesic
 cargo test --lib -- voxel_remesh
 cargo test --lib -- tet_mesh
-cargo test --lib -- isotropic_remesh
 
 # Run with log output
 RUST_LOG=info cargo test --lib -- --nocapture
@@ -168,13 +185,15 @@ The voxel reconstruction + TetGen pipeline processes an 80K-triangle Stanford Bu
 
 1. "S3-Slicer: A General Slicing Framework for Multi-Axis 3D Printing" (SIGGRAPH Asia 2022)
    - [Paper](https://dl.acm.org/doi/10.1145/3550469.3555430) | [Code](https://github.com/zhangty019/S3_DeformFDM)
-2. "An Optimal Algorithm for 3D Triangle Mesh Slicing"
-3. "Support-Free Volume Printing by Multi-Axis Motion" (TOG 2020)
-4. "A Remeshing Approach to Multiresolution Modeling" - Botsch & Kobbelt (2004)
-5. "Singularity-Aware Motion Planning for Multi-Axis Additive Manufacturing" (RAL 2021)
+2. "The Heat Method for Distance Computation" - Crane, Weischedel, Wardetzky (2013)
+3. "S4-Slicer" - jyjblrd (Deform/slice/untransform approach)
+4. "An Optimal Algorithm for 3D Triangle Mesh Slicing"
+5. "Support-Free Volume Printing by Multi-Axis Motion" (TOG 2020)
+6. "A Remeshing Approach to Multiresolution Modeling" - Botsch & Kobbelt (2004)
+7. "Singularity-Aware Motion Planning for Multi-Axis Additive Manufacturing" (RAL 2021)
 
 ## License
 
-MIT License - See LICENSE file for details.
+GNU General Public License v3 - See LICENSE file for details.
 
-**Note:** The TetGen dependency (`tritet`) is AGPL licensed. If distributing binaries, ensure compliance or build with `--no-default-features` to exclude it.
+**Note:** The TetGen dependency (`tritet`) is AGPL licensed. Disable with `--no-default-features` if needed.

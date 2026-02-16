@@ -74,6 +74,10 @@ pub enum SlicingMode {
     Curved,
     /// S4 non-planar slicing (Deform → Slice → Un-Deform)
     S4,
+    /// Conical slicing (RotBot/Transform — cone-based Z shift)
+    Conical,
+    /// Geodesic slicing (Heat Method distance field)
+    Geodesic,
 }
 
 /// Main application state
@@ -101,6 +105,8 @@ pub struct SlicerApp {
     pub toolpath_pattern: crate::toolpath_patterns::ToolpathPattern,
     pub toolpath_line_width: f64,
     pub toolpath_infill_density: f64,
+    pub wall_count: usize,
+    pub infill_pattern: crate::toolpath_patterns::InfillPattern,
 
     // Support generation
     pub support_config: OverhangConfig,
@@ -160,6 +166,19 @@ pub struct SlicerApp {
     pub s4_asap_max_iterations: usize,     // 3-20
     pub s4_asap_convergence: f64,          // 1e-5 to 1e-3
 
+    // Conical slicing configuration
+    pub conical_angle_degrees: f64,        // Cone half-angle (5-60)
+    pub conical_direction: crate::conical::ConicalDirection,
+    pub conical_auto_center: bool,         // Auto-center on mesh centroid
+    pub conical_center_x: f64,
+    pub conical_center_y: f64,
+
+    // Geodesic slicing configuration
+    pub geodesic_source_mode: u8,          // 0=BottomBoundary, 1=PointSource
+    pub geodesic_source_point: [f64; 3],   // For point source mode
+    pub geodesic_heat_factor: f64,         // Multiplier on avg_edge_length² (default 1.0)
+    pub geodesic_bottom_tolerance: f64,    // Z tolerance for bottom boundary (default 0.5mm)
+
     // Face orientation mode
     pub face_orientation_mode: bool,       // Whether we're in "select face to orient" mode
     pub selected_face_index: Option<usize>, // Index of the selected triangle
@@ -190,6 +209,8 @@ impl Default for SlicerApp {
             toolpath_pattern: crate::toolpath_patterns::ToolpathPattern::Contour,
             toolpath_line_width: 0.4,
             toolpath_infill_density: 0.2,
+            wall_count: 2,
+            infill_pattern: crate::toolpath_patterns::InfillPattern::Rectilinear,
 
             support_config: OverhangConfig::default(),
             support_result: None,
@@ -241,6 +262,19 @@ impl Default for SlicerApp {
             s4_smoothness_weight: 0.5,
             s4_asap_max_iterations: 10,
             s4_asap_convergence: 1e-4,
+
+            // Conical slicing defaults
+            conical_angle_degrees: 45.0,
+            conical_direction: crate::conical::ConicalDirection::Outward,
+            conical_auto_center: true,
+            conical_center_x: 0.0,
+            conical_center_y: 0.0,
+
+            // Geodesic slicing defaults
+            geodesic_source_mode: 0,
+            geodesic_source_point: [0.0, 0.0, 0.0],
+            geodesic_heat_factor: 1.0,
+            geodesic_bottom_tolerance: 0.5,
 
             // Face orientation defaults
             face_orientation_mode: false,
@@ -334,6 +368,14 @@ impl SlicerApp {
             SlicingMode::S4 => {
                 self.log("Starting S4 non-planar slicing (Deform + Slice + Un-Deform)...".to_string());
                 self.start_s4_slicing();
+            }
+            SlicingMode::Conical => {
+                self.log("Starting conical slicing (RotBot/Transform)...".to_string());
+                self.start_conical_slicing();
+            }
+            SlicingMode::Geodesic => {
+                self.log("Starting geodesic slicing (Heat Method)...".to_string());
+                self.start_geodesic_slicing();
             }
         }
     }
@@ -582,6 +624,141 @@ impl SlicerApp {
         });
     }
 
+    /// Start conical slicing in background thread
+    fn start_conical_slicing(&mut self) {
+        let mesh = self.mesh.clone().unwrap();
+        let config = self.config.clone();
+        let progress = self.slicing_progress.clone();
+        let cone_angle = self.conical_angle_degrees;
+        let direction = self.conical_direction;
+
+        // Determine center: auto from mesh centroid or manual
+        let (center_x, center_y) = if self.conical_auto_center {
+            let cx = (mesh.bounds_min.x + mesh.bounds_max.x) / 2.0;
+            let cy = (mesh.bounds_min.y + mesh.bounds_max.y) / 2.0;
+            (cx, cy)
+        } else {
+            (self.conical_center_x, self.conical_center_y)
+        };
+
+        let (tx, rx) = mpsc::channel();
+        self.layers_receiver = Some(rx);
+
+        std::thread::spawn(move || {
+            {
+                let mut p = progress.lock().unwrap();
+                p.operation = "Conical Slicing".to_string();
+                p.percentage = 5.0;
+                p.message = "Initializing conical pipeline...".to_string();
+            }
+
+            let result = std::panic::catch_unwind(|| {
+                crate::conical::execute_conical_pipeline(
+                    &mesh, &config, cone_angle, center_x, center_y, direction,
+                )
+            });
+
+            match result {
+                Ok(layers) => {
+                    let layer_count = layers.len();
+                    log::info!("Conical pipeline completed with {} layers", layer_count);
+
+                    if let Err(e) = tx.send(layers) {
+                        log::error!("Failed to send layers to main thread: {:?}", e);
+                        let mut p = progress.lock().unwrap();
+                        p.operation = "Error".to_string();
+                        p.message = "Failed to send layers to main thread".to_string();
+                        return;
+                    }
+
+                    {
+                        let mut p = progress.lock().unwrap();
+                        p.operation = "Complete".to_string();
+                        p.percentage = 100.0;
+                        p.layers_completed = layer_count;
+                        p.total_layers = layer_count;
+                        p.message = format!("Generated {} conical layers", layer_count);
+                    }
+                }
+                Err(e) => {
+                    log::error!("Conical pipeline panicked: {:?}", e);
+                    let mut p = progress.lock().unwrap();
+                    p.operation = "Error".to_string();
+                    p.message = "Conical pipeline failed (panic)".to_string();
+                }
+            }
+        });
+    }
+
+    /// Start geodesic slicing in background thread
+    fn start_geodesic_slicing(&mut self) {
+        let mesh = self.mesh.clone().unwrap();
+        let layer_height = self.config.layer_height;
+        let progress = self.slicing_progress.clone();
+
+        let source = if self.geodesic_source_mode == 1 {
+            let p = self.geodesic_source_point;
+            crate::geodesic::GeodesicSource::Point(crate::geometry::Point3D::new(p[0], p[1], p[2]))
+        } else {
+            crate::geodesic::GeodesicSource::BottomBoundary
+        };
+        let heat_factor = self.geodesic_heat_factor;
+        let bottom_tol = self.geodesic_bottom_tolerance;
+
+        let (tx, rx) = mpsc::channel();
+        self.layers_receiver = Some(rx);
+
+        std::thread::spawn(move || {
+            {
+                let mut p = progress.lock().unwrap();
+                p.operation = "Geodesic Slicing".to_string();
+                p.percentage = 5.0;
+                p.message = "Initializing geodesic pipeline (Heat Method)...".to_string();
+            }
+
+            let config = crate::geodesic::GeodesicSlicerConfig {
+                source,
+                layer_height,
+                heat_timestep_factor: heat_factor,
+                bottom_tolerance: bottom_tol,
+            };
+
+            let result = std::panic::catch_unwind(|| {
+                crate::geodesic::geodesic_slice(&mesh, &config)
+            });
+
+            match result {
+                Ok(layers) => {
+                    let layer_count = layers.len();
+                    log::info!("Geodesic pipeline completed with {} layers", layer_count);
+
+                    if let Err(e) = tx.send(layers) {
+                        log::error!("Failed to send layers to main thread: {:?}", e);
+                        let mut p = progress.lock().unwrap();
+                        p.operation = "Error".to_string();
+                        p.message = "Failed to send layers to main thread".to_string();
+                        return;
+                    }
+
+                    {
+                        let mut p = progress.lock().unwrap();
+                        p.operation = "Complete".to_string();
+                        p.percentage = 100.0;
+                        p.layers_completed = layer_count;
+                        p.total_layers = layer_count;
+                        p.message = format!("Generated {} geodesic layers (Heat Method)", layer_count);
+                    }
+                }
+                Err(e) => {
+                    log::error!("Geodesic pipeline panicked: {:?}", e);
+                    let mut p = progress.lock().unwrap();
+                    p.operation = "Error".to_string();
+                    p.message = "Geodesic pipeline failed (panic)".to_string();
+                }
+            }
+        });
+    }
+
     /// Deform mesh using S3-Slicer algorithm (for preview before slicing)
     pub fn deform_mesh_preview(&mut self) {
         let mesh = match &self.mesh {
@@ -667,8 +844,13 @@ impl SlicerApp {
                 log::info!("  → Inverted: {}, degenerate: {}",
                     quality.inverted_tets, quality.degenerate_tets);
 
-                let deformed_surface = deformed_tet.to_surface_mesh();
-                log::info!("  → Deformed surface: {} triangles", deformed_surface.triangles.len());
+                // Deform original mesh surface through tet field (not blocky tet surface)
+                let deformed_surface = crate::s3_slicer::tet_point_location::deform_surface_through_tets(
+                    &mesh_clone,
+                    &tet_mesh,
+                    &deformed_tet,
+                );
+                log::info!("  → Deformed surface: {} triangles (original mesh topology)", deformed_surface.triangles.len());
                 log::info!("S4 deformation preview complete");
 
                 let _ = tx.send(deformed_surface);
@@ -854,6 +1036,8 @@ impl SlicerApp {
             line_width: self.toolpath_line_width,
             node_distance: 1.0,
             infill_density: self.toolpath_infill_density,
+            wall_count: self.wall_count,
+            infill_pattern: self.infill_pattern,
         };
 
         let generator = ToolpathGenerator::new(self.nozzle_diameter, self.config.layer_height)

@@ -8,12 +8,19 @@ use serde::{Deserialize, Serialize};
 /// Available toolpath patterns
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolpathPattern {
-    /// Follow contour lines (outer perimeter)
+    /// Wall loops + infill (standard slicer output)
     Contour,
     /// Spiral pattern from outside to inside
     Spiral,
     /// Zigzag back-and-forth pattern
     Zigzag,
+}
+
+/// Infill pattern for interior fill
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InfillPattern {
+    /// Alternating-direction parallel lines (rectilinear)
+    Rectilinear,
 }
 
 impl ToolpathPattern {
@@ -36,9 +43,11 @@ impl Default for ToolpathPattern {
 #[derive(Debug, Clone)]
 pub struct ToolpathConfig {
     pub pattern: ToolpathPattern,
-    pub line_width: f64,      // Spacing between adjacent paths (mm)
-    pub node_distance: f64,   // Spacing between nodes along path (mm)
-    pub infill_density: f64,  // 0.0 to 1.0 for infill patterns
+    pub line_width: f64,         // Spacing between adjacent paths (mm)
+    pub node_distance: f64,      // Spacing between nodes along path (mm)
+    pub infill_density: f64,     // 0.0 to 1.0 for infill patterns
+    pub wall_count: usize,       // Number of perimeter loops (1-10)
+    pub infill_pattern: InfillPattern, // Pattern for interior fill
 }
 
 impl Default for ToolpathConfig {
@@ -48,7 +57,15 @@ impl Default for ToolpathConfig {
             line_width: 0.4,
             node_distance: 1.0,
             infill_density: 0.2,
+            wall_count: 2,
+            infill_pattern: InfillPattern::Rectilinear,
         }
+    }
+}
+
+impl Default for InfillPattern {
+    fn default() -> Self {
+        InfillPattern::Rectilinear
     }
 }
 
@@ -207,7 +224,7 @@ pub fn generate_contour_pattern(
 }
 
 /// Resample contour with specific spacing
-fn resample_contour(points: &[Point3D], spacing: f64) -> Vec<Point3D> {
+pub fn resample_contour(points: &[Point3D], spacing: f64) -> Vec<Point3D> {
     if points.len() < 2 {
         return points.to_vec();
     }
@@ -254,6 +271,143 @@ fn calculate_bounds(points: &[Point3D]) -> (f64, f64, f64, f64) {
     }
 
     (min_x, max_x, min_y, max_y)
+}
+
+/// Generate infill lines clipped to the interior of a boundary contour.
+/// Uses scanline approach: horizontal lines at spacing, clipped to boundary edges.
+/// `outer_boundary` is used to validate that infill lines stay inside the original contour.
+/// Returns individual line segments (each is a vec of points to extrude along).
+pub fn generate_clipped_infill(
+    boundary: &Contour,
+    config: &ToolpathConfig,
+    layer_z: f64,
+    outer_boundary: Option<&Contour>,
+) -> Vec<Vec<Point3D>> {
+    let pts = &boundary.points;
+    if pts.len() < 3 || config.infill_density < 0.01 {
+        return Vec::new();
+    }
+
+    let (min_x, max_x, min_y, max_y) = calculate_bounds(pts);
+
+    // Line spacing based on density
+    let line_spacing = config.line_width / config.infill_density;
+    let margin = config.line_width * 0.1; // Small margin to avoid edge artifacts
+
+    let mut infill_lines: Vec<Vec<Point3D>> = Vec::new();
+    let mut direction_forward = true;
+
+    // Generate scanlines
+    let mut y = min_y + line_spacing / 2.0;
+    while y < max_y {
+        // Find all intersections of horizontal line y with boundary edges
+        let mut intersections: Vec<f64> = Vec::new();
+        let n = pts.len();
+
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let yi = pts[i].y;
+            let yj = pts[j].y;
+
+            // Check if this edge crosses the scanline
+            if (yi <= y && yj > y) || (yj <= y && yi > y) {
+                // Compute x intersection
+                let t = (y - yi) / (yj - yi);
+                let x = pts[i].x + t * (pts[j].x - pts[i].x);
+                intersections.push(x);
+            }
+        }
+
+        // Sort intersections by x
+        intersections.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Pair up entry/exit: intersections[0..1] is inside, [1..2] is outside, etc.
+        let mut i = 0;
+        while i + 1 < intersections.len() {
+            let x_start = intersections[i] + margin;
+            let x_end = intersections[i + 1] - margin;
+
+            if x_end > x_start + config.line_width {
+                // Generate points along this infill segment
+                let mut line_points = Vec::new();
+
+                if direction_forward {
+                    let mut x = x_start;
+                    while x <= x_end {
+                        let z = interpolate_z_for_infill(x, y, boundary, layer_z);
+                        line_points.push(Point3D::new(x, y, z));
+                        x += config.node_distance;
+                    }
+                    // Add final point
+                    if line_points.last().map(|p| (x_end - p.x).abs() > config.node_distance * 0.3).unwrap_or(true) {
+                        let z = interpolate_z_for_infill(x_end, y, boundary, layer_z);
+                        line_points.push(Point3D::new(x_end, y, z));
+                    }
+                } else {
+                    let mut x = x_end;
+                    while x >= x_start {
+                        let z = interpolate_z_for_infill(x, y, boundary, layer_z);
+                        line_points.push(Point3D::new(x, y, z));
+                        x -= config.node_distance;
+                    }
+                    if line_points.last().map(|p| (p.x - x_start).abs() > config.node_distance * 0.3).unwrap_or(true) {
+                        let z = interpolate_z_for_infill(x_start, y, boundary, layer_z);
+                        line_points.push(Point3D::new(x_start, y, z));
+                    }
+                }
+
+                if line_points.len() >= 2 {
+                    infill_lines.push(line_points);
+                }
+            }
+
+            i += 2; // Skip to next entry/exit pair
+        }
+
+        direction_forward = !direction_forward; // Zigzag alternation
+        y += line_spacing;
+    }
+
+    // Validate infill lines against the outer boundary (original contour) if provided.
+    // This catches cases where the offset contour is malformed for complex shapes.
+    if let Some(outer) = outer_boundary {
+        infill_lines.retain(|line| {
+            if line.len() < 2 {
+                return false;
+            }
+            // Check midpoint of the line — if it's outside the original contour, discard
+            let mid_idx = line.len() / 2;
+            let mid = &line[mid_idx];
+            if !is_point_in_contour(mid, outer) {
+                return false;
+            }
+            // Also check endpoints
+            is_point_in_contour(&line[0], outer) && is_point_in_contour(line.last().unwrap(), outer)
+        });
+    }
+
+    infill_lines
+}
+
+/// Interpolate Z for infill point — uses boundary contour for non-planar layers,
+/// falls back to layer_z for planar layers.
+fn interpolate_z_for_infill(x: f64, y: f64, boundary: &Contour, layer_z: f64) -> f64 {
+    // Check if this is a non-planar layer (varying Z in contour)
+    let pts = &boundary.points;
+    if pts.len() < 2 {
+        return layer_z;
+    }
+
+    let z_min = pts.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+    let z_max = pts.iter().map(|p| p.z).fold(f64::NEG_INFINITY, f64::max);
+
+    if (z_max - z_min) < 0.01 {
+        // Planar layer
+        return layer_z;
+    }
+
+    // Non-planar: interpolate from nearest boundary edge
+    crate::contour_offset::interpolate_z_from_contour_pub(x, y, boundary)
 }
 
 /// Check if a point is inside a contour using ray casting

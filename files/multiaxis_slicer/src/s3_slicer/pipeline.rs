@@ -752,10 +752,47 @@ pub fn execute_s4_pipeline(
         return execute_s3_pipeline(original_mesh, fallback_config);
     }
 
-    // Step 5: Extract deformed surface and slice planarly
-    log::info!("Step 5/7: Slicing deformed surface with planar slicer...");
-    let deformed_surface = deformed_tet_mesh.to_surface_mesh();
-    log::info!("  → Deformed surface: {} triangles", deformed_surface.triangles.len());
+    // Step 5: Deform original mesh surface through tet field, then slice planarly
+    log::info!("Step 5/7: Deforming original surface through tet field and slicing...");
+    let deformed_surface = crate::s3_slicer::tet_point_location::deform_surface_through_tets(
+        &original_mesh,
+        &tet_mesh,
+        &deformed_tet_mesh,
+    );
+    log::info!("  → Deformed surface: {} triangles (original mesh topology)", deformed_surface.triangles.len());
+
+    // Filter out spurious triangles (bad STL geometry with very long edges) that
+    // create stray intersection lines during slicing. Compute median edge length
+    // and remove triangles with any edge > 15× median.
+    let deformed_surface = {
+        let mut edge_lengths: Vec<f64> = deformed_surface.triangles.iter()
+            .flat_map(|tri| {
+                let e0 = ((tri.v1.x - tri.v0.x).powi(2) + (tri.v1.y - tri.v0.y).powi(2) + (tri.v1.z - tri.v0.z).powi(2)).sqrt();
+                let e1 = ((tri.v2.x - tri.v1.x).powi(2) + (tri.v2.y - tri.v1.y).powi(2) + (tri.v2.z - tri.v1.z).powi(2)).sqrt();
+                let e2 = ((tri.v0.x - tri.v2.x).powi(2) + (tri.v0.y - tri.v2.y).powi(2) + (tri.v0.z - tri.v2.z).powi(2)).sqrt();
+                vec![e0, e1, e2]
+            })
+            .collect();
+        edge_lengths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median_edge = edge_lengths[edge_lengths.len() / 2];
+        let max_allowed_edge = (median_edge * 15.0).max(5.0); // At least 5mm threshold
+
+        let filtered: Vec<_> = deformed_surface.triangles.iter()
+            .filter(|tri| {
+                let e0 = ((tri.v1.x - tri.v0.x).powi(2) + (tri.v1.y - tri.v0.y).powi(2) + (tri.v1.z - tri.v0.z).powi(2)).sqrt();
+                let e1 = ((tri.v2.x - tri.v1.x).powi(2) + (tri.v2.y - tri.v1.y).powi(2) + (tri.v2.z - tri.v1.z).powi(2)).sqrt();
+                let e2 = ((tri.v0.x - tri.v2.x).powi(2) + (tri.v0.y - tri.v2.y).powi(2) + (tri.v0.z - tri.v2.z).powi(2)).sqrt();
+                e0 <= max_allowed_edge && e1 <= max_allowed_edge && e2 <= max_allowed_edge
+            })
+            .cloned()
+            .collect();
+        let removed = deformed_surface.triangles.len() - filtered.len();
+        if removed > 0 {
+            log::info!("  → Filtered {} spurious triangles (median edge={:.2}mm, max allowed={:.2}mm)",
+                removed, median_edge, max_allowed_edge);
+        }
+        Mesh::new(filtered).unwrap()
+    };
 
     let slicing_config = SlicingConfig {
         layer_height: config.layer_height,
@@ -846,17 +883,43 @@ pub fn execute_s4_pipeline(
                 untransformed_points.push(original_point);
             }
 
-            // Build segments for CurvedLayer compat
-            for window in untransformed_points.windows(2) {
-                all_segments.push(LineSegment::new(window[0], window[1]));
-                all_normals.push(Vector3D::new(0.0, 0.0, 1.0));
+            // Split contour at stray jumps: if consecutive points are too far apart,
+            // break into separate sub-contours to avoid long stray lines
+            let max_seg_len = config.layer_height * 20.0; // Allow generous moves but catch strays
+            let max_seg_len_sq = max_seg_len * max_seg_len;
+
+            let mut sub_contours: Vec<Vec<Point3D>> = Vec::new();
+            let mut current_sub: Vec<Point3D> = Vec::new();
+
+            for pt in &untransformed_points {
+                if let Some(last) = current_sub.last() {
+                    let dx = pt.x - last.x;
+                    let dy = pt.y - last.y;
+                    let dz = pt.z - last.z;
+                    let dist_sq = dx * dx + dy * dy + dz * dz;
+                    if dist_sq > max_seg_len_sq {
+                        // Break: save current sub-contour and start new one
+                        if current_sub.len() >= 2 {
+                            sub_contours.push(std::mem::take(&mut current_sub));
+                        } else {
+                            current_sub.clear();
+                        }
+                    }
+                }
+                current_sub.push(*pt);
+            }
+            if current_sub.len() >= 2 {
+                sub_contours.push(current_sub);
             }
 
-            // Create contour directly — preserves contour structure from planar slicer
-            if untransformed_points.len() >= 2 {
+            for sub in &sub_contours {
+                for window in sub.windows(2) {
+                    all_segments.push(LineSegment::new(window[0], window[1]));
+                    all_normals.push(Vector3D::new(0.0, 0.0, 1.0));
+                }
                 untransformed_contours.push(crate::geometry::Contour {
-                    points: untransformed_points,
-                    closed: contour.closed,
+                    points: sub.clone(),
+                    closed: false, // Sub-contours from splits are open
                 });
             }
         }

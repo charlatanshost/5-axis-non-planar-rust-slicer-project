@@ -211,6 +211,9 @@ impl TetMesh {
         // hash_point vertex merging which can break MC topology.
         log::info!("  Attempting voxel reconstruction before TetGen...");
         let base_res = auto_grid_resolution(surface_mesh);
+        let extent = surface_mesh.bounds_max - surface_mesh.bounds_min;
+        let mesh_volume = extent.x * extent.y * extent.z;
+
         for &res in &[base_res, (base_res * 3 / 4).max(32), (base_res / 2).max(32)] {
             log::info!("  Voxel remesh (resolution: {})...", res);
             let (vertices, faces) = voxel_remesh_indexed(surface_mesh, res);
@@ -224,10 +227,7 @@ impl TetMesh {
             log::info!("  Voxel reconstructed: {} → {} faces ({} vertices)",
                 surface_mesh.triangles.len(), faces.len(), vertices.len());
 
-            // Compute volume for quality constraints
-            let extent = surface_mesh.bounds_max - surface_mesh.bounds_min;
-            let mesh_volume = extent.x * extent.y * extent.z;
-
+            // Try with quality constraints first (better tet mesh quality)
             match Self::run_tetgen_indexed(&vertices, &faces, Some(mesh_volume / 5000.0), Some(15.0)) {
                 Ok(mesh) => {
                     log::info!("  TetGen succeeded on voxel mesh (resolution {})", res);
@@ -235,6 +235,38 @@ impl TetMesh {
                 }
                 Err(e) => {
                     log::warn!("  TetGen failed on voxel mesh at resolution {}: {}", res, e);
+                }
+            }
+        }
+
+        // ── Strategy 2b: Retry voxel meshes WITHOUT quality constraints ───
+        // TetGen often fails with status=4 ("small feature") when quality
+        // constraints force Steiner point insertion near thin features.
+        // Try multiple resolutions (including lower ones) without constraints.
+        log::info!("  Retrying voxel meshes WITHOUT quality constraints...");
+        let retry_resolutions = [
+            (base_res * 3 / 4).max(32),
+            (base_res / 2).max(25),
+            (base_res / 3).max(20),
+        ];
+        for &res in &retry_resolutions {
+            log::info!("  Voxel remesh (resolution: {}, no quality constraints)...", res);
+            let (vertices, faces) = voxel_remesh_indexed(surface_mesh, res);
+
+            if faces.len() < 4 {
+                continue;
+            }
+
+            log::info!("  Voxel reconstructed: {} faces ({} vertices)",
+                faces.len(), vertices.len());
+
+            match Self::run_tetgen_indexed(&vertices, &faces, None, None) {
+                Ok(mesh) => {
+                    log::info!("  TetGen succeeded on voxel mesh without constraints (resolution {})", res);
+                    return Ok(mesh);
+                }
+                Err(e) => {
+                    log::warn!("  TetGen failed without constraints at resolution {}: {}", res, e);
                 }
             }
         }
@@ -262,6 +294,23 @@ impl TetMesh {
                 Err(e) => {
                     log::warn!("  TetGen still failed at {:.2} mm resolution: {}", resolution, e);
                 }
+            }
+        }
+
+        // ── Strategy 3b: Grid-based tet mesh (bypass TetGen entirely) ───
+        // Generates a regular grid of cubes covering the bounding box, splits
+        // each cube into 5 tetrahedra, and keeps only tets whose centroids are
+        // inside the surface mesh (via 3-axis ray casting). This works on ANY
+        // mesh regardless of self-intersections or other quality issues.
+        log::info!("  Attempting grid-based tet mesh (no TetGen)...");
+        match Self::from_surface_mesh_grid(surface_mesh, 80) {
+            Ok(mesh) => {
+                log::info!("  Grid tet mesh succeeded: {} tets, {} surface tris",
+                    mesh.tets.len(), mesh.surface_triangles.len());
+                return Ok(mesh);
+            }
+            Err(e) => {
+                log::warn!("  Grid tet mesh failed: {}", e);
             }
         }
 
@@ -584,6 +633,182 @@ impl TetMesh {
         }
 
         Ok(Self::new(vertices, tets))
+    }
+
+    /// Create a grid-based tetrahedral mesh that bypasses TetGen entirely.
+    ///
+    /// Generates a regular grid of cubes covering the bounding box, splits each
+    /// cube into 6 tetrahedra (Freudenthal decomposition), then uses 3-axis ray
+    /// casting to classify which tets are inside the surface mesh.
+    ///
+    /// The Freudenthal decomposition guarantees face-matching between adjacent
+    /// cubes, so tet adjacency (and thus Dijkstra propagation) works correctly
+    /// across the entire grid. Each cube is split along 6 monotone paths from
+    /// vertex v0=(0,0,0) to v7=(1,1,1).
+    pub fn from_surface_mesh_grid(surface_mesh: &Mesh, grid_res: usize) -> Result<Self, String> {
+        let extent = surface_mesh.bounds_max - surface_mesh.bounds_min;
+        let longest = extent.x.max(extent.y).max(extent.z);
+        if longest < 1e-10 {
+            return Err("Mesh has zero extent".to_string());
+        }
+
+        let cell_size = longest / grid_res as f64;
+        let padding = cell_size * 1.5;
+
+        let origin = Point3D::new(
+            surface_mesh.bounds_min.x - padding,
+            surface_mesh.bounds_min.y - padding,
+            surface_mesh.bounds_min.z - padding,
+        );
+
+        let nx = ((extent.x + 2.0 * padding) / cell_size).ceil() as usize + 1;
+        let ny = ((extent.y + 2.0 * padding) / cell_size).ceil() as usize + 1;
+        let nz = ((extent.z + 2.0 * padding) / cell_size).ceil() as usize + 1;
+
+        log::info!("  Grid: {}x{}x{} = {} cells, cell_size={:.4}",
+            nx - 1, ny - 1, nz - 1, (nx - 1) * (ny - 1) * (nz - 1), cell_size);
+
+        // Build grid vertices
+        let total_verts = nx * ny * nz;
+        let mut vertices = Vec::with_capacity(total_verts);
+        for iz in 0..nz {
+            for iy in 0..ny {
+                for ix in 0..nx {
+                    vertices.push(Point3D::new(
+                        origin.x + ix as f64 * cell_size,
+                        origin.y + iy as f64 * cell_size,
+                        origin.z + iz as f64 * cell_size,
+                    ));
+                }
+            }
+        }
+
+        // Classify grid vertex positions as inside/outside the mesh
+        let inside = grid_inside_classification(
+            &vertices, nx, ny, nz, &origin, cell_size, surface_mesh,
+        );
+
+        // Build vertex index helper
+        let vi = |ix: usize, iy: usize, iz: usize| -> usize {
+            ix + iy * nx + iz * nx * ny
+        };
+
+        // 6-tet Freudenthal decomposition of each cube.
+        // Each cube is split into 6 tets along the body diagonal v0→v7.
+        // The 6 tets correspond to the 3! = 6 orderings of axes (x, y, z):
+        //   v0=000, v1=100, v2=010, v3=110, v4=001, v5=101, v6=011, v7=111
+        //
+        // This decomposition guarantees face-matching between adjacent cubes
+        // because shared faces always use the same diagonal direction.
+        let mut tets = Vec::new();
+
+        for iz in 0..(nz - 1) {
+            for iy in 0..(ny - 1) {
+                for ix in 0..(nx - 1) {
+                    let v0 = vi(ix, iy, iz);
+                    let v1 = vi(ix + 1, iy, iz);
+                    let v2 = vi(ix, iy + 1, iz);
+                    let v3 = vi(ix + 1, iy + 1, iz);
+                    let v4 = vi(ix, iy, iz + 1);
+                    let v5 = vi(ix + 1, iy, iz + 1);
+                    let v6 = vi(ix, iy + 1, iz + 1);
+                    let v7 = vi(ix + 1, iy + 1, iz + 1);
+
+                    // Check if this cell has ANY inside vertex - if not, skip entirely
+                    let cube_verts = [v0, v1, v2, v3, v4, v5, v6, v7];
+                    if !cube_verts.iter().any(|&v| inside[v]) {
+                        continue;
+                    }
+
+                    // 6-tet Freudenthal decomposition (monotone paths v0→v7):
+                    // Path xyz: v0→v1→v3→v7  (x first, then y, then z)
+                    // Path xzy: v0→v1→v5→v7  (x first, then z, then y)
+                    // Path yxz: v0→v2→v3→v7  (y first, then x, then z)
+                    // Path yzx: v0→v2→v6→v7  (y first, then z, then x)
+                    // Path zxy: v0→v4→v5→v7  (z first, then x, then y)
+                    // Path zyx: v0→v4→v6→v7  (z first, then y, then x)
+                    let cell_tets = [
+                        [v0, v1, v3, v7],
+                        [v0, v1, v5, v7],
+                        [v0, v2, v3, v7],
+                        [v0, v2, v6, v7],
+                        [v0, v4, v5, v7],
+                        [v0, v4, v6, v7],
+                    ];
+
+                    for &[a, b, c, d] in &cell_tets {
+                        // Keep tet if ANY vertex is inside — ensures the grid tet mesh
+                        // fully encloses the original surface so barycentric interpolation
+                        // works for all surface vertices (not just interior ones)
+                        if !inside[a] && !inside[b] && !inside[c] && !inside[d] {
+                            continue;
+                        }
+
+                        // Check orientation and fix if needed
+                        let tet = Tetrahedron::new(a, b, c, d);
+                        let sv = tet.signed_volume(&vertices);
+
+                        if sv.abs() < 1e-15 {
+                            continue; // Degenerate
+                        }
+
+                        if sv > 0.0 {
+                            tets.push(tet);
+                        } else {
+                            // Swap two vertices to fix orientation
+                            tets.push(Tetrahedron::new(a, c, b, d));
+                        }
+                    }
+                }
+            }
+        }
+
+        if tets.is_empty() {
+            return Err("Grid tet mesh: no interior tetrahedra found".to_string());
+        }
+
+        log::info!("  Grid tet mesh: {} tetrahedra from {} vertices",
+            tets.len(), vertices.len());
+
+        // Compact: remove unused vertices
+        let mut used = vec![false; vertices.len()];
+        for tet in &tets {
+            for &vi in &tet.vertices {
+                used[vi] = true;
+            }
+        }
+        let mut remap = vec![0usize; vertices.len()];
+        let mut new_vertices = Vec::new();
+        for (i, &is_used) in used.iter().enumerate() {
+            if is_used {
+                remap[i] = new_vertices.len();
+                new_vertices.push(vertices[i]);
+            }
+        }
+        let new_tets: Vec<Tetrahedron> = tets.iter().map(|tet| {
+            Tetrahedron::new(
+                remap[tet.vertices[0]],
+                remap[tet.vertices[1]],
+                remap[tet.vertices[2]],
+                remap[tet.vertices[3]],
+            )
+        }).collect();
+
+        log::info!("  After compaction: {} vertices, {} tets",
+            new_vertices.len(), new_tets.len());
+
+        // Verify: check adjacency connectivity
+        let mesh = Self::new(new_vertices, new_tets);
+        let connected_neighbors: usize = mesh.tet_neighbors.iter()
+            .flat_map(|n| n.iter())
+            .filter(|n| n.is_some())
+            .count();
+        let total_faces = mesh.tets.len() * 4;
+        log::info!("  Adjacency: {}/{} faces connected ({:.1}%)",
+            connected_neighbors, total_faces,
+            100.0 * connected_neighbors as f64 / total_faces as f64);
+
+        Ok(mesh)
     }
 
     /// Convert back to surface mesh
@@ -1234,6 +1459,238 @@ fn convex_hull_at_resolution(mesh: &Mesh, resolution: f64) -> Result<Mesh, Strin
     }).collect();
 
     Mesh::new(triangles).map_err(|e| format!("Failed to create hull mesh: {}", e))
+}
+
+/// Classify grid vertices as inside/outside a surface mesh using 3-axis ray casting.
+///
+/// For each grid vertex, casts rays along +X, +Y, and +Z axes through the mesh.
+/// Uses majority vote (2 out of 3 axes agree) for robust inside/outside classification.
+/// This handles self-intersecting meshes gracefully.
+fn grid_inside_classification(
+    vertices: &[Point3D],
+    nx: usize, ny: usize, nz: usize,
+    origin: &Point3D, cell_size: f64,
+    mesh: &Mesh,
+) -> Vec<bool> {
+    let total = vertices.len();
+    let eps = cell_size * 1e-4;
+
+    // Extract triangles as point triples
+    let tris: Vec<[Point3D; 3]> = mesh.triangles.iter()
+        .map(|t| [t.v0, t.v1, t.v2])
+        .collect();
+
+    // Build 2D spatial bins for each axis to accelerate ray-triangle tests
+    let bin2d_size = cell_size * 5.0;
+    let inv_bin2d = 1.0 / bin2d_size;
+
+    // ── X-axis ray casting ──
+    let mut x_inside = vec![false; total];
+    {
+        let mut yz_bins: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        for (ti, tri) in tris.iter().enumerate() {
+            let ymin = tri[0].y.min(tri[1].y).min(tri[2].y);
+            let ymax = tri[0].y.max(tri[1].y).max(tri[2].y);
+            let zmin = tri[0].z.min(tri[1].z).min(tri[2].z);
+            let zmax = tri[0].z.max(tri[1].z).max(tri[2].z);
+            let iy0 = ((ymin - origin.y) * inv_bin2d).floor() as i32;
+            let iy1 = ((ymax - origin.y) * inv_bin2d).floor() as i32;
+            let iz0 = ((zmin - origin.z) * inv_bin2d).floor() as i32;
+            let iz1 = ((zmax - origin.z) * inv_bin2d).floor() as i32;
+            for by in iy0..=iy1 {
+                for bz in iz0..=iz1 {
+                    yz_bins.entry((by, bz)).or_default().push(ti);
+                }
+            }
+        }
+
+        for iz in 0..nz {
+            for iy in 0..ny {
+                let ray_y = origin.y + iy as f64 * cell_size + eps;
+                let ray_z = origin.z + iz as f64 * cell_size + eps;
+                let by = ((ray_y - origin.y) * inv_bin2d).floor() as i32;
+                let bz = ((ray_z - origin.z) * inv_bin2d).floor() as i32;
+
+                let mut hits: Vec<f64> = Vec::new();
+                if let Some(bin) = yz_bins.get(&(by, bz)) {
+                    for &ti in bin {
+                        if let Some(x) = grid_ray_x_tri(&tris[ti][0], &tris[ti][1], &tris[ti][2], ray_y, ray_z) {
+                            hits.push(x);
+                        }
+                    }
+                }
+                hits.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+                let mut inside = false;
+                let mut hit_idx = 0;
+                for ix in 0..nx {
+                    let x = origin.x + ix as f64 * cell_size + eps;
+                    while hit_idx < hits.len() && hits[hit_idx] < x {
+                        inside = !inside;
+                        hit_idx += 1;
+                    }
+                    if inside {
+                        x_inside[ix + iy * nx + iz * nx * ny] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Y-axis ray casting ──
+    let mut y_inside = vec![false; total];
+    {
+        let mut xz_bins: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        for (ti, tri) in tris.iter().enumerate() {
+            let xmin = tri[0].x.min(tri[1].x).min(tri[2].x);
+            let xmax = tri[0].x.max(tri[1].x).max(tri[2].x);
+            let zmin = tri[0].z.min(tri[1].z).min(tri[2].z);
+            let zmax = tri[0].z.max(tri[1].z).max(tri[2].z);
+            let ix0 = ((xmin - origin.x) * inv_bin2d).floor() as i32;
+            let ix1 = ((xmax - origin.x) * inv_bin2d).floor() as i32;
+            let iz0 = ((zmin - origin.z) * inv_bin2d).floor() as i32;
+            let iz1 = ((zmax - origin.z) * inv_bin2d).floor() as i32;
+            for bx in ix0..=ix1 {
+                for bz in iz0..=iz1 {
+                    xz_bins.entry((bx, bz)).or_default().push(ti);
+                }
+            }
+        }
+
+        for iz in 0..nz {
+            for ix in 0..nx {
+                let ray_x = origin.x + ix as f64 * cell_size + eps;
+                let ray_z = origin.z + iz as f64 * cell_size + eps;
+                let bx = ((ray_x - origin.x) * inv_bin2d).floor() as i32;
+                let bz = ((ray_z - origin.z) * inv_bin2d).floor() as i32;
+
+                let mut hits: Vec<f64> = Vec::new();
+                if let Some(bin) = xz_bins.get(&(bx, bz)) {
+                    for &ti in bin {
+                        if let Some(y) = grid_ray_y_tri(&tris[ti][0], &tris[ti][1], &tris[ti][2], ray_x, ray_z) {
+                            hits.push(y);
+                        }
+                    }
+                }
+                hits.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+                let mut inside = false;
+                let mut hit_idx = 0;
+                for iy in 0..ny {
+                    let y = origin.y + iy as f64 * cell_size + eps;
+                    while hit_idx < hits.len() && hits[hit_idx] < y {
+                        inside = !inside;
+                        hit_idx += 1;
+                    }
+                    if inside {
+                        y_inside[ix + iy * nx + iz * nx * ny] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Z-axis ray casting ──
+    let mut z_inside = vec![false; total];
+    {
+        let mut xy_bins: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        for (ti, tri) in tris.iter().enumerate() {
+            let xmin = tri[0].x.min(tri[1].x).min(tri[2].x);
+            let xmax = tri[0].x.max(tri[1].x).max(tri[2].x);
+            let ymin = tri[0].y.min(tri[1].y).min(tri[2].y);
+            let ymax = tri[0].y.max(tri[1].y).max(tri[2].y);
+            let ix0 = ((xmin - origin.x) * inv_bin2d).floor() as i32;
+            let ix1 = ((xmax - origin.x) * inv_bin2d).floor() as i32;
+            let iy0 = ((ymin - origin.y) * inv_bin2d).floor() as i32;
+            let iy1 = ((ymax - origin.y) * inv_bin2d).floor() as i32;
+            for bx in ix0..=ix1 {
+                for by in iy0..=iy1 {
+                    xy_bins.entry((bx, by)).or_default().push(ti);
+                }
+            }
+        }
+
+        for iy in 0..ny {
+            for ix in 0..nx {
+                let ray_x = origin.x + ix as f64 * cell_size + eps;
+                let ray_y = origin.y + iy as f64 * cell_size + eps;
+                let bx = ((ray_x - origin.x) * inv_bin2d).floor() as i32;
+                let by = ((ray_y - origin.y) * inv_bin2d).floor() as i32;
+
+                let mut hits: Vec<f64> = Vec::new();
+                if let Some(bin) = xy_bins.get(&(bx, by)) {
+                    for &ti in bin {
+                        if let Some(z) = grid_ray_z_tri(&tris[ti][0], &tris[ti][1], &tris[ti][2], ray_x, ray_y) {
+                            hits.push(z);
+                        }
+                    }
+                }
+                hits.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+                let mut inside = false;
+                let mut hit_idx = 0;
+                for iz in 0..nz {
+                    let z = origin.z + iz as f64 * cell_size + eps;
+                    while hit_idx < hits.len() && hits[hit_idx] < z {
+                        inside = !inside;
+                        hit_idx += 1;
+                    }
+                    if inside {
+                        z_inside[ix + iy * nx + iz * nx * ny] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Majority vote: 2+ axes say inside → inside
+    let mut result = vec![false; total];
+    for i in 0..total {
+        let votes = x_inside[i] as u8 + y_inside[i] as u8 + z_inside[i] as u8;
+        result[i] = votes >= 2;
+    }
+
+    let inside_count = result.iter().filter(|&&v| v).count();
+    log::info!("  Grid classification: {} inside, {} outside of {} vertices",
+        inside_count, total - inside_count, total);
+
+    result
+}
+
+/// Ray-triangle intersection for +X axis ray at (y0, z0). Returns X of intersection.
+fn grid_ray_x_tri(a: &Point3D, b: &Point3D, c: &Point3D, y0: f64, z0: f64) -> Option<f64> {
+    let d = (b.y - a.y) * (c.z - a.z) - (b.z - a.z) * (c.y - a.y);
+    if d.abs() < 1e-15 { return None; }
+    let inv_d = 1.0 / d;
+    let u = ((y0 - a.y) * (c.z - a.z) - (z0 - a.z) * (c.y - a.y)) * inv_d;
+    if u < 0.0 || u > 1.0 { return None; }
+    let v = ((b.y - a.y) * (z0 - a.z) - (b.z - a.z) * (y0 - a.y)) * inv_d;
+    if v < 0.0 || u + v > 1.0 { return None; }
+    Some(a.x * (1.0 - u - v) + b.x * u + c.x * v)
+}
+
+/// Ray-triangle intersection for +Y axis ray at (x0, z0). Returns Y of intersection.
+fn grid_ray_y_tri(a: &Point3D, b: &Point3D, c: &Point3D, x0: f64, z0: f64) -> Option<f64> {
+    let d = (b.x - a.x) * (c.z - a.z) - (b.z - a.z) * (c.x - a.x);
+    if d.abs() < 1e-15 { return None; }
+    let inv_d = 1.0 / d;
+    let u = ((x0 - a.x) * (c.z - a.z) - (z0 - a.z) * (c.x - a.x)) * inv_d;
+    if u < 0.0 || u > 1.0 { return None; }
+    let v = ((b.x - a.x) * (z0 - a.z) - (b.z - a.z) * (x0 - a.x)) * inv_d;
+    if v < 0.0 || u + v > 1.0 { return None; }
+    Some(a.y * (1.0 - u - v) + b.y * u + c.y * v)
+}
+
+/// Ray-triangle intersection for +Z axis ray at (x0, y0). Returns Z of intersection.
+fn grid_ray_z_tri(a: &Point3D, b: &Point3D, c: &Point3D, x0: f64, y0: f64) -> Option<f64> {
+    let d = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    if d.abs() < 1e-15 { return None; }
+    let inv_d = 1.0 / d;
+    let u = ((x0 - a.x) * (c.y - a.y) - (y0 - a.y) * (c.x - a.x)) * inv_d;
+    if u < 0.0 || u > 1.0 { return None; }
+    let v = ((b.x - a.x) * (y0 - a.y) - (b.y - a.y) * (x0 - a.x)) * inv_d;
+    if v < 0.0 || u + v > 1.0 { return None; }
+    Some(a.z * (1.0 - u - v) + b.z * u + c.z * v)
 }
 
 /// Hash a point for deduplication

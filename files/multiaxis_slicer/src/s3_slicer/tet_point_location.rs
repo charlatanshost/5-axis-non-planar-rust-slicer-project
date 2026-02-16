@@ -348,6 +348,53 @@ pub fn interpolate_point(
     )
 }
 
+/// Deform a surface mesh through a tet mesh deformation.
+///
+/// For each vertex of the surface mesh, finds which tet in the ORIGINAL tet mesh
+/// contains it, computes barycentric coordinates, then interpolates the deformed
+/// position from the DEFORMED tet mesh. This preserves the original mesh topology
+/// (triangle connectivity) while applying the volumetric deformation.
+///
+/// This is critical for grid-based tet meshes whose surface is blocky — we want
+/// to slice the original mesh surface deformed through the tet field, not the
+/// blocky tet surface itself.
+pub fn deform_surface_through_tets(
+    surface_mesh: &crate::mesh::Mesh,
+    original_tet_mesh: &TetMesh,
+    deformed_tet_mesh: &TetMesh,
+) -> crate::mesh::Mesh {
+    let grid = TetSpatialGrid::build(original_tet_mesh);
+
+    let deformed_triangles: Vec<crate::geometry::Triangle> = surface_mesh.triangles.iter()
+        .map(|tri| {
+            let deform_point = |p: &Point3D| -> Point3D {
+                let loc = match grid.find_containing_tet(p, original_tet_mesh) {
+                    Some(r) => r,
+                    None => grid.find_nearest_tet(p, original_tet_mesh),
+                };
+                let tet = &deformed_tet_mesh.tets[loc.tet_index];
+                interpolate_point(
+                    &loc.bary_coords,
+                    &deformed_tet_mesh.vertices[tet.vertices[0]],
+                    &deformed_tet_mesh.vertices[tet.vertices[1]],
+                    &deformed_tet_mesh.vertices[tet.vertices[2]],
+                    &deformed_tet_mesh.vertices[tet.vertices[3]],
+                )
+            };
+
+            crate::geometry::Triangle {
+                v0: deform_point(&tri.v0),
+                v1: deform_point(&tri.v1),
+                v2: deform_point(&tri.v2),
+            }
+        })
+        .collect();
+
+    log::info!("  → Deformed {} surface triangles through tet mesh", deformed_triangles.len());
+
+    crate::mesh::Mesh::new(deformed_triangles).unwrap()
+}
+
 /// Compute 1D cell index for a coordinate value.
 fn cell_index_1d(value: f64, min: f64, cell_size: f64, num_cells: usize) -> usize {
     if cell_size <= 0.0 || num_cells == 0 {

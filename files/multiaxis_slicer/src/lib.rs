@@ -12,6 +12,9 @@ pub mod singularity;
 pub mod motion_planning;
 pub mod support_generation;
 pub mod s3_slicer;
+pub mod conical;
+pub mod contour_offset;
+pub mod geodesic;
 pub mod gui;
 
 // Re-export commonly used types
