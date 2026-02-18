@@ -83,14 +83,20 @@ pub fn execute_conical_pipeline(
     };
     log::info!("  Planar slicer produced {} layers", planar_layers.len());
 
-    // Step 3: Back-transform contour points
+    // Step 3: Back-transform contour points to original space
     log::info!("Step 3/3: Back-transforming contour points to original space...");
-    let layers: Vec<Layer> = planar_layers.into_iter()
+    let bed_z = mesh.bounds_min.z;
+    let mut layers: Vec<Layer> = planar_layers.into_iter()
         .map(|layer| {
             let contours: Vec<Contour> = layer.contours.into_iter()
                 .map(|contour| {
                     let points: Vec<Point3D> = contour.points.into_iter()
-                        .map(|p| conical_inverse(p, center_x, center_y, tan_angle, sign))
+                        .map(|p| {
+                            let mut p = conical_inverse(p, center_x, center_y, tan_angle, sign);
+                            // Clamp to bed level (prevents numerical artifacts below build plate)
+                            if p.z < bed_z { p.z = bed_z; }
+                            p
+                        })
                         .collect();
                     Contour::new(points, contour.closed)
                 })
@@ -109,6 +115,9 @@ pub fn execute_conical_pipeline(
             Layer::new(avg_z, contours, layer.layer_height)
         })
         .collect();
+
+    // Sort layers by Z for consistent bottom-up printing
+    layers.sort_by(|a, b| a.z.partial_cmp(&b.z).unwrap_or(std::cmp::Ordering::Equal));
 
     let total_contours: usize = layers.iter().map(|l| l.contours.len()).sum();
     let total_points: usize = layers.iter()

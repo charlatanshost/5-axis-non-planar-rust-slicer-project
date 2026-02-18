@@ -585,6 +585,22 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                 ui.checkbox(&mut app.show_wireframe, "Wireframe mode");
                 ui.checkbox(&mut app.show_gcode_terminal, "Show G-code terminal");
 
+                // Section view controls
+                ui.checkbox(&mut app.section_enabled, "Section view");
+                if app.section_enabled {
+                    ui.horizontal(|ui| {
+                        ui.label("Axis:");
+                        ui.selectable_value(&mut app.section_axis, 0, "X");
+                        ui.selectable_value(&mut app.section_axis, 1, "Y");
+                        ui.selectable_value(&mut app.section_axis, 2, "Z");
+                    });
+                    ui.add(egui::Slider::new(&mut app.section_depth, 0.0..=1.0)
+                        .text("Depth"));
+                }
+
+                ui.checkbox(&mut app.show_travel_moves, "Show travel moves")
+                    .on_hover_text("Toggle visibility of rapid travel moves (cyan lines) in toolpath view");
+
                 ui.separator();
 
                 // Toolpath playback controls

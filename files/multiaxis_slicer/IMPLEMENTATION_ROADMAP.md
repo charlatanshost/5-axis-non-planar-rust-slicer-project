@@ -458,12 +458,58 @@ faer = "0.13"                    # Fast linear algebra
 
 ---
 
+---
+
+## Servo Firmware & Advanced G-code (Future)
+
+> **Context:** The slicer targets a custom servo-driven machine (not stepper-based).
+> Servo motors have fundamentally different motion characteristics — they can execute
+> true arc interpolation and jerk-limited profiling much more accurately than steppers,
+> making the following G-code features actually worth implementing (unlike on typical
+> FDM printers where firmware support is spotty).
+
+### G5 / G6 — Cubic B-Spline / Circular Interpolation
+- **G5 IJK** — cubic spline move (Marlin 2.x, LinuxCNC)
+- **G6.1 Q1** — NURBS feedforward (Fanuc/Siemens CNC)
+- **Why servo makes this viable:** Servos close the position loop fast enough to track
+  smooth curves without losing steps; steppers cannot.
+- **Implementation plan:**
+  1. Add a `GCodeDialect` enum to `gcode.rs`: `Marlin`, `Klipper`, `LinuxCNC`, `Fanuc`
+  2. In the G-code generator, detect sequences of collinear-ish segments and fit arcs
+     (radius-of-curvature > configurable threshold)
+  3. Emit `G2`/`G3` (arc) or `G5` (spline) instead of a chain of `G1` moves
+  4. Fall back to `G1` subdivision if the controller dialect doesn't support it
+
+### G64 — Path Blending / Continuous Mode
+- **G64 P<tolerance>** (LinuxCNC) / **G64** (Fanuc) — allows the controller to blend
+  path segments without coming to a full stop at each corner
+- Reduces print time and eliminates the "dot" artefact at segment junctions
+- **Implementation plan:**
+  - Emit `G64 P0.05` in the G-code header when `dialect = LinuxCNC`
+  - Add a `path_blend_tolerance` field to `MachineConfig` (default `0.0` = disabled)
+  - Document that this requires the servo firmware to support look-ahead planning
+
+### Jerk-Limited Velocity Profiling (S-Curve)
+- Servo drives can execute S-curve acceleration profiles natively
+- Slicer side: pre-compute segment speeds so the firmware doesn't have to
+- Long-term: generate `M566` (Duet) or equivalent jerk limits per-segment
+
+### Relevant Files to Modify
+| File | Change |
+|------|--------|
+| `src/gcode.rs` | Add `GCodeDialect`, arc/spline emission, G64 header |
+| `src/gui/app.rs` | Add `gcode_dialect` field to app state |
+| `src/gui/control_panel.rs` | Dialect selector dropdown |
+| `src/motion_planning/mod.rs` | Feed arc-fitting results into G-code stage |
+
+---
+
 ## Notes
 
-**Current Status:** Implementing overhang detection as first step of support generation.
+**Current Status:** Core slicing methods complete (Planar, Conical, S3, S4, Geodesic).
+Active work: slicing quality fixes, section view, playback visualization.
 
-**Next Up:** Complete overhang detection, then move to tree skeleton generation.
+**Servo G-code features** are deferred until the servo firmware project reaches a stage
+where these G-codes are supported — at that point, `gcode.rs` is the primary entry point.
 
-**Questions/Blockers:** None currently.
-
-**Last Updated:** 2026-01-24
+**Last Updated:** 2026-02-18

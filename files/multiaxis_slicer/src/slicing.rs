@@ -89,11 +89,14 @@ impl Slicer {
         log::info!("Generated {} slicing planes", slicing_planes.len());
 
         // Parallel slicing using Rayon
-        let layers: Vec<Layer> = slicing_planes
+        let mut layers: Vec<Layer> = slicing_planes
             .par_iter()
             .map(|&z| self.slice_at_height(mesh, z))
             .filter(|layer| !layer.is_empty())
             .collect();
+
+        // Ensure deterministic layer ordering (par_iter doesn't guarantee order)
+        layers.sort_by(|a, b| a.z.partial_cmp(&b.z).unwrap());
 
         log::info!("Generated {} non-empty layers", layers.len());
         Ok(layers)

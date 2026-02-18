@@ -45,6 +45,31 @@ pub struct Viewport3D {
     // Coordinate axes (X=red, Y=green, Z=blue)
     axes_mesh: Option<Arc<Gm<Mesh, ColorMaterial>>>,
 
+    // Layer contour visualization
+    layer_lines: Option<Arc<Gm<Mesh, ColorMaterial>>>,
+    last_layer_count: usize,
+
+    // Wireframe overlay
+    wireframe_mesh: Option<Arc<Gm<Mesh, ColorMaterial>>>,
+    last_wireframe_triangle_count: usize,
+
+    // Playback tracking
+    last_playback_position: usize,
+
+    // Section view (mesh cut)
+    section_mesh: Option<Arc<Gm<Mesh, PhysicalMaterial>>>,
+    last_section_axis: u8,
+    last_section_depth: f32,
+    last_section_enabled: bool,
+
+    // Section view tracking for layer/toolpath content rebuild
+    last_section_axis_for_content: u8,
+    last_section_depth_for_content: f32,
+    last_section_enabled_for_content: bool,
+
+    // Travel moves visibility tracking
+    last_show_travel_moves: bool,
+
     // Face selection
     last_mesh_triangle_count: usize,
 }
@@ -81,6 +106,19 @@ impl Viewport3D {
             toolpath_lines: None,
             last_toolpath_count: 0,
             axes_mesh: None,
+            layer_lines: None,
+            last_layer_count: 0,
+            wireframe_mesh: None,
+            last_wireframe_triangle_count: 0,
+            last_playback_position: usize::MAX,
+            section_mesh: None,
+            last_section_axis: 255,
+            last_section_depth: 1.0,
+            last_section_enabled: false,
+            last_section_axis_for_content: 255,
+            last_section_depth_for_content: 1.0,
+            last_section_enabled_for_content: false,
+            last_show_travel_moves: true,
             last_mesh_triangle_count: 0,
         }
     }
@@ -326,8 +364,19 @@ impl Viewport3D {
         self.toolpath_spheres = None;
         self.toolpath_lines = None;
         self.axes_mesh = None;
+        self.layer_lines = None;
+        self.wireframe_mesh = None;
         self.last_toolpath_count = 0;
+        self.last_layer_count = 0;
+        self.last_wireframe_triangle_count = 0;
         self.last_mesh_triangle_count = 0;
+        self.section_mesh = None;
+        self.last_section_enabled = false;
+        self.last_section_axis_for_content = 255;
+        self.last_section_depth_for_content = 1.0;
+        self.last_section_enabled_for_content = false;
+        self.last_show_travel_moves = true;
+        self.last_playback_position = usize::MAX;
     }
 
     /// Create build plate grid as 3D mesh
@@ -502,6 +551,277 @@ impl Viewport3D {
         log::info!("✓ Created XYZ coordinate axes (X=red, Y=green, Z=blue)");
     }
 
+    /// Create 3D visualization of layer contours as colored tube lines
+    fn create_layer_lines(&mut self, app: &SlicerApp) {
+        if app.layers.is_empty() {
+            self.layer_lines = None;
+            self.last_layer_count = 0;
+            return;
+        }
+
+        // Compute section clip plane (if active)
+        let mesh_bounds_copy = self.mesh_bounds;
+        let section_filter: Option<(usize, f32)> = if app.section_enabled {
+            mesh_bounds_copy.map(|(bounds_min, bounds_max)| {
+                let ax = app.section_axis.min(2) as usize;
+                let cut_pos = bounds_min[ax] + app.section_depth * (bounds_max[ax] - bounds_min[ax]);
+                (ax, cut_pos)
+            })
+        } else {
+            None
+        };
+
+        let mut positions: Vec<Vec3> = Vec::new();
+        let mut normals: Vec<Vec3> = Vec::new();
+        let mut colors: Vec<Srgba> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+
+        let tube_radius = 0.15;
+        let tube_segments = 3; // Triangular cross-section for performance
+
+        // Find min/max Z for color gradient
+        let min_z = app.layers.iter().map(|l| l.z).fold(f64::INFINITY, f64::min) as f32;
+        let max_z = app.layers.iter().map(|l| l.z).fold(f64::NEG_INFINITY, f64::max) as f32;
+        let z_range = (max_z - min_z).max(0.1);
+
+        let mut total_segments = 0usize;
+
+        for layer in &app.layers {
+            // Color gradient: blue (240°) at bottom → magenta (300°) at top
+            let t = ((layer.z as f32) - min_z) / z_range;
+            let hue = 240.0 + 60.0 * t; // 240° = blue, 300° = magenta
+            let (r, g, b) = hsl_to_rgb(hue, 0.9, 0.55);
+            let color = Srgba::new((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, 255);
+
+            for contour in &layer.contours {
+                if contour.points.len() < 2 {
+                    continue;
+                }
+
+                for window in contour.points.windows(2) {
+                    let p1 = vec3(window[0].x as f32, window[0].y as f32, window[0].z as f32);
+                    let p2 = vec3(window[1].x as f32, window[1].y as f32, window[1].z as f32);
+
+                    // Section clip: skip if either endpoint is beyond the cut plane
+                    if let Some((ax, cut_pos)) = section_filter {
+                        let p1c = match ax { 0 => p1.x, 1 => p1.y, _ => p1.z };
+                        let p2c = match ax { 0 => p2.x, 1 => p2.y, _ => p2.z };
+                        if p1c > cut_pos || p2c > cut_pos { continue; }
+                    }
+
+                    create_tube_segment(
+                        p1, p2, tube_radius, tube_segments, color,
+                        &mut positions, &mut normals, &mut colors, &mut indices,
+                    );
+                    total_segments += 1;
+                }
+
+                // Close the contour if it's closed
+                if contour.closed && contour.points.len() >= 3 {
+                    let first = contour.points.first().unwrap();
+                    let last = contour.points.last().unwrap();
+                    let p1 = vec3(last.x as f32, last.y as f32, last.z as f32);
+                    let p2 = vec3(first.x as f32, first.y as f32, first.z as f32);
+
+                    if let Some((ax, cut_pos)) = section_filter {
+                        let p1c = match ax { 0 => p1.x, 1 => p1.y, _ => p1.z };
+                        let p2c = match ax { 0 => p2.x, 1 => p2.y, _ => p2.z };
+                        if p1c > cut_pos || p2c > cut_pos { continue; }
+                    }
+
+                    create_tube_segment(
+                        p1, p2, tube_radius, tube_segments, color,
+                        &mut positions, &mut normals, &mut colors, &mut indices,
+                    );
+                    total_segments += 1;
+                }
+            }
+        }
+
+        self.last_layer_count = app.layers.len();
+
+        if positions.is_empty() {
+            self.layer_lines = None;
+            return;
+        }
+
+        let cpu_mesh = CpuMesh {
+            positions: Positions::F32(positions),
+            normals: Some(normals),
+            colors: Some(colors),
+            indices: Indices::U32(indices),
+            ..Default::default()
+        };
+
+        let gpu_mesh = Mesh::new(&self.context, &cpu_mesh);
+        self.layer_lines = Some(Arc::new(Gm::new(gpu_mesh, ColorMaterial::default())));
+
+        log::info!("✓ Layer visualization: {} layers, {} segments (BLUE→MAGENTA by height)",
+            app.layers.len(), total_segments);
+    }
+
+    /// Create wireframe overlay showing mesh triangle edges as thin tubes
+    fn create_wireframe_mesh(&mut self, mesh: &SlicerMesh) {
+        use std::collections::HashSet;
+
+        let mut positions: Vec<Vec3> = Vec::new();
+        let mut normals: Vec<Vec3> = Vec::new();
+        let mut colors: Vec<Srgba> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+
+        let tube_radius = 0.05;
+        let tube_segments = 3;
+        let wire_color = Srgba::new(255, 255, 255, 200);
+
+        // Quantize vertex positions to weld STL duplicate vertices
+        let quantize = |v: f64| -> i64 { (v * 1e3).round() as i64 };
+
+        // Collect unique edges by quantized vertex positions
+        let mut seen_edges: HashSet<((i64, i64, i64), (i64, i64, i64))> = HashSet::new();
+        let mut edge_endpoints: Vec<(Vec3, Vec3)> = Vec::new();
+
+        for tri in &mesh.triangles {
+            let verts = [
+                (tri.v0.x, tri.v0.y, tri.v0.z),
+                (tri.v1.x, tri.v1.y, tri.v1.z),
+                (tri.v2.x, tri.v2.y, tri.v2.z),
+            ];
+            let keys: Vec<(i64, i64, i64)> = verts.iter()
+                .map(|v| (quantize(v.0), quantize(v.1), quantize(v.2)))
+                .collect();
+
+            for i in 0..3 {
+                let j = (i + 1) % 3;
+                let (a, b) = if keys[i] < keys[j] { (keys[i], keys[j]) } else { (keys[j], keys[i]) };
+                if seen_edges.insert((a, b)) {
+                    edge_endpoints.push((
+                        vec3(verts[i].0 as f32, verts[i].1 as f32, verts[i].2 as f32),
+                        vec3(verts[j].0 as f32, verts[j].1 as f32, verts[j].2 as f32),
+                    ));
+                }
+            }
+        }
+
+        // Limit wireframe to avoid massive GPU uploads on complex meshes
+        let max_edges = 200_000;
+        let edges_to_render = if edge_endpoints.len() > max_edges {
+            log::warn!("  Wireframe: capping at {} edges (mesh has {})", max_edges, edge_endpoints.len());
+            &edge_endpoints[..max_edges]
+        } else {
+            &edge_endpoints[..]
+        };
+
+        for (p1, p2) in edges_to_render {
+            create_tube_segment(
+                *p1, *p2, tube_radius, tube_segments, wire_color,
+                &mut positions, &mut normals, &mut colors, &mut indices,
+            );
+        }
+
+        self.last_wireframe_triangle_count = mesh.triangles.len();
+
+        if positions.is_empty() {
+            self.wireframe_mesh = None;
+            return;
+        }
+
+        let cpu_mesh = CpuMesh {
+            positions: Positions::F32(positions),
+            normals: Some(normals),
+            colors: Some(colors),
+            indices: Indices::U32(indices),
+            ..Default::default()
+        };
+
+        let gpu_mesh = Mesh::new(&self.context, &cpu_mesh);
+        self.wireframe_mesh = Some(Arc::new(Gm::new(gpu_mesh, ColorMaterial::default())));
+
+        log::info!("✓ Wireframe: {} unique edges rendered", edges_to_render.len());
+    }
+
+    /// Create section view mesh by filtering triangles on one side of a clipping plane
+    fn create_section_mesh(&mut self, mesh: &SlicerMesh, axis: u8, depth: f32) {
+        let bounds_min = [mesh.bounds_min.x as f32, mesh.bounds_min.y as f32, mesh.bounds_min.z as f32];
+        let bounds_max = [mesh.bounds_max.x as f32, mesh.bounds_max.y as f32, mesh.bounds_max.z as f32];
+        let ax = axis.min(2) as usize;
+        let cut_pos = bounds_min[ax] + depth * (bounds_max[ax] - bounds_min[ax]);
+
+        let mut positions: Vec<Vec3> = Vec::new();
+        let mut normals: Vec<Vec3> = Vec::new();
+
+        for triangle in mesh.triangles.iter() {
+            let v0 = vec3(triangle.v0.x as f32, triangle.v0.y as f32, triangle.v0.z as f32);
+            let v1 = vec3(triangle.v1.x as f32, triangle.v1.y as f32, triangle.v1.z as f32);
+            let v2 = vec3(triangle.v2.x as f32, triangle.v2.y as f32, triangle.v2.z as f32);
+
+            // Centroid-based filtering
+            let centroid_val = match ax {
+                0 => (v0.x + v1.x + v2.x) / 3.0,
+                1 => (v0.y + v1.y + v2.y) / 3.0,
+                _ => (v0.z + v1.z + v2.z) / 3.0,
+            };
+
+            if centroid_val > cut_pos {
+                continue;
+            }
+
+            positions.push(v0);
+            positions.push(v1);
+            positions.push(v2);
+
+            let edge1 = v1 - v0;
+            let edge2 = v2 - v0;
+            let mut normal = edge1.cross(edge2);
+            let len = (normal.x * normal.x + normal.y * normal.y + normal.z * normal.z).sqrt();
+            if len > 1e-6 {
+                normal = vec3(normal.x / len, normal.y / len, normal.z / len);
+            } else {
+                normal = vec3(0.0, 1.0, 0.0);
+            }
+            normals.push(normal);
+            normals.push(normal);
+            normals.push(normal);
+        }
+
+        if positions.is_empty() {
+            self.section_mesh = None;
+            return;
+        }
+
+        let num_tris = positions.len() / 3;
+        let indices: Vec<u32> = (0..positions.len() as u32).collect();
+        let colors = vec![Srgba::new(220, 220, 230, 255); positions.len()];
+
+        let cpu_mesh = CpuMesh {
+            positions: Positions::F32(positions),
+            normals: Some(normals),
+            colors: Some(colors),
+            indices: Indices::U32(indices),
+            ..Default::default()
+        };
+
+        let gpu_mesh = Mesh::new(&self.context, &cpu_mesh);
+        let material = PhysicalMaterial::new_opaque(
+            &self.context,
+            &CpuMaterial {
+                albedo: Srgba::new(220, 220, 230, 255),
+                roughness: 0.7,
+                metallic: 0.05,
+                ..Default::default()
+            },
+        );
+        let mut material = material;
+        material.render_states.cull = Cull::None;
+        material.render_states.depth_test = DepthTest::Less;
+
+        self.section_mesh = Some(Arc::new(Gm::new(gpu_mesh, material)));
+        self.last_section_axis = axis;
+        self.last_section_depth = depth;
+
+        log::info!("✓ Section view: {}/{} triangles visible (axis={}, depth={:.2})",
+            num_tris, mesh.triangles.len(), ["X", "Y", "Z"][ax], depth);
+    }
+
     /// Create 3D visualization of ALL toolpaths as thin tube geometry
     /// Color scheme:
     /// - EXTRUSION moves: Gradient from GREEN (start) → YELLOW → RED (end) based on queue position
@@ -513,6 +833,18 @@ impl Viewport3D {
             self.last_toolpath_count = 0;
             return;
         }
+
+        // Compute section clip plane (if active)
+        let mesh_bounds_copy = self.mesh_bounds;
+        let section_filter: Option<(usize, f32)> = if app.section_enabled {
+            mesh_bounds_copy.map(|(bounds_min, bounds_max)| {
+                let ax = app.section_axis.min(2) as usize;
+                let cut_pos = bounds_min[ax] + app.section_depth * (bounds_max[ax] - bounds_min[ax]);
+                (ax, cut_pos)
+            })
+        } else {
+            None
+        };
 
         // For tube segments (proper 3D geometry)
         let mut tube_positions: Vec<Vec3> = Vec::new();
@@ -543,6 +875,22 @@ impl Viewport3D {
 
                 // Determine if this is extrusion or travel move
                 let is_extrusion = window[1].extrusion > 1e-6;
+
+                // Skip travel moves if hidden
+                if !app.show_travel_moves && !is_extrusion {
+                    global_segment_idx += 1;
+                    continue;
+                }
+
+                // Section clip: skip if either endpoint is beyond the cut plane
+                if let Some((ax, cut_pos)) = section_filter {
+                    let p1c = match ax { 0 => p1.x, 1 => p1.y, _ => p1.z };
+                    let p2c = match ax { 0 => p2.x, 1 => p2.y, _ => p2.z };
+                    if p1c > cut_pos || p2c > cut_pos {
+                        global_segment_idx += 1;
+                        continue;
+                    }
+                }
 
                 let segment_color = if is_extrusion {
                     // EXTRUSION: Gradient GREEN (120°) -> YELLOW (60°) -> RED (0°)
@@ -594,6 +942,112 @@ impl Viewport3D {
 
         log::info!("✓ Toolpath visualization: {} segments (GREEN→RED = extrusion queue, CYAN = travel)",
             total_segments);
+    }
+
+    /// Create 3D visualization of toolpaths up to a specific segment index (for playback)
+    /// Shows a bright nozzle marker at the current position
+    fn create_toolpath_lines_up_to(&mut self, app: &SlicerApp, max_segment: usize) {
+        if app.toolpaths.is_empty() {
+            self.toolpath_spheres = None;
+            self.toolpath_lines = None;
+            self.last_toolpath_count = 0;
+            return;
+        }
+
+        // Compute section clip plane (if active)
+        let mesh_bounds_copy = self.mesh_bounds;
+        let section_filter: Option<(usize, f32)> = if app.section_enabled {
+            mesh_bounds_copy.map(|(bounds_min, bounds_max)| {
+                let ax = app.section_axis.min(2) as usize;
+                let cut_pos = bounds_min[ax] + app.section_depth * (bounds_max[ax] - bounds_min[ax]);
+                (ax, cut_pos)
+            })
+        } else {
+            None
+        };
+
+        let mut tube_positions: Vec<Vec3> = Vec::new();
+        let mut tube_normals: Vec<Vec3> = Vec::new();
+        let mut tube_colors: Vec<Srgba> = Vec::new();
+        let mut tube_indices: Vec<u32> = Vec::new();
+
+        let tube_radius = 0.2;
+        let tube_segments = 4;
+
+        // Use visible count for gradient so color range covers what's shown
+        let total_visible = max_segment + 1;
+        let mut global_segment_idx = 0usize;
+
+        'outer: for toolpath in app.toolpaths.iter() {
+            for window in toolpath.paths.windows(2) {
+                if global_segment_idx > max_segment {
+                    break 'outer;
+                }
+
+                let p1 = vec3(window[0].position.x as f32, window[0].position.y as f32, window[0].position.z as f32);
+                let p2 = vec3(window[1].position.x as f32, window[1].position.y as f32, window[1].position.z as f32);
+
+                let is_extrusion = window[1].extrusion > 1e-6;
+                let is_last = global_segment_idx == max_segment;
+
+                // Skip travel moves if hidden (still advance index to keep playback position correct)
+                if !app.show_travel_moves && !is_extrusion && !is_last {
+                    global_segment_idx += 1;
+                    continue;
+                }
+
+                // Section clip: skip if either endpoint is beyond the cut plane
+                if let Some((ax, cut_pos)) = section_filter {
+                    let p1c = match ax { 0 => p1.x, 1 => p1.y, _ => p1.z };
+                    let p2c = match ax { 0 => p2.x, 1 => p2.y, _ => p2.z };
+                    if (p1c > cut_pos || p2c > cut_pos) && !is_last {
+                        global_segment_idx += 1;
+                        continue;
+                    }
+                }
+
+                let segment_color = if is_last {
+                    // Nozzle position: bright white
+                    Srgba::new(255, 255, 255, 255)
+                } else if is_extrusion {
+                    let t = global_segment_idx as f32 / total_visible.max(1) as f32;
+                    let hue = 120.0 * (1.0 - t);
+                    let (r, g, b) = hsl_to_rgb(hue, 1.0, 0.5);
+                    Srgba::new((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, 255)
+                } else {
+                    Srgba::new(0, 220, 255, 220)
+                };
+
+                let radius = if is_last { tube_radius * 2.5 } else { tube_radius };
+
+                create_tube_segment(
+                    p1, p2, radius, tube_segments, segment_color,
+                    &mut tube_positions, &mut tube_normals, &mut tube_colors, &mut tube_indices
+                );
+
+                global_segment_idx += 1;
+            }
+        }
+
+        self.last_toolpath_count = app.toolpaths.len();
+        self.toolpath_spheres = None;
+
+        if tube_positions.is_empty() || tube_indices.is_empty() {
+            self.toolpath_lines = None;
+            return;
+        }
+
+        let tube_cpu_mesh = CpuMesh {
+            positions: Positions::F32(tube_positions),
+            normals: Some(tube_normals),
+            colors: Some(tube_colors),
+            indices: Indices::U32(tube_indices),
+            ..Default::default()
+        };
+
+        let tube_gpu_mesh = Mesh::new(&self.context, &tube_cpu_mesh);
+        let tube_material = ColorMaterial::default();
+        self.toolpath_lines = Some(Arc::new(Gm::new(tube_gpu_mesh, tube_material)));
     }
 
     /// Render build plate grid at specified Z height by projecting to 2D screen space
@@ -734,10 +1188,75 @@ impl Viewport3D {
             }
         }
 
-        // Update toolpath lines if they changed
-        if app.toolpaths.len() != self.last_toolpath_count {
+        // Detect section/travel state changes (affects layer lines and toolpath lines)
+        let section_content_changed = app.section_enabled != self.last_section_enabled_for_content
+            || (app.section_enabled && (
+                app.section_axis != self.last_section_axis_for_content
+                || (app.section_depth - self.last_section_depth_for_content).abs() > 0.001
+            ));
+        let travel_changed = app.show_travel_moves != self.last_show_travel_moves;
+
+        // Update toolpath lines — playback-aware rebuild
+        if app.toolpath_playback_enabled {
+            // Rebuild when playback position, toolpaths, section, or travel visibility changed
+            if app.toolpath_playback_position != self.last_playback_position
+                || app.toolpaths.len() != self.last_toolpath_count
+                || section_content_changed
+                || travel_changed
+            {
+                self.create_toolpath_lines_up_to(app, app.toolpath_playback_position);
+                self.last_playback_position = app.toolpath_playback_position;
+            }
+        } else if app.toolpaths.len() != self.last_toolpath_count
+            || self.last_playback_position != usize::MAX
+            || section_content_changed
+            || travel_changed
+        {
+            // Playback disabled or toolpaths/section/travel changed — show all
             log::info!("Updating toolpath visualization ({} layers)", app.toolpaths.len());
             self.create_toolpath_lines(app);
+            self.last_playback_position = usize::MAX;
+        }
+
+        // Update layer contour lines if they changed or section changed
+        if app.layers.len() != self.last_layer_count || section_content_changed {
+            log::info!("Updating layer visualization ({} layers)", app.layers.len());
+            self.create_layer_lines(app);
+        }
+
+        // Persist section/travel tracking state
+        if section_content_changed {
+            self.last_section_enabled_for_content = app.section_enabled;
+            self.last_section_axis_for_content = app.section_axis;
+            self.last_section_depth_for_content = app.section_depth;
+        }
+        if travel_changed {
+            self.last_show_travel_moves = app.show_travel_moves;
+        }
+
+        // Update wireframe if mesh changed
+        if let Some(mesh) = display_mesh {
+            if app.show_wireframe && mesh.triangles.len() != self.last_wireframe_triangle_count {
+                log::info!("Creating wireframe visualization ({} triangles)", mesh.triangles.len());
+                self.create_wireframe_mesh(mesh);
+            }
+        }
+
+        // Update section view mesh
+        if let Some(mesh) = display_mesh {
+            if app.section_enabled {
+                let depth_changed = (app.section_depth - self.last_section_depth).abs() > 0.001;
+                let axis_changed = app.section_axis != self.last_section_axis;
+                let mesh_changed = mesh.triangles.len() != self.last_mesh_triangle_count;
+                let just_enabled = !self.last_section_enabled;
+                if depth_changed || axis_changed || mesh_changed || just_enabled {
+                    self.create_section_mesh(mesh, app.section_axis, app.section_depth);
+                }
+                self.last_section_enabled = true;
+            } else if self.last_section_enabled {
+                self.section_mesh = None;
+                self.last_section_enabled = false;
+            }
         }
 
         // Allocate space for the 3D viewport
@@ -805,11 +1324,22 @@ impl Viewport3D {
                 }
             }
             let context = self.context.clone();
-            let mesh_arc = Arc::clone(mesh_obj);
+            // Use section mesh when section view is active, otherwise full mesh
+            let mesh_arc = if app.show_mesh {
+                if app.section_enabled {
+                    self.section_mesh.clone()
+                } else {
+                    Some(Arc::clone(mesh_obj))
+                }
+            } else {
+                None
+            };
             let build_plate_arc = self.build_plate_mesh.clone();
             // Only include toolpath objects if show_toolpaths is enabled
             let toolpath_spheres_arc = if app.show_toolpaths { self.toolpath_spheres.clone() } else { None };
             let toolpath_lines_arc = if app.show_toolpaths { self.toolpath_lines.clone() } else { None };
+            let layer_lines_arc = if app.show_layers { self.layer_lines.clone() } else { None };
+            let wireframe_arc = if app.show_wireframe { self.wireframe_mesh.clone() } else { None };
             let axes_arc = self.axes_mesh.clone();
             let camera_yaw = self.camera_yaw;
             let camera_pitch = self.camera_pitch;
@@ -905,7 +1435,14 @@ impl Viewport3D {
                         );
 
                         // Collect objects to render
-                        let mut objects: Vec<&dyn three_d::Object> = vec![&*mesh_arc];
+                        let mut objects: Vec<&dyn three_d::Object> = Vec::new();
+
+                        // Add mesh if show_mesh is enabled
+                        let mesh_ref;
+                        if let Some(ref m) = mesh_arc {
+                            mesh_ref = m.clone();
+                            objects.push(&*mesh_ref);
+                        }
 
                         // Add build plate if available
                         let build_plate_ref;
@@ -926,6 +1463,20 @@ impl Viewport3D {
                         if let Some(ref tp_lines) = toolpath_lines_arc {
                             toolpath_lines_ref = tp_lines.clone();
                             objects.push(&*toolpath_lines_ref);
+                        }
+
+                        // Add layer contour lines if available
+                        let layer_lines_ref;
+                        if let Some(ref ll) = layer_lines_arc {
+                            layer_lines_ref = ll.clone();
+                            objects.push(&*layer_lines_ref);
+                        }
+
+                        // Add wireframe overlay if available
+                        let wireframe_ref;
+                        if let Some(ref wf) = wireframe_arc {
+                            wireframe_ref = wf.clone();
+                            objects.push(&*wireframe_ref);
                         }
 
                         // Add coordinate axes

@@ -685,12 +685,38 @@ pub fn geodesic_slice(mesh: &Mesh, config: &GeodesicSlicerConfig) -> Vec<Layer> 
         }
         let contours = extract_level_set(&topo, &distances, level);
         if !contours.is_empty() {
-            layers.push(Layer::new(level, contours, config.layer_height));
+            // Use minimum Z of contour points as layer height for printability.
+            // Geodesic distance ≠ build height — a single level set can contain
+            // contours at wildly different Z heights on complex meshes.
+            // Using min Z ensures the layer is printed at a physically reachable height.
+            let min_z = contours.iter()
+                .flat_map(|c| c.points.iter())
+                .map(|p| p.z)
+                .fold(f64::INFINITY, f64::min);
+            layers.push(Layer::new(min_z, contours, config.layer_height));
         }
     }
 
-    log::info!("=== Geodesic slicing complete: {} layers ===", layers.len());
-    layers
+    // Sort layers by Z (bottom-up) for printability.
+    // Without this, layers ordered by geodesic distance may print high-Z
+    // geometry (ears, protrusions) before the supporting body below.
+    layers.sort_by(|a, b| a.z.partial_cmp(&b.z).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Deduplicate layers at nearly identical Z heights (merge contours)
+    let mut merged_layers: Vec<Layer> = Vec::new();
+    for layer in layers {
+        if let Some(last) = merged_layers.last_mut() {
+            if (layer.z - last.z).abs() < config.layer_height * 0.1 {
+                // Merge contours into existing layer
+                last.contours.extend(layer.contours);
+                continue;
+            }
+        }
+        merged_layers.push(layer);
+    }
+
+    log::info!("=== Geodesic slicing complete: {} layers (sorted by Z) ===", merged_layers.len());
+    merged_layers
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

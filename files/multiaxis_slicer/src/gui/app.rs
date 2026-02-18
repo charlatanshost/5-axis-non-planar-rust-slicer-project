@@ -129,6 +129,14 @@ pub struct SlicerApp {
     pub gcode_highlight_line: Option<usize>, // Line to highlight in terminal
     pub last_playback_time: std::time::Instant,
 
+    // Section view
+    pub section_enabled: bool,
+    pub section_axis: u8,      // 0=X, 1=Y, 2=Z
+    pub section_depth: f32,    // Normalized 0.0-1.0 within mesh bounds
+
+    // Toolpath display options
+    pub show_travel_moves: bool,
+
     // Background task state
     pub slicing_progress: Arc<Mutex<SlicingProgress>>,
     pub is_slicing: bool,
@@ -154,7 +162,6 @@ pub struct SlicerApp {
 
     // Deformation method (Phase 3)
     pub s3_deformation_method: crate::s3_slicer::DeformationMethod,
-    pub s3_use_asap_deformation: bool,     // DEPRECATED - use s3_deformation_method
     pub s3_asap_max_iterations: usize,     // 5-20
     pub s3_asap_convergence: f64,          // 1e-5 to 1e-3
 
@@ -231,6 +238,12 @@ impl Default for SlicerApp {
             gcode_highlight_line: None,
             last_playback_time: std::time::Instant::now(),
 
+            section_enabled: false,
+            section_axis: 2,    // Z axis
+            section_depth: 1.0, // Show all
+
+            show_travel_moves: true,
+
             slicing_progress: Arc::new(Mutex::new(SlicingProgress::default())),
             is_slicing: false,
             has_sliced: false,
@@ -251,7 +264,6 @@ impl Default for SlicerApp {
 
             // Deformation method defaults
             s3_deformation_method: crate::s3_slicer::DeformationMethod::TetVolumetric, // Default to tet volumetric (best quality)
-            s3_use_asap_deformation: false, // DEPRECATED
             s3_asap_max_iterations: 10,
             s3_asap_convergence: 1e-4,
 
@@ -470,7 +482,6 @@ impl SlicerApp {
                 max_rotation_degrees,
                 // Deformation method settings
                 deformation_method,
-                use_asap_deformation: matches!(deformation_method, crate::s3_slicer::DeformationMethod::AsapDeformation),
                 asap_max_iterations,
                 asap_convergence_threshold: asap_convergence,
             };
@@ -568,7 +579,6 @@ impl SlicerApp {
                 smoothness_weight,
                 max_rotation_degrees,
                 deformation_method: crate::s3_slicer::DeformationMethod::S4Deform,
-                use_asap_deformation: false,
                 asap_max_iterations,
                 asap_convergence_threshold: asap_convergence,
             };
@@ -1038,6 +1048,7 @@ impl SlicerApp {
             infill_density: self.toolpath_infill_density,
             wall_count: self.wall_count,
             infill_pattern: self.infill_pattern,
+            ..ToolpathConfig::default()
         };
 
         let generator = ToolpathGenerator::new(self.nozzle_diameter, self.config.layer_height)

@@ -90,20 +90,32 @@ impl GCodeGenerator {
         let report_interval = (total_segments / 10).max(1000); // Report every 10% or 1000 segments
 
         for (layer_idx, toolpath) in toolpaths.iter().enumerate() {
+            lines.push(format!("; LAYER:{}", layer_idx));
+            lines.push(format!("; Z:{:.3}", toolpath.z));
+
             for segment in &toolpath.paths {
-                total_extrusion += segment.extrusion;
                 let (a_angle, b_angle) = self.orientation_to_angles(&segment.orientation);
 
-                lines.push(format!(
-                    "G1 X{:.3} Y{:.3} Z{:.3} A{:.3} B{:.3} E{:.5} F{:.0}",
-                    segment.position.x,
-                    segment.position.y,
-                    segment.position.z,
-                    a_angle,
-                    b_angle,
-                    total_extrusion,
-                    segment.feedrate * 60.0
-                ));
+                if segment.extrusion < 1e-8 {
+                    // Travel move: retract, rapid move, prime
+                    lines.push(format!("G1 E{:.5} F{:.0} ; Retract",
+                        total_extrusion - self.retraction_distance,
+                        self.retraction_speed * 60.0));
+                    lines.push(format!("G0 X{:.3} Y{:.3} Z{:.3} A{:.3} B{:.3} F6000 ; Travel",
+                        segment.position.x, segment.position.y, segment.position.z,
+                        a_angle, b_angle));
+                    lines.push(format!("G1 E{:.5} F{:.0} ; Prime",
+                        total_extrusion,
+                        self.retraction_speed * 60.0));
+                } else {
+                    // Extrusion move
+                    total_extrusion += segment.extrusion;
+                    lines.push(format!(
+                        "G1 X{:.3} Y{:.3} Z{:.3} A{:.3} B{:.3} E{:.5} F{:.0}",
+                        segment.position.x, segment.position.y, segment.position.z,
+                        a_angle, b_angle, total_extrusion,
+                        segment.feedrate * 60.0));
+                }
 
                 processed_segments += 1;
                 if processed_segments % report_interval == 0 {
@@ -160,24 +172,27 @@ impl GCodeGenerator {
         segment: &ToolpathSegment,
         total_extrusion: &mut f64,
     ) -> io::Result<()> {
-        *total_extrusion += segment.extrusion;
-
-        // For 5-axis: Include A and B rotation axes
-        // A = rotation around X axis
-        // B = rotation around Y axis
         let (a_angle, b_angle) = self.orientation_to_angles(&segment.orientation);
 
-        writeln!(
-            file,
-            "G1 X{:.3} Y{:.3} Z{:.3} A{:.3} B{:.3} E{:.5} F{:.0}",
-            segment.position.x,
-            segment.position.y,
-            segment.position.z,
-            a_angle,
-            b_angle,
-            *total_extrusion,
-            segment.feedrate * 60.0 // Convert mm/s to mm/min
-        )?;
+        if segment.extrusion < 1e-8 {
+            // Travel move: retract, rapid move, prime
+            writeln!(file, "G1 E{:.5} F{:.0} ; Retract",
+                *total_extrusion - self.retraction_distance,
+                self.retraction_speed * 60.0)?;
+            writeln!(file, "G0 X{:.3} Y{:.3} Z{:.3} A{:.3} B{:.3} F6000 ; Travel",
+                segment.position.x, segment.position.y, segment.position.z,
+                a_angle, b_angle)?;
+            writeln!(file, "G1 E{:.5} F{:.0} ; Prime",
+                *total_extrusion,
+                self.retraction_speed * 60.0)?;
+        } else {
+            // Extrusion move
+            *total_extrusion += segment.extrusion;
+            writeln!(file, "G1 X{:.3} Y{:.3} Z{:.3} A{:.3} B{:.3} E{:.5} F{:.0}",
+                segment.position.x, segment.position.y, segment.position.z,
+                a_angle, b_angle, *total_extrusion,
+                segment.feedrate * 60.0)?;
+        }
 
         Ok(())
     }

@@ -48,6 +48,9 @@ pub struct ToolpathConfig {
     pub infill_density: f64,     // 0.0 to 1.0 for infill patterns
     pub wall_count: usize,       // Number of perimeter loops (1-10)
     pub infill_pattern: InfillPattern, // Pattern for interior fill
+    pub print_speed: f64,        // Wall/perimeter speed (mm/s)
+    pub infill_speed: f64,       // Infill extrusion speed (mm/s)
+    pub travel_speed: f64,       // Non-extrusion travel speed (mm/s)
 }
 
 impl Default for ToolpathConfig {
@@ -59,6 +62,9 @@ impl Default for ToolpathConfig {
             infill_density: 0.2,
             wall_count: 2,
             infill_pattern: InfillPattern::Rectilinear,
+            print_speed: 50.0,
+            infill_speed: 40.0,
+            travel_speed: 80.0,
         }
     }
 }

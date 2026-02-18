@@ -72,11 +72,7 @@ pub struct S3PipelineConfig {
     /// Deformation method to use
     pub deformation_method: DeformationMethod,
 
-    /// Use ASAP deformation (true) or scale-controlled (false)
-    /// DEPRECATED: Use deformation_method instead
-    pub use_asap_deformation: bool,
-
-    /// ASAP solver configuration (only used if use_asap_deformation = true)
+    /// ASAP solver max iterations
     pub asap_max_iterations: usize,
 
     /// ASAP convergence threshold
@@ -93,7 +89,6 @@ impl Default for S3PipelineConfig {
             smoothness_weight: 0.5,
             max_rotation_degrees: 15.0,  // Conservative default to prevent extreme deformations
             deformation_method: DeformationMethod::VirtualScalarField,  // Default to virtual - no mesh collapse
-            use_asap_deformation: false,  // Deprecated - use deformation_method
             asap_max_iterations: 3,      // 3 iterations is usually enough for ARAP convergence
             asap_convergence_threshold: 1e-3,  // Higher threshold for faster termination
         }
@@ -398,12 +393,7 @@ pub fn execute_s3_pipeline(
         layers.len(), total_contours, total_points);
 
     log::info!("=== S3-Slicer Pipeline Complete ===");
-    let deformation_type = if config.use_asap_deformation {
-        "ASAP global deformation"
-    } else {
-        "scale-controlled local deformation"
-    };
-    log::info!("Generated {} layers using {} (virtual deformation)", layers.len(), deformation_type);
+    log::info!("Generated {} layers using {:?} deformation method", layers.len(), config.deformation_method);
     log::info!("Toolpaths are in ORIGINAL mesh space (no inverse mapping needed)");
 
     // Use our computed scalar field (from ASAP or scale-controlled, depending on config)

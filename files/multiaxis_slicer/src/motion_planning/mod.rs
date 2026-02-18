@@ -136,9 +136,6 @@ impl Default for MotionPlanningConfig {
             filament_calculator: FilamentCalculator {
                 filament_diameter: 1.75,
                 nozzle_diameter: 0.4,
-                use_distance: true,
-                use_height: true,
-                use_width: true,
             },
             machine_config: MachineConfig {
                 work_volume: (

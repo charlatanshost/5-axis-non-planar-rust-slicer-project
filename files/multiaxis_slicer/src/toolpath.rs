@@ -126,7 +126,7 @@ impl ToolpathGenerator {
                     position: p1,
                     orientation,
                     extrusion,
-                    feedrate: 50.0,
+                    feedrate: self.pattern_config.print_speed,
                 });
             }
         }
@@ -191,7 +191,7 @@ impl ToolpathGenerator {
                             position: apply_nonplanar_offset(line[0]),
                             orientation,
                             extrusion: 0.0,
-                            feedrate: 80.0,
+                            feedrate: self.pattern_config.travel_speed,
                         });
                     }
 
@@ -206,7 +206,7 @@ impl ToolpathGenerator {
                             position: p1,
                             orientation,
                             extrusion,
-                            feedrate: 40.0, // Slightly slower for infill
+                            feedrate: self.pattern_config.infill_speed,
                         });
                     }
                 }
@@ -233,7 +233,7 @@ impl ToolpathGenerator {
                 position: apply_nonplanar_offset(contour_points[0]),
                 orientation,
                 extrusion: 0.0,
-                feedrate: 80.0,
+                feedrate: self.pattern_config.travel_speed,
             });
         }
 
@@ -248,7 +248,7 @@ impl ToolpathGenerator {
                 position: p1,
                 orientation,
                 extrusion,
-                feedrate: 50.0,
+                feedrate: self.pattern_config.print_speed,
             });
         }
     }

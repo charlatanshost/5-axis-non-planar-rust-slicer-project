@@ -5,9 +5,6 @@ use crate::geometry::{Point3D, Vector3D};
 pub struct FilamentCalculator {
     pub filament_diameter: f64,
     pub nozzle_diameter: f64,
-    pub use_distance: bool,
-    pub use_height: bool,
-    pub use_width: bool,
 }
 
 impl FilamentCalculator {
@@ -18,21 +15,13 @@ impl FilamentCalculator {
         layer_height: f64,
         toolpath_width: f64,
     ) -> f64 {
-        let mut volume = 0.0;
+        // Volume = cross_section_area × distance traveled
+        let distance = match prev_waypoint {
+            Some(prev) => (waypoint.position - prev.position).norm(),
+            None => 0.0,
+        };
 
-        if self.use_distance && prev_waypoint.is_some() {
-            let distance = (waypoint.position - prev_waypoint.unwrap().position).norm();
-            volume += layer_height * toolpath_width * distance;
-        }
-
-        if self.use_height {
-            volume += layer_height * toolpath_width * self.nozzle_diameter;
-        }
-
-        if self.use_width {
-            volume += toolpath_width * layer_height * self.nozzle_diameter;
-        }
-
+        let volume = layer_height * toolpath_width * distance;
         let filament_area = std::f64::consts::PI * (self.filament_diameter / 2.0).powi(2);
         volume / filament_area
     }
