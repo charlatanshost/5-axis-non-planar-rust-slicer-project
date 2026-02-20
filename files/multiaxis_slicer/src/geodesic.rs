@@ -33,10 +33,27 @@ pub enum GeodesicSource {
 pub struct GeodesicSlicerConfig {
     pub source: GeodesicSource,
     pub layer_height: f64,
-    /// Multiplier on avg_edge_length² for the heat timestep (default 1.0).
+    /// Multiplier on avg_edge_length² for the finest-scale heat timestep.
+    /// In multi-scale mode this is the base (smallest) factor; larger scales are added
+    /// automatically at 2× increments until full mesh coverage is achieved.
     pub heat_timestep_factor: f64,
-    /// Z tolerance for bottom boundary detection in mm (default 0.5).
+    /// Z tolerance for bottom boundary detection in mm (default 0.1).
     pub bottom_tolerance: f64,
+    /// Use multi-scale heat method: run at several timesteps and fuse per-vertex
+    /// using the finest scale that still reaches each vertex.  Gives fine detail in
+    /// thin features (feet, ears) AND full-mesh coverage simultaneously.
+    pub use_multiscale: bool,
+    /// Number of doubling scales in multi-scale mode (default 6 = factor × [1,2,4,8,16,32]).
+    pub num_scales: usize,
+    /// Use adaptive (variable-diffusivity) heat method.
+    /// Per-face kappa = adaptive_kappa_base × (avg_edge_length)².
+    /// Small faces (thin features) get small κ → heat slows down → sharp local gradients.
+    /// Large faces (smooth regions) get large κ → heat spreads fast → full coverage.
+    /// Can be combined with multi-scale for best results.
+    pub use_adaptive: bool,
+    /// Base scaling factor for per-face diffusivity κ (default 6.0).
+    /// Increase for faster spread in large regions; decrease to preserve more feature detail.
+    pub adaptive_kappa_base: f64,
 }
 
 impl Default for GeodesicSlicerConfig {
@@ -45,7 +62,11 @@ impl Default for GeodesicSlicerConfig {
             source: GeodesicSource::BottomBoundary,
             layer_height: 0.2,
             heat_timestep_factor: 1.0,
-            bottom_tolerance: 0.5,
+            bottom_tolerance: 0.1,
+            use_multiscale: true,
+            num_scales: 6,
+            use_adaptive: false,
+            adaptive_kappa_base: 6.0,
         }
     }
 }
@@ -141,99 +162,93 @@ impl MeshTopology {
 
 // ── Cotangent Laplacian ─────────────────────────────────────────────
 
-/// Build the cotangent Laplacian L and lumped mass matrix M.
-/// Returns (mass_diagonal, laplacian_as_sparse_symmetric).
-fn build_cotangent_laplacian(topo: &MeshTopology) -> (Vec<f64>, SparseSymmetric) {
+/// Lumped mass matrix M (diagonal): area/3 per adjacent face.
+fn compute_lumped_mass(topo: &MeshTopology) -> Vec<f64> {
     let n = topo.num_vertices();
     let mut mass = vec![0.0f64; n];
+    for face in &topo.faces {
+        let [i, j, k] = *face;
+        let area = (topo.vertices[j] - topo.vertices[i])
+            .cross(&(topo.vertices[k] - topo.vertices[i]))
+            .norm() * 0.5;
+        if area < 1e-15 { continue; }
+        let third = area / 3.0;
+        mass[i] += third;
+        mass[j] += third;
+        mass[k] += third;
+    }
+    for m in &mut mass {
+        if *m < 1e-12 { *m = 1e-12; }
+    }
+    mass
+}
 
-    // Accumulate off-diagonal weights in a map to merge duplicate edges
+/// Build the cotangent stiffness matrix, with an optional per-face diffusivity κ.
+/// If `kappa_per_face` is empty, κ=1 everywhere (standard isotropic Laplacian).
+/// Adaptive usage: supply κ(f) = base_factor × (avg_edge_of_f)² so that the
+/// heat equation diffuses slowly in small-feature regions (toes) and quickly in
+/// large-feature regions (body), preserving detail while achieving full coverage.
+fn build_cotangent_stiffness(topo: &MeshTopology, kappa_per_face: &[f64]) -> SparseSymmetric {
+    let n = topo.num_vertices();
     let mut edge_weights: HashMap<(usize, usize), f64> = HashMap::new();
     let mut diag = vec![0.0f64; n];
 
-    for face in &topo.faces {
+    let add_edge = |map: &mut HashMap<(usize, usize), f64>, a: usize, b: usize, w: f64| {
+        let key = if a < b { (a, b) } else { (b, a) };
+        *map.entry(key).or_insert(0.0) += w;
+    };
+
+    for (f_idx, face) in topo.faces.iter().enumerate() {
+        let kappa = kappa_per_face.get(f_idx).copied().unwrap_or(1.0);
         let [i, j, k] = *face;
         let vi = topo.vertices[i];
         let vj = topo.vertices[j];
         let vk = topo.vertices[k];
 
-        // Triangle area
-        let e1 = vj - vi;
-        let e2 = vk - vi;
-        let area = e1.cross(&e2).norm() * 0.5;
-        if area < 1e-15 {
-            continue;
-        }
+        let area = (vj - vi).cross(&(vk - vi)).norm() * 0.5;
+        if area < 1e-15 { continue; }
 
-        // Lumped mass: 1/3 of area per vertex
-        let third_area = area / 3.0;
-        mass[i] += third_area;
-        mass[j] += third_area;
-        mass[k] += third_area;
-
-        // Cotangent weights for each edge
-        // Edge (j,k) opposite vertex i
-        let ejk = vk - vj;
-        let eji = vi - vj;
-        let eki = vi - vk;
-        let ekj = vj - vk;
-
-        // cot(angle at i) for edge (j,k)
-        let cot_i = {
-            let a = vj - vi;
-            let b = vk - vi;
-            a.dot(&b) / a.cross(&b).norm().max(1e-12)
-        };
-        // cot(angle at j) for edge (i,k)
-        let cot_j = {
-            let a = vi - vj;
-            let b = vk - vj;
-            a.dot(&b) / a.cross(&b).norm().max(1e-12)
-        };
-        // cot(angle at k) for edge (i,j)
-        let cot_k = {
-            let a = vi - vk;
-            let b = vj - vk;
-            a.dot(&b) / a.cross(&b).norm().max(1e-12)
-        };
-
-        // Clamp to avoid instability from near-degenerate triangles
         let clamp = |c: f64| c.clamp(-100.0, 100.0);
-        let cot_i = clamp(cot_i);
-        let cot_j = clamp(cot_j);
-        let cot_k = clamp(cot_k);
+        let cot_i = clamp({ let a = vj-vi; let b = vk-vi; a.dot(&b) / a.cross(&b).norm().max(1e-12) });
+        let cot_j = clamp({ let a = vi-vj; let b = vk-vj; a.dot(&b) / a.cross(&b).norm().max(1e-12) });
+        let cot_k = clamp({ let a = vi-vk; let b = vj-vk; a.dot(&b) / a.cross(&b).norm().max(1e-12) });
 
-        // Each edge gets 0.5 * cot(opposite angle)
-        // Edge (j,k): weight = 0.5 * cot_i
-        let add_edge = |map: &mut HashMap<(usize, usize), f64>, a: usize, b: usize, w: f64| {
-            let key = if a < b { (a, b) } else { (b, a) };
-            *map.entry(key).or_insert(0.0) += w;
-        };
-
-        add_edge(&mut edge_weights, j, k, 0.5 * cot_i);
-        add_edge(&mut edge_weights, i, k, 0.5 * cot_j);
-        add_edge(&mut edge_weights, i, j, 0.5 * cot_k);
+        add_edge(&mut edge_weights, j, k, 0.5 * cot_i * kappa);
+        add_edge(&mut edge_weights, i, k, 0.5 * cot_j * kappa);
+        add_edge(&mut edge_weights, i, j, 0.5 * cot_k * kappa);
     }
 
-    // Build sparse symmetric matrix
     let mut off_diag: Vec<(usize, usize, f64)> = Vec::with_capacity(edge_weights.len());
     for (&(i, j), &w) in &edge_weights {
-        // Laplacian off-diagonal = -w (negative of cotangent weight)
         off_diag.push((i, j, -w));
-        // Diagonal accumulates positive weights
         diag[i] += w;
         diag[j] += w;
     }
+    SparseSymmetric { n, diag, off_diag }
+}
 
-    // Ensure minimum mass for isolated vertices
-    for m in &mut mass {
-        if *m < 1e-12 {
-            *m = 1e-12;
-        }
-    }
-
-    let laplacian = SparseSymmetric { n, diag, off_diag };
+/// Build the cotangent Laplacian L and lumped mass matrix M.
+/// Returns (mass_diagonal, laplacian_as_sparse_symmetric).
+fn build_cotangent_laplacian(topo: &MeshTopology) -> (Vec<f64>, SparseSymmetric) {
+    let mass = compute_lumped_mass(topo);
+    let laplacian = build_cotangent_stiffness(topo, &[]);
     (mass, laplacian)
+}
+
+/// Per-face diffusivity κ for the adaptive heat method.
+/// κ(f) = base_factor × (avg_edge_length(f))², clamped to [0.05, 50].
+/// This makes heat diffuse proportionally to local feature size:
+///   – Small triangles (thin features) → small κ → slow diffusion → sharp contours.
+///   – Large triangles (smooth body) → large κ → fast diffusion → full coverage.
+fn compute_kappa_per_face(topo: &MeshTopology, base_factor: f64) -> Vec<f64> {
+    topo.faces.iter().map(|face| {
+        let [i, j, k] = *face;
+        let e0 = (topo.vertices[j] - topo.vertices[i]).norm();
+        let e1 = (topo.vertices[k] - topo.vertices[j]).norm();
+        let e2 = (topo.vertices[i] - topo.vertices[k]).norm();
+        let avg_sq = ((e0 + e1 + e2) / 3.0).powi(2);
+        (base_factor * avg_sq).clamp(0.05, 50.0)
+    }).collect()
 }
 
 // ── Conjugate Gradient solver ───────────────────────────────────────
@@ -299,37 +314,49 @@ fn conjugate_gradient(
 
 // ── Heat Method ─────────────────────────────────────────────────────
 
-/// Compute geodesic distances from source vertices using the Heat Method.
-fn compute_geodesic_distance(
-    topo: &MeshTopology,
-    mass: &[f64],
-    laplacian: &SparseSymmetric,
-    sources: &[usize],
-    heat_timestep_factor: f64,
-) -> Vec<f64> {
-    let n = topo.num_vertices();
-
-    // Compute average edge length for timestep
-    let mut total_edge_len = 0.0;
-    let mut edge_count = 0;
+/// Average edge length across all faces.
+fn compute_avg_edge(topo: &MeshTopology) -> f64 {
+    let mut total = 0.0;
+    let mut count = 0usize;
     for face in &topo.faces {
         for k in 0..3 {
             let a = face[k];
             let b = face[(k + 1) % 3];
             if a < b {
-                total_edge_len += (topo.vertices[b] - topo.vertices[a]).norm();
-                edge_count += 1;
+                total += (topo.vertices[b] - topo.vertices[a]).norm();
+                count += 1;
             }
         }
     }
-    let avg_edge = if edge_count > 0 { total_edge_len / edge_count as f64 } else { 1.0 };
-    let t = heat_timestep_factor * avg_edge * avg_edge;
-    log::info!("  Heat method: avg_edge={:.4}mm, timestep t={:.6}", avg_edge, t);
+    if count > 0 { total / count as f64 } else { 1.0 }
+}
 
-    // Step 1: Build heat system (M + t*L) and RHS = M*delta
+/// Run one heat + Poisson pass at a fixed timestep `t`.
+///
+/// `heat_laplacian`   — stiffness used for the backward-Euler heat step.
+///                      Pass the **adaptive** Laplacian (with per-face κ) here when using
+///                      the adaptive heat method; the isotropic Laplacian otherwise.
+/// `poisson_laplacian` — stiffness used for the Poisson (∇φ = div X) step.
+///                       Always pass the **isotropic** Laplacian here; this ensures the
+///                       distance field is defined in Euclidean geometry regardless of κ.
+///
+/// Returns `(u_heat, distances)`:
+///   - `u_heat` — raw heat values (needed for multi-scale coverage detection)
+///   - `distances` — geodesic distances, min-shifted to 0 at sources
+fn geodesic_at_t(
+    topo: &MeshTopology,
+    mass: &[f64],
+    heat_laplacian: &SparseSymmetric,
+    poisson_laplacian: &SparseSymmetric,
+    sources: &[usize],
+    t: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let n = topo.num_vertices();
+
+    // Step 1: Build heat system (M + t*L_heat) and RHS = M*delta
     // The heat equation backward Euler: (M + t*L) u = M * delta_S
-    let heat_diag: Vec<f64> = (0..n).map(|i| mass[i] + t * laplacian.diag[i]).collect();
-    let heat_off_diag: Vec<(usize, usize, f64)> = laplacian.off_diag.iter()
+    let heat_diag: Vec<f64> = (0..n).map(|i| mass[i] + t * heat_laplacian.diag[i]).collect();
+    let heat_off_diag: Vec<(usize, usize, f64)> = heat_laplacian.off_diag.iter()
         .map(|&(i, j, val)| (i, j, t * val))
         .collect();
     let heat_system = SparseSymmetric { n, diag: heat_diag, off_diag: heat_off_diag };
@@ -339,7 +366,7 @@ fn compute_geodesic_distance(
         rhs[s] = mass[s];
     }
 
-    let u = conjugate_gradient(&heat_system, &rhs, 500, 1e-8);
+    let u = conjugate_gradient(&heat_system, &rhs, 2000, 1e-8);
 
     // Step 2: Per-face normalized negative gradient of u
     let mut face_grad: Vec<Vector3D> = Vec::with_capacity(topo.faces.len());
@@ -366,21 +393,14 @@ fn compute_geodesic_distance(
         let e_jk = vk - vj;
         let e_ki = vi - vk;
 
-        let grad = (u[i] * n_hat.cross(&e_jk)
-                  + u[j] * n_hat.cross(&e_ki)
-                  + u[k] * n_hat.cross(&e_ij)) / (area2 * 0.5); // divide by area (area2/2)
-
-        // Wait -- the formula is ∇u = (1/(2A)) * Σ u_i * (N_hat × e_opposite)
-        // But we computed N_hat = face_normal / |face_normal| where |face_normal| = 2A
-        // So (1/(2A)) * u_i * (N_hat × e_opp) works directly, we just sum them
-        // Let me redo this more carefully:
         let area = area2 * 0.5;
-        let n_unit = face_normal / area2; // unit normal
 
+        // Gradient of scalar field: ∇u = (1/(2A)) * Σ u_i * (N_hat × e_opposite_i)
+        // n_hat = face_normal / area2 is the unit normal (area2 = |face_normal| = 2A)
         let grad_u = (1.0 / (2.0 * area)) * (
-            u[i] * n_unit.cross(&e_jk)
-          + u[j] * n_unit.cross(&e_ki)
-          + u[k] * n_unit.cross(&e_ij)
+            u[i] * n_hat.cross(&e_jk)
+          + u[j] * n_hat.cross(&e_ki)
+          + u[k] * n_hat.cross(&e_ij)
         );
 
         let grad_norm = grad_u.norm();
@@ -427,46 +447,141 @@ fn compute_geodesic_distance(
         div[k] += 0.5 * (cot_j * e_ki.dot(&x_f) + cot_i * e_kj.dot(&x_f));
     }
 
-    // Step 4: Solve Poisson equation L*phi = div
-    // The Laplacian is singular (constant in null space), so we pin one vertex
-    // by adding a small value to diagonal
-    let mut poisson_diag = laplacian.diag.clone();
+    // Step 4: Solve Poisson equation L*phi = div using the ISOTROPIC Laplacian.
+    // (Using poisson_laplacian, not heat_laplacian — distance must be Euclidean.)
+    let mut poisson_diag = poisson_laplacian.diag.clone();
     poisson_diag[0] += 1e-6; // Pin vertex 0 to make system non-singular
 
     let poisson_system = SparseSymmetric {
         n,
         diag: poisson_diag,
-        off_diag: laplacian.off_diag.clone(),
+        off_diag: poisson_laplacian.off_diag.clone(),
     };
 
-    let phi = conjugate_gradient(&poisson_system, &div, 500, 1e-8);
+    let phi = conjugate_gradient(&poisson_system, &div, 2000, 1e-8);
 
-    // Step 5: Shift so source vertices have distance = 0
-    // Use mean of source values as the baseline (more robust than global min)
+    // Step 5: Shift so source vertices have distance = 0.
+    // Do NOT use abs() — that creates a mirror zero-crossing on the far side of the field,
+    // producing level sets that expand from both source AND anti-source simultaneously.
     let source_mean: f64 = sources.iter().map(|&s| phi[s]).sum::<f64>() / sources.len() as f64;
-    let mut distances: Vec<f64> = phi.iter().map(|&p| (p - source_mean).abs()).collect();
-    // The Poisson solve may flip sign — check if source vertices have high values
-    // If so, negate (distance should increase away from sources)
+    let mut distances: Vec<f64> = phi.iter().map(|&p| p - source_mean).collect();
+    // The Poisson solve may flip sign — check if source vertices have above-average distances.
+    // Distance should INCREASE away from sources, so sources must have the MINIMUM.
     let source_avg: f64 = sources.iter().map(|&s| distances[s]).sum::<f64>() / sources.len() as f64;
     let global_avg: f64 = distances.iter().sum::<f64>() / distances.len() as f64;
     if source_avg > global_avg {
-        // Distances are inverted, flip them
-        let max_d = distances.iter().cloned().fold(0.0f64, f64::max);
+        // Poisson gave decreasing phi from source — negate so sources become minimum
         for d in &mut distances {
-            *d = max_d - *d;
+            *d = -*d;
         }
     }
-    // Shift so min = 0
+    // Clamp numerical negatives (vertices with phi slightly below source_mean due to
+    // solver error) to zero — treat them as "at source" rather than as far-away points
+    for d in &mut distances {
+        if *d < 0.0 { *d = 0.0; }
+    }
+    // Shift so minimum = 0 (should already be ~0 after clamp, but ensure exact zero)
     let min_d = distances.iter().cloned().fold(f64::INFINITY, f64::min);
     for d in &mut distances {
         *d -= min_d;
     }
 
-    let max_dist = distances.iter().cloned().fold(0.0f64, f64::max);
+    (u, distances)
+}
+
+/// Single-scale geodesic distance.
+fn compute_geodesic_distance(
+    topo: &MeshTopology,
+    mass: &[f64],
+    heat_laplacian: &SparseSymmetric,
+    poisson_laplacian: &SparseSymmetric,
+    sources: &[usize],
+    heat_timestep_factor: f64,
+) -> Vec<f64> {
+    let avg_edge = compute_avg_edge(topo);
+    let t = heat_timestep_factor * avg_edge * avg_edge;
+    log::info!("  Heat method: avg_edge={:.4}mm, timestep t={:.6}", avg_edge, t);
+    let (_u, phi) = geodesic_at_t(topo, mass, heat_laplacian, poisson_laplacian, sources, t);
+    let max_dist = phi.iter().cloned().fold(0.0f64, f64::max);
     log::info!("  Geodesic distances: min=0.0, max={:.3}mm, {} source vertices",
         max_dist, sources.len());
+    phi
+}
 
-    distances
+/// Multi-scale geodesic distance fusion.
+///
+/// Runs `num_scales` heat+Poisson solves at doubling timesteps
+/// `base_factor × [1, 2, 4, …, 2^(num_scales-1)] × avg_edge²`.
+///
+/// `heat_laplacian`    — used for the backward-Euler heat step (may be adaptive).
+/// `poisson_laplacian` — used for the Poisson step (always isotropic).
+///
+/// For each vertex we pick the **finest** (smallest t) scale at which the
+/// heat field is non-negligible (> 1e-6 × peak heat).  This gives:
+///   • Accurate, locally-detailed distances near the source (small t)
+///   • Full-mesh coverage for distant vertices (large t kicks in)
+///
+/// Result: detail in thin features (toes, ears) + global coverage — no
+/// single timestep can achieve both simultaneously.
+fn compute_multiscale_geodesic_distance(
+    topo: &MeshTopology,
+    mass: &[f64],
+    heat_laplacian: &SparseSymmetric,
+    poisson_laplacian: &SparseSymmetric,
+    sources: &[usize],
+    base_factor: f64,
+    num_scales: usize,
+) -> Vec<f64> {
+    let n = topo.num_vertices();
+    let avg_edge = compute_avg_edge(topo);
+    let avg_sq = avg_edge * avg_edge;
+
+    log::info!("  Multi-scale: avg_edge={:.4}mm, {} scales, base_factor={:.1}",
+        avg_edge, num_scales, base_factor);
+
+    let mut all_heat: Vec<Vec<f64>> = Vec::with_capacity(num_scales);
+    let mut all_phi:  Vec<Vec<f64>> = Vec::with_capacity(num_scales);
+    let mut max_heat: Vec<f64>      = Vec::with_capacity(num_scales);
+
+    for k in 0..num_scales {
+        let factor = base_factor * (1usize << k) as f64;
+        let t = factor * avg_sq;
+        let (u, phi) = geodesic_at_t(topo, mass, heat_laplacian, poisson_laplacian, sources, t);
+        let max_u = u.iter().cloned().fold(0.0f64, f64::max);
+        let max_d = phi.iter().cloned().fold(0.0f64, f64::max);
+        log::info!("    Scale {}: factor={:.1}, t={:.3}mm², max_heat={:.3e}, max_dist={:.2}mm",
+            k, factor, t, max_u, max_d);
+        max_heat.push(max_u);
+        all_heat.push(u);
+        all_phi.push(phi);
+    }
+
+    // Per-vertex: use finest scale where heat value > 1e-6 × peak heat at that scale.
+    // Finer scale = smaller t = more accurate local distances.
+    const THRESHOLD: f64 = 1e-6;
+    let mut final_phi = vec![0.0f64; n];
+    for v in 0..n {
+        let mut selected = false;
+        for k in 0..num_scales {
+            if max_heat[k] > 0.0 && all_heat[k][v] > THRESHOLD * max_heat[k] {
+                final_phi[v] = all_phi[k][v];
+                selected = true;
+                break;
+            }
+        }
+        if !selected {
+            // No scale reached this vertex — fall back to coarsest available
+            final_phi[v] = all_phi[num_scales - 1][v];
+        }
+    }
+
+    // Ensure minimum distance is exactly 0
+    let min_d = final_phi.iter().cloned().fold(f64::INFINITY, f64::min);
+    if min_d > 0.0 { for d in &mut final_phi { *d -= min_d; } }
+
+    let max_dist = final_phi.iter().cloned().fold(0.0f64, f64::max);
+    log::info!("  Multi-scale geodesic: max_dist={:.3}mm", max_dist);
+    final_phi
 }
 
 // ── Source vertex detection ─────────────────────────────────────────
@@ -662,47 +777,116 @@ pub fn geodesic_slice(mesh: &Mesh, config: &GeodesicSlicerConfig) -> Vec<Layer> 
     }
     log::info!("  Found {} source vertices", sources.len());
 
-    // Step 4: Compute geodesic distances
-    log::info!("Step 4: Computing geodesic distance field (Heat Method)...");
-    let distances = compute_geodesic_distance(
-        &topo, &mass, &laplacian, &sources, config.heat_timestep_factor
-    );
+    // Step 4: Compute geodesic distances (single-scale or multi-scale, isotropic or adaptive).
+    //
+    // Adaptive mode (use_adaptive=true): build an adaptive Laplacian where each face's
+    // diffusivity κ(f) = adaptive_kappa_base × (avg_edge_length(f))².  Small triangles
+    // (thin features, toes) get small κ → slow diffusion → sharp local gradients.
+    // Large triangles (body) get large κ → fast spread → full coverage.
+    // The Poisson step always uses the ISOTROPIC Laplacian so distances are Euclidean.
+    let adapt_lap_opt: Option<SparseSymmetric> = if config.use_adaptive {
+        log::info!("  Adaptive mode: building per-face kappa Laplacian (base={:.1})...",
+            config.adaptive_kappa_base);
+        let kappa = compute_kappa_per_face(&topo, config.adaptive_kappa_base);
+        let kappa_min = kappa.iter().cloned().fold(f64::INFINITY, f64::min);
+        let kappa_max = kappa.iter().cloned().fold(0.0f64, f64::max);
+        log::info!("  κ range: [{:.3}, {:.3}]", kappa_min, kappa_max);
+        Some(build_cotangent_stiffness(&topo, &kappa))
+    } else {
+        None
+    };
+    let heat_lap = adapt_lap_opt.as_ref().unwrap_or(&laplacian);
+
+    let distances = if config.use_multiscale {
+        log::info!("Step 4: Computing MULTI-SCALE{}geodesic distances ({} scales, base factor={:.1})...",
+            if config.use_adaptive { " ADAPTIVE " } else { " " },
+            config.num_scales, config.heat_timestep_factor);
+        compute_multiscale_geodesic_distance(
+            &topo, &mass, heat_lap, &laplacian, &sources,
+            config.heat_timestep_factor, config.num_scales,
+        )
+    } else {
+        log::info!("Step 4: Computing{}geodesic distance field (Heat Method)...",
+            if config.use_adaptive { " ADAPTIVE " } else { " " });
+        compute_geodesic_distance(
+            &topo, &mass, heat_lap, &laplacian, &sources, config.heat_timestep_factor
+        )
+    };
 
     // Step 5: Extract level-set layers
     log::info!("Step 5: Extracting geodesic layers...");
     let max_dist = distances.iter().cloned().fold(0.0f64, f64::max);
-    let num_layers = (max_dist / config.layer_height).ceil() as usize;
+
+    // The source vertices define the "bottom" plane. Geodesic from the bottom boundary
+    // wraps all the way around a closed mesh, producing distances >> model height.
+    // Cap at the model's Z range so we only produce layers for the "outward" wavefront.
+    let source_z_min = sources.iter()
+        .map(|&s| topo.vertices[s].z)
+        .fold(f64::INFINITY, f64::min);
+    let model_z_max = topo.vertices.iter().map(|v| v.z).fold(f64::NEG_INFINITY, f64::max);
+    let z_range = (model_z_max - source_z_min).max(config.layer_height);
+    let effective_max_dist = max_dist.min(z_range);
+    log::info!("  Z range: {:.2}mm, geodesic max: {:.2}mm, effective cap: {:.2}mm",
+        z_range, max_dist, effective_max_dist);
+
+    let num_layers = (effective_max_dist / config.layer_height).ceil() as usize;
     if num_layers == 0 {
-        log::warn!("  Max geodesic distance is 0, no layers to extract");
+        log::warn!("  Effective max geodesic distance is 0, no layers to extract");
         return Vec::new();
     }
 
     let mut layers = Vec::with_capacity(num_layers);
     for i in 1..=num_layers {
         let level = i as f64 * config.layer_height;
-        if level > max_dist {
+        if level > effective_max_dist {
             break;
         }
-        let contours = extract_level_set(&topo, &distances, level);
+        let raw_contours = extract_level_set(&topo, &distances, level);
+
+        // Filter 1: drop contours that lie entirely on the source plane (flat-base flooding).
+        // Filter 2: drop contours that contain an artifact segment — both endpoints at z_min
+        //           AND XY distance > 10mm.  Same bad-STL-triangle issue as conical mode.
+        const ARTIFACT_Z_EPS: f64 = 0.001;
+        const ARTIFACT_SEG_SQ: f64 = 100.0; // (10mm)²
+        let contours: Vec<_> = raw_contours.into_iter()
+            .filter(|c| {
+                // Keep only contours with at least one point above the source plane
+                if !c.points.iter().any(|p| p.z > source_z_min + ARTIFACT_Z_EPS) {
+                    return false;
+                }
+                // Discard contours containing artifact segments (long jumps at z_min)
+                let pts = &c.points;
+                let n = pts.len();
+                for i in 0..n {
+                    let p1 = &pts[i];
+                    let p2 = &pts[(i + 1) % n];
+                    if p1.z < source_z_min + ARTIFACT_Z_EPS && p2.z < source_z_min + ARTIFACT_Z_EPS {
+                        let dx = p2.x - p1.x;
+                        let dy = p2.y - p1.y;
+                        if dx * dx + dy * dy > ARTIFACT_SEG_SQ { return false; }
+                    }
+                }
+                true
+            })
+            .collect();
+
         if !contours.is_empty() {
-            // Use minimum Z of contour points as layer height for printability.
-            // Geodesic distance ≠ build height — a single level set can contain
-            // contours at wildly different Z heights on complex meshes.
-            // Using min Z ensures the layer is printed at a physically reachable height.
-            let min_z = contours.iter()
-                .flat_map(|c| c.points.iter())
-                .map(|p| p.z)
-                .fold(f64::INFINITY, f64::min);
-            layers.push(Layer::new(min_z, contours, config.layer_height));
+            // Use average Z of contour points so the layer is ordered by print height.
+            let z_sum: f64 = contours.iter().flat_map(|c| c.points.iter()).map(|p| p.z).sum();
+            let z_cnt: usize = contours.iter().map(|c| c.points.len()).sum();
+            let avg_z = if z_cnt > 0 { z_sum / z_cnt as f64 } else { source_z_min + level };
+            layers.push(Layer::new(avg_z, contours, config.layer_height));
         }
     }
 
-    // Sort layers by Z (bottom-up) for printability.
-    // Without this, layers ordered by geodesic distance may print high-Z
-    // geometry (ears, protrusions) before the supporting body below.
-    layers.sort_by(|a, b| a.z.partial_cmp(&b.z).unwrap_or(std::cmp::Ordering::Equal));
+    // Keep layers in geodesic distance order (level 1, 2, 3, …).
+    // A Z-sort was previously used here but caused "layers start from top AND bottom and meet in
+    // the middle": surfaces reached by long geodesic paths (e.g. the inside of a hull) have large
+    // geodesic distance but low Z; Z-sorting promoted those to the front of the print, producing
+    // the mirrored-wavefront artifact. Geodesic order guarantees each layer is one step further
+    // from the source (base), which is the correct bottom-up surface-following sequence.
 
-    // Deduplicate layers at nearly identical Z heights (merge contours)
+    // Deduplicate consecutive layers at nearly identical Z heights (merge contours)
     let mut merged_layers: Vec<Layer> = Vec::new();
     for layer in layers {
         if let Some(last) = merged_layers.last_mut() {
@@ -836,7 +1020,7 @@ mod tests {
             .find(|&i| topo.vertices[i].x.abs() < 1e-6 && topo.vertices[i].y.abs() < 1e-6)
             .unwrap();
 
-        let distances = compute_geodesic_distance(&topo, &mass, &laplacian, &[origin_idx], 1.0);
+        let distances = compute_geodesic_distance(&topo, &mass, &laplacian, &laplacian, &[origin_idx], 1.0);
 
         // Distances should be non-negative after shift
         assert!(distances.iter().all(|&d| d >= -1e-6), "All distances should be >= 0");
@@ -862,6 +1046,10 @@ mod tests {
             layer_height: 3.0,
             heat_timestep_factor: 1.0,
             bottom_tolerance: 0.5,
+            use_multiscale: false,
+            num_scales: 4,
+            use_adaptive: false,
+            adaptive_kappa_base: 6.0,
         };
         let layers = geodesic_slice(&mesh, &config);
         // Should get some layers (cube is 10mm tall, geodesic dist ~10mm, so ~3 layers at 3mm spacing)

@@ -51,6 +51,7 @@ pub struct ToolpathConfig {
     pub print_speed: f64,        // Wall/perimeter speed (mm/s)
     pub infill_speed: f64,       // Infill extrusion speed (mm/s)
     pub travel_speed: f64,       // Non-extrusion travel speed (mm/s)
+    pub skip_infill: bool,       // Skip infill generation (for geodesic/coord-transform modes)
 }
 
 impl Default for ToolpathConfig {
@@ -65,6 +66,7 @@ impl Default for ToolpathConfig {
             print_speed: 50.0,
             infill_speed: 40.0,
             travel_speed: 80.0,
+            skip_infill: false,
         }
     }
 }
@@ -288,6 +290,7 @@ pub fn generate_clipped_infill(
     config: &ToolpathConfig,
     layer_z: f64,
     outer_boundary: Option<&Contour>,
+    z_ref_points: Option<&[Point3D]>,
 ) -> Vec<Vec<Point3D>> {
     let pts = &boundary.points;
     if pts.len() < 3 || config.infill_density < 0.01 {
@@ -340,24 +343,40 @@ pub fn generate_clipped_infill(
                 if direction_forward {
                     let mut x = x_start;
                     while x <= x_end {
-                        let z = interpolate_z_for_infill(x, y, boundary, layer_z);
+                        let z = if let Some(refs) = z_ref_points {
+                            interpolate_z_idw(x, y, refs, layer_z)
+                        } else {
+                            interpolate_z_for_infill(x, y, boundary, layer_z)
+                        };
                         line_points.push(Point3D::new(x, y, z));
                         x += config.node_distance;
                     }
                     // Add final point
                     if line_points.last().map(|p| (x_end - p.x).abs() > config.node_distance * 0.3).unwrap_or(true) {
-                        let z = interpolate_z_for_infill(x_end, y, boundary, layer_z);
+                        let z = if let Some(refs) = z_ref_points {
+                            interpolate_z_idw(x_end, y, refs, layer_z)
+                        } else {
+                            interpolate_z_for_infill(x_end, y, boundary, layer_z)
+                        };
                         line_points.push(Point3D::new(x_end, y, z));
                     }
                 } else {
                     let mut x = x_end;
                     while x >= x_start {
-                        let z = interpolate_z_for_infill(x, y, boundary, layer_z);
+                        let z = if let Some(refs) = z_ref_points {
+                            interpolate_z_idw(x, y, refs, layer_z)
+                        } else {
+                            interpolate_z_for_infill(x, y, boundary, layer_z)
+                        };
                         line_points.push(Point3D::new(x, y, z));
                         x -= config.node_distance;
                     }
                     if line_points.last().map(|p| (p.x - x_start).abs() > config.node_distance * 0.3).unwrap_or(true) {
-                        let z = interpolate_z_for_infill(x_start, y, boundary, layer_z);
+                        let z = if let Some(refs) = z_ref_points {
+                            interpolate_z_idw(x_start, y, refs, layer_z)
+                        } else {
+                            interpolate_z_for_infill(x_start, y, boundary, layer_z)
+                        };
                         line_points.push(Point3D::new(x_start, y, z));
                     }
                 }
@@ -414,6 +433,36 @@ fn interpolate_z_for_infill(x: f64, y: f64, boundary: &Contour, layer_z: f64) ->
 
     // Non-planar: interpolate from nearest boundary edge
     crate::contour_offset::interpolate_z_from_contour_pub(x, y, boundary)
+}
+
+/// Inverse-distance weighted Z interpolation from a set of reference points.
+///
+/// Uses the K=8 nearest points (by XY distance) with 1/d² weighting.
+/// Falls back to `layer_z` for planar layers (Z range < 0.01mm).
+fn interpolate_z_idw(x: f64, y: f64, ref_points: &[Point3D], layer_z: f64) -> f64 {
+    if ref_points.is_empty() {
+        return layer_z;
+    }
+    let z_min = ref_points.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+    let z_max = ref_points.iter().map(|p| p.z).fold(f64::NEG_INFINITY, f64::max);
+    if z_max - z_min < 0.01 {
+        return layer_z; // planar layer — skip expensive IDW
+    }
+
+    const K: usize = 8;
+    let mut heap: Vec<(f64, f64)> = ref_points.iter()
+        .map(|p| ((p.x - x).powi(2) + (p.y - y).powi(2), p.z))
+        .collect();
+    heap.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    heap.truncate(K);
+
+    let (mut wz, mut tw) = (0.0f64, 0.0f64);
+    for (d2, z) in &heap {
+        let w = 1.0 / (d2 + 1e-9);
+        wz += w * z;
+        tw += w;
+    }
+    if tw > 1e-12 { wz / tw } else { layer_z }
 }
 
 /// Check if a point is inside a contour using ray casting

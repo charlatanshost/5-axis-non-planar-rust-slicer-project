@@ -78,6 +78,10 @@ pub enum SlicingMode {
     Conical,
     /// Geodesic slicing (Heat Method distance field)
     Geodesic,
+    /// Cylindrical coordinate-transform slicing (concentric radial shells)
+    CoordTransformCylindrical,
+    /// Spherical coordinate-transform slicing (concentric spherical shells)
+    CoordTransformSpherical,
 }
 
 /// Main application state
@@ -180,11 +184,25 @@ pub struct SlicerApp {
     pub conical_center_x: f64,
     pub conical_center_y: f64,
 
+    // Cylindrical/Spherical coordinate transform configuration
+    pub coord_transform_auto_center: bool,
+    pub coord_transform_center_x: f64,
+    pub coord_transform_center_y: f64,
+    pub coord_transform_center_z: f64,
+
     // Geodesic slicing configuration
     pub geodesic_source_mode: u8,          // 0=BottomBoundary, 1=PointSource
     pub geodesic_source_point: [f64; 3],   // For point source mode
-    pub geodesic_heat_factor: f64,         // Multiplier on avg_edge_length² (default 1.0)
-    pub geodesic_bottom_tolerance: f64,    // Z tolerance for bottom boundary (default 0.5mm)
+    pub geodesic_heat_factor: f64,         // Base timestep factor (finest scale in multi-scale)
+    pub geodesic_bottom_tolerance: f64,    // Z tolerance for bottom boundary
+    pub geodesic_use_multiscale: bool,     // Enable multi-scale heat method
+    pub geodesic_num_scales: usize,        // Number of doubling scales (default 6)
+    pub geodesic_use_adaptive: bool,       // Enable adaptive (variable-κ) heat method
+    pub geodesic_adaptive_kappa_base: f64, // Per-face κ = kappa_base × (avg_edge)²
+
+    // G-code / machine kinematics configuration
+    pub tcp_offset: f64,                               // pivot-to-nozzle distance (mm); 0 = disabled
+    pub rotary_axis_mode: crate::gcode::RotaryAxisMode, // A/B vs B/C axis labels
 
     // Face orientation mode
     pub face_orientation_mode: bool,       // Whether we're in "select face to orient" mode
@@ -282,11 +300,25 @@ impl Default for SlicerApp {
             conical_center_x: 0.0,
             conical_center_y: 0.0,
 
+            // Cylindrical/Spherical coordinate transform defaults
+            coord_transform_auto_center: true,
+            coord_transform_center_x: 0.0,
+            coord_transform_center_y: 0.0,
+            coord_transform_center_z: 0.0,
+
             // Geodesic slicing defaults
             geodesic_source_mode: 0,
             geodesic_source_point: [0.0, 0.0, 0.0],
             geodesic_heat_factor: 1.0,
-            geodesic_bottom_tolerance: 0.5,
+            geodesic_bottom_tolerance: 0.1,
+            geodesic_use_multiscale: true,
+            geodesic_num_scales: 6,
+            geodesic_use_adaptive: false,
+            geodesic_adaptive_kappa_base: 6.0,
+
+            // G-code kinematics defaults
+            tcp_offset: 0.0,
+            rotary_axis_mode: crate::gcode::RotaryAxisMode::AB,
 
             // Face orientation defaults
             face_orientation_mode: false,
@@ -388,6 +420,14 @@ impl SlicerApp {
             SlicingMode::Geodesic => {
                 self.log("Starting geodesic slicing (Heat Method)...".to_string());
                 self.start_geodesic_slicing();
+            }
+            SlicingMode::CoordTransformCylindrical => {
+                self.log("Starting cylindrical coordinate-transform slicing...".to_string());
+                self.start_cylindrical_slicing();
+            }
+            SlicingMode::CoordTransformSpherical => {
+                self.log("Starting spherical coordinate-transform slicing...".to_string());
+                self.start_spherical_slicing();
             }
         }
     }
@@ -714,6 +754,10 @@ impl SlicerApp {
         };
         let heat_factor = self.geodesic_heat_factor;
         let bottom_tol = self.geodesic_bottom_tolerance;
+        let use_multiscale = self.geodesic_use_multiscale;
+        let num_scales = self.geodesic_num_scales;
+        let use_adaptive = self.geodesic_use_adaptive;
+        let adaptive_kappa_base = self.geodesic_adaptive_kappa_base;
 
         let (tx, rx) = mpsc::channel();
         self.layers_receiver = Some(rx);
@@ -731,6 +775,10 @@ impl SlicerApp {
                 layer_height,
                 heat_timestep_factor: heat_factor,
                 bottom_tolerance: bottom_tol,
+                use_multiscale,
+                num_scales,
+                use_adaptive,
+                adaptive_kappa_base,
             };
 
             let result = std::panic::catch_unwind(|| {
@@ -764,6 +812,133 @@ impl SlicerApp {
                     let mut p = progress.lock().unwrap();
                     p.operation = "Error".to_string();
                     p.message = "Geodesic pipeline failed (panic)".to_string();
+                }
+            }
+        });
+    }
+
+    /// Start cylindrical coordinate-transform slicing in background thread
+    fn start_cylindrical_slicing(&mut self) {
+        let mesh = self.mesh.clone().unwrap();
+        let config = self.config.clone();
+        let progress = self.slicing_progress.clone();
+
+        let (center_x, center_y) = if self.coord_transform_auto_center {
+            let cx = (mesh.bounds_min.x + mesh.bounds_max.x) / 2.0;
+            let cy = (mesh.bounds_min.y + mesh.bounds_max.y) / 2.0;
+            (cx, cy)
+        } else {
+            (self.coord_transform_center_x, self.coord_transform_center_y)
+        };
+
+        let (tx, rx) = mpsc::channel();
+        self.layers_receiver = Some(rx);
+
+        std::thread::spawn(move || {
+            {
+                let mut p = progress.lock().unwrap();
+                p.operation = "Cylindrical Slicing".to_string();
+                p.percentage = 5.0;
+                p.message = "Initializing cylindrical pipeline...".to_string();
+            }
+
+            let result = std::panic::catch_unwind(|| {
+                crate::coordinate_transform::execute_cylindrical_pipeline(
+                    &mesh, &config, center_x, center_y,
+                )
+            });
+
+            match result {
+                Ok(layers) => {
+                    let layer_count = layers.len();
+                    log::info!("Cylindrical pipeline completed with {} layers", layer_count);
+
+                    if let Err(e) = tx.send(layers) {
+                        log::error!("Failed to send layers to main thread: {:?}", e);
+                        let mut p = progress.lock().unwrap();
+                        p.operation = "Error".to_string();
+                        p.message = "Failed to send layers to main thread".to_string();
+                        return;
+                    }
+
+                    {
+                        let mut p = progress.lock().unwrap();
+                        p.operation = "Complete".to_string();
+                        p.percentage = 100.0;
+                        p.layers_completed = layer_count;
+                        p.total_layers = layer_count;
+                        p.message = format!("Generated {} cylindrical layers", layer_count);
+                    }
+                }
+                Err(e) => {
+                    log::error!("Cylindrical pipeline panicked: {:?}", e);
+                    let mut p = progress.lock().unwrap();
+                    p.operation = "Error".to_string();
+                    p.message = "Cylindrical pipeline failed (panic)".to_string();
+                }
+            }
+        });
+    }
+
+    /// Start spherical coordinate-transform slicing in background thread
+    fn start_spherical_slicing(&mut self) {
+        let mesh = self.mesh.clone().unwrap();
+        let config = self.config.clone();
+        let progress = self.slicing_progress.clone();
+
+        let (center_x, center_y, center_z) = if self.coord_transform_auto_center {
+            let cx = (mesh.bounds_min.x + mesh.bounds_max.x) / 2.0;
+            let cy = (mesh.bounds_min.y + mesh.bounds_max.y) / 2.0;
+            let cz = mesh.bounds_min.z; // Use bottom of mesh as sphere center Z
+            (cx, cy, cz)
+        } else {
+            (self.coord_transform_center_x, self.coord_transform_center_y, self.coord_transform_center_z)
+        };
+
+        let (tx, rx) = mpsc::channel();
+        self.layers_receiver = Some(rx);
+
+        std::thread::spawn(move || {
+            {
+                let mut p = progress.lock().unwrap();
+                p.operation = "Spherical Slicing".to_string();
+                p.percentage = 5.0;
+                p.message = "Initializing spherical pipeline...".to_string();
+            }
+
+            let result = std::panic::catch_unwind(|| {
+                crate::coordinate_transform::execute_spherical_pipeline(
+                    &mesh, &config, center_x, center_y, center_z,
+                )
+            });
+
+            match result {
+                Ok(layers) => {
+                    let layer_count = layers.len();
+                    log::info!("Spherical pipeline completed with {} layers", layer_count);
+
+                    if let Err(e) = tx.send(layers) {
+                        log::error!("Failed to send layers to main thread: {:?}", e);
+                        let mut p = progress.lock().unwrap();
+                        p.operation = "Error".to_string();
+                        p.message = "Failed to send layers to main thread".to_string();
+                        return;
+                    }
+
+                    {
+                        let mut p = progress.lock().unwrap();
+                        p.operation = "Complete".to_string();
+                        p.percentage = 100.0;
+                        p.layers_completed = layer_count;
+                        p.total_layers = layer_count;
+                        p.message = format!("Generated {} spherical layers", layer_count);
+                    }
+                }
+                Err(e) => {
+                    log::error!("Spherical pipeline panicked: {:?}", e);
+                    let mut p = progress.lock().unwrap();
+                    p.operation = "Error".to_string();
+                    p.message = "Spherical pipeline failed (panic)".to_string();
                 }
             }
         });
@@ -1041,6 +1216,14 @@ impl SlicerApp {
             self.toolpath_pattern.name(), self.layers.len(), total_contours));
 
         use crate::toolpath_patterns::ToolpathConfig;
+        // Geodesic and coordinate-transform contours are 3D surface curves whose XY projection
+        // covers the full cross-section — infill would penetrate the outer shell, so skip it.
+        let skip_infill = matches!(
+            self.slicing_mode,
+            SlicingMode::Geodesic
+            | SlicingMode::CoordTransformCylindrical
+            | SlicingMode::CoordTransformSpherical
+        );
         let pattern_config = ToolpathConfig {
             pattern: self.toolpath_pattern,
             line_width: self.toolpath_line_width,
@@ -1048,6 +1231,7 @@ impl SlicerApp {
             infill_density: self.toolpath_infill_density,
             wall_count: self.wall_count,
             infill_pattern: self.infill_pattern,
+            skip_infill,
             ..ToolpathConfig::default()
         };
 
@@ -1192,7 +1376,9 @@ impl SlicerApp {
             self.log("⚠️ Warning: Generating G-code without motion planning optimization".to_string());
         }
 
-        let gcode_gen = GCodeGenerator::new();
+        let mut gcode_gen = GCodeGenerator::new();
+        gcode_gen.kinematics.tcp_offset = self.tcp_offset;
+        gcode_gen.kinematics.rotary_axes = self.rotary_axis_mode;
         self.gcode_lines = gcode_gen.generate_to_string(&self.toolpaths);
         self.show_gcode_terminal = true;
         self.gcode_scroll_to_bottom = true;
@@ -1208,7 +1394,9 @@ impl SlicerApp {
 
         self.log(format!("Exporting G-code to {:?}", path));
 
-        let gcode_gen = GCodeGenerator::new();
+        let mut gcode_gen = GCodeGenerator::new();
+        gcode_gen.kinematics.tcp_offset = self.tcp_offset;
+        gcode_gen.kinematics.rotary_axes = self.rotary_axis_mode;
         match gcode_gen.generate(&self.toolpaths, &path) {
             Ok(_) => {
                 self.log(format!("G-code exported successfully"));

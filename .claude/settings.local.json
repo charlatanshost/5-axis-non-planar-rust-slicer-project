@@ -61,7 +61,9 @@
       "WebFetch(domain:zendy.io)",
       "Bash(where:*)",
       "Bash(node -e:*)",
-      "Bash(\"/c/Program Files/nodejs/node.exe\" --version)"
+      "Bash(\"/c/Program Files/nodejs/node.exe\" --version)",
+      "Bash(echo:*)",
+      "Bash(Select-String -Pattern \"\\(^test |FAILED|passed|failed|test result|^error\\)\")"
     ]
   }
 }

@@ -5,12 +5,45 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 
+/// Which rotary-axis letters to emit in G-code moves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RotaryAxisMode {
+    /// A = pitch (rotation around X), B = roll (rotation around Y).
+    /// This is the default for most 5-axis head machines.
+    AB,
+    /// B = tilt, C = rotate.
+    /// Common on table-tilt / table-rotate machine configurations.
+    BC,
+}
+
+impl Default for RotaryAxisMode {
+    fn default() -> Self { Self::AB }
+}
+
+/// Machine kinematics parameters for 5-axis TCP compensation.
+#[derive(Debug, Clone)]
+pub struct MachineKinematics {
+    /// Pivot-to-nozzle-tip distance in mm.
+    /// Set to 0.0 to disable TCP compensation (default).
+    pub tcp_offset: f64,
+    /// Which axis labels to use when writing rotary moves.
+    pub rotary_axes: RotaryAxisMode,
+}
+
+impl Default for MachineKinematics {
+    fn default() -> Self {
+        Self { tcp_offset: 0.0, rotary_axes: RotaryAxisMode::AB }
+    }
+}
+
 pub struct GCodeGenerator {
     pub filament_diameter: f64,
     pub nozzle_temp: f64,
     pub bed_temp: f64,
     pub retraction_distance: f64,
     pub retraction_speed: f64,
+    /// 5-axis machine kinematics (TCP offset + rotary axis labels).
+    pub kinematics: MachineKinematics,
 }
 
 impl Default for GCodeGenerator {
@@ -21,6 +54,7 @@ impl Default for GCodeGenerator {
             bed_temp: 60.0,
             retraction_distance: 6.5,
             retraction_speed: 25.0,
+            kinematics: MachineKinematics::default(),
         }
     }
 }
@@ -95,15 +129,16 @@ impl GCodeGenerator {
 
             for segment in &toolpath.paths {
                 let (a_angle, b_angle) = self.orientation_to_angles(&segment.orientation);
+                let pos = self.tcp_compensate(segment.position, a_angle, b_angle);
+                let (rot1, rot2) = self.format_rotary(a_angle, b_angle);
 
                 if segment.extrusion < 1e-8 {
                     // Travel move: retract, rapid move, prime
                     lines.push(format!("G1 E{:.5} F{:.0} ; Retract",
                         total_extrusion - self.retraction_distance,
                         self.retraction_speed * 60.0));
-                    lines.push(format!("G0 X{:.3} Y{:.3} Z{:.3} A{:.3} B{:.3} F6000 ; Travel",
-                        segment.position.x, segment.position.y, segment.position.z,
-                        a_angle, b_angle));
+                    lines.push(format!("G0 X{:.3} Y{:.3} Z{:.3} {} {} F6000 ; Travel",
+                        pos.x, pos.y, pos.z, rot1, rot2));
                     lines.push(format!("G1 E{:.5} F{:.0} ; Prime",
                         total_extrusion,
                         self.retraction_speed * 60.0));
@@ -111,9 +146,8 @@ impl GCodeGenerator {
                     // Extrusion move
                     total_extrusion += segment.extrusion;
                     lines.push(format!(
-                        "G1 X{:.3} Y{:.3} Z{:.3} A{:.3} B{:.3} E{:.5} F{:.0}",
-                        segment.position.x, segment.position.y, segment.position.z,
-                        a_angle, b_angle, total_extrusion,
+                        "G1 X{:.3} Y{:.3} Z{:.3} {} {} E{:.5} F{:.0}",
+                        pos.x, pos.y, pos.z, rot1, rot2, total_extrusion,
                         segment.feedrate * 60.0));
                 }
 
@@ -173,24 +207,24 @@ impl GCodeGenerator {
         total_extrusion: &mut f64,
     ) -> io::Result<()> {
         let (a_angle, b_angle) = self.orientation_to_angles(&segment.orientation);
+        let pos = self.tcp_compensate(segment.position, a_angle, b_angle);
+        let (rot1, rot2) = self.format_rotary(a_angle, b_angle);
 
         if segment.extrusion < 1e-8 {
             // Travel move: retract, rapid move, prime
             writeln!(file, "G1 E{:.5} F{:.0} ; Retract",
                 *total_extrusion - self.retraction_distance,
                 self.retraction_speed * 60.0)?;
-            writeln!(file, "G0 X{:.3} Y{:.3} Z{:.3} A{:.3} B{:.3} F6000 ; Travel",
-                segment.position.x, segment.position.y, segment.position.z,
-                a_angle, b_angle)?;
+            writeln!(file, "G0 X{:.3} Y{:.3} Z{:.3} {} {} F6000 ; Travel",
+                pos.x, pos.y, pos.z, rot1, rot2)?;
             writeln!(file, "G1 E{:.5} F{:.0} ; Prime",
                 *total_extrusion,
                 self.retraction_speed * 60.0)?;
         } else {
             // Extrusion move
             *total_extrusion += segment.extrusion;
-            writeln!(file, "G1 X{:.3} Y{:.3} Z{:.3} A{:.3} B{:.3} E{:.5} F{:.0}",
-                segment.position.x, segment.position.y, segment.position.z,
-                a_angle, b_angle, *total_extrusion,
+            writeln!(file, "G1 X{:.3} Y{:.3} Z{:.3} {} {} E{:.5} F{:.0}",
+                pos.x, pos.y, pos.z, rot1, rot2, *total_extrusion,
                 segment.feedrate * 60.0)?;
         }
 
@@ -214,16 +248,43 @@ impl GCodeGenerator {
         Ok(())
     }
 
-    /// Convert tool orientation vector to A and B angles (in degrees)
+    /// Convert tool orientation vector to two rotation angles (in degrees).
+    ///
+    /// Returns `(axis1_deg, axis2_deg)` where the meaning of axis1 and axis2
+    /// depends on `self.kinematics.rotary_axes`:
+    /// - `AB`: axis1 = A (pitch around X), axis2 = B (roll around Y)
+    /// - `BC`: axis1 = B (tilt), axis2 = C (rotate) — same math, different labels
     fn orientation_to_angles(&self, orientation: &crate::geometry::Vector3D) -> (f64, f64) {
-        // Project orientation to get rotation angles
-        // A = rotation around X (pitch)
-        // B = rotation around Y (roll)
-        
         let a_angle = orientation.y.atan2(orientation.z).to_degrees();
         let b_angle = (-orientation.x).atan2(orientation.z).to_degrees();
-        
         (a_angle, b_angle)
+    }
+
+    /// Apply TCP (tool center point) compensation.
+    ///
+    /// Shifts `position` so that the nozzle tip (which is `tcp_offset` mm below the
+    /// pivot) lands at `position` when the head is tilted by `(a_deg, b_deg)`.
+    /// Returns `position` unchanged when `tcp_offset ≈ 0`.
+    fn tcp_compensate(&self, position: crate::geometry::Point3D, a_deg: f64, b_deg: f64)
+        -> crate::geometry::Point3D
+    {
+        let offset = self.kinematics.tcp_offset;
+        if offset.abs() < 1e-6 { return position; }
+        let a = a_deg.to_radians();
+        let b = b_deg.to_radians();
+        crate::geometry::Point3D::new(
+            position.x + offset * a.sin() * b.cos(),
+            position.y + offset * a.sin() * b.sin(),
+            position.z + offset * (1.0 - a.cos()),
+        )
+    }
+
+    /// Format a rotary-axis pair for a G-code move according to the configured axis mode.
+    fn format_rotary(&self, axis1_deg: f64, axis2_deg: f64) -> (String, String) {
+        match self.kinematics.rotary_axes {
+            RotaryAxisMode::AB => (format!("A{:.3}", axis1_deg), format!("B{:.3}", axis2_deg)),
+            RotaryAxisMode::BC => (format!("B{:.3}", axis1_deg), format!("C{:.3}", axis2_deg)),
+        }
     }
 }
 

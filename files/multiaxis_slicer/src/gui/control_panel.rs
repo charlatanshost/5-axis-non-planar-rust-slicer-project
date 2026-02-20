@@ -145,6 +145,8 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                             crate::gui::app::SlicingMode::Conical => "Conical (RotBot)",
                             crate::gui::app::SlicingMode::Curved => "S3 Curved Layer",
                             crate::gui::app::SlicingMode::Geodesic => "Geodesic (Heat Method)",
+                            crate::gui::app::SlicingMode::CoordTransformCylindrical => "Cylindrical",
+                            crate::gui::app::SlicingMode::CoordTransformSpherical => "Spherical",
                         })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::Planar, "Planar (Traditional)")
@@ -157,6 +159,10 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                                 .on_hover_text("S3-Slicer: Quaternion field optimization → Deformation → Curved layers.\nMore complex, multiple deformation methods available.");
                             ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::Geodesic, "Geodesic (Heat Method)")
                                 .on_hover_text("Geodesic slicing: layers follow surface curvature via Heat Method distance field.\nLayers are equidistant along the mesh surface, not through air.");
+                            ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::CoordTransformCylindrical, "Cylindrical")
+                                .on_hover_text("Cylindrical slicing: maps mesh to (theta, z, r) space.\nPlanar slices become concentric radial shells around the Z axis.");
+                            ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::CoordTransformSpherical, "Spherical")
+                                .on_hover_text("Spherical slicing: maps mesh to (theta, phi, r) space.\nPlanar slices become concentric spherical shells around a center point.");
                         });
                 });
 
@@ -291,7 +297,7 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                         if app.geodesic_source_mode == 0 {
                             ui.horizontal(|ui| {
                                 ui.label("Bottom tolerance:");
-                                ui.add(egui::Slider::new(&mut app.geodesic_bottom_tolerance, 0.1..=5.0)
+                                ui.add(egui::Slider::new(&mut app.geodesic_bottom_tolerance, 0.01..=5.0)
                                     .suffix(" mm")
                                     .step_by(0.1))
                                     .on_hover_text("Z tolerance for detecting bottom boundary vertices.\nLarger = more source vertices at the base.");
@@ -315,11 +321,94 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                         ui.label(egui::RichText::new("Advanced").weak());
 
                         ui.horizontal(|ui| {
-                            ui.label("Heat timestep:");
-                            ui.add(egui::Slider::new(&mut app.geodesic_heat_factor, 0.1..=10.0)
-                                .step_by(0.1))
-                                .on_hover_text("Multiplier on avg_edge_length² for heat diffusion timestep.\n1.0 is default. Larger = smoother but less accurate distances.");
+                            ui.checkbox(&mut app.geodesic_use_multiscale, "Multi-scale")
+                                .on_hover_text("Run several heat solves at doubling timesteps and fuse per-vertex.\nGives fine detail in thin features AND full-mesh coverage simultaneously.\nRecommended: ON.");
                         });
+
+                        if app.geodesic_use_multiscale {
+                            ui.horizontal(|ui| {
+                                ui.label("  Base factor:");
+                                ui.add(egui::Slider::new(&mut app.geodesic_heat_factor, 0.1..=20.0)
+                                    .step_by(0.5))
+                                    .on_hover_text("Finest (most detailed) heat timestep = factor × avg_edge².\nMulti-scale adds larger scales automatically for full coverage.\nSmaller = more local detail in thin features (feet, ears).");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("  Scales:");
+                                ui.add(egui::Slider::new(&mut app.geodesic_num_scales, 3..=8)
+                                    .step_by(1.0))
+                                    .on_hover_text("Number of doubling timestep scales.\n6 covers factor × [1,2,4,8,16,32] — enough for most meshes.\nIncrease if the mesh is very tall relative to its fine features.");
+                            });
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label("Heat timestep:");
+                                ui.add(egui::Slider::new(&mut app.geodesic_heat_factor, 0.1..=100.0)
+                                    .step_by(0.5))
+                                    .on_hover_text("Multiplier on avg_edge_length² for heat diffusion timestep.\nLarger = smoother but less accurate. Needs ~15+ for full mesh coverage on most objects.");
+                            });
+                        }
+
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut app.geodesic_use_adaptive, "Adaptive κ")
+                                .on_hover_text("Variable-diffusivity heat method (Grok/Crane adaptive extension).\nPer-face κ = kappa_base × (avg_edge)².\nSmall triangles (thin features, toes) → small κ → slow diffusion → sharp contours.\nLarge triangles (body, ears) → large κ → fast spread → full coverage.\nCombines well with multi-scale for best results.");
+                        });
+
+                        if app.geodesic_use_adaptive {
+                            ui.horizontal(|ui| {
+                                ui.label("  κ base:");
+                                ui.add(egui::Slider::new(&mut app.geodesic_adaptive_kappa_base, 0.5..=20.0)
+                                    .step_by(0.5))
+                                    .on_hover_text("Scaling factor for per-face diffusivity κ.\nκ(face) = base × (avg_edge_length)², clamped to [0.05, 50].\nTypical range: 4–8. Higher = more aggressive spread in large regions.\nTry 6.0 as a starting point.");
+                            });
+                        }
+                    });
+
+                    ui.add_space(5.0);
+                }
+
+                // Cylindrical / Spherical Configuration
+                let is_coord_transform = matches!(
+                    app.slicing_mode,
+                    crate::gui::app::SlicingMode::CoordTransformCylindrical
+                    | crate::gui::app::SlicingMode::CoordTransformSpherical
+                );
+                if is_coord_transform {
+                    let title = if app.slicing_mode == crate::gui::app::SlicingMode::CoordTransformCylindrical {
+                        "Cylindrical Slicing Configuration"
+                    } else {
+                        "Spherical Slicing Configuration"
+                    };
+                    ui.collapsing(title, |ui| {
+                        if app.slicing_mode == crate::gui::app::SlicingMode::CoordTransformCylindrical {
+                            ui.label(egui::RichText::new("Pipeline: (x,y,z) → (θ,z,r) → Planar slice → Inverse").weak());
+                            ui.label(egui::RichText::new("⚠ Branch-cut artifact possible at θ = ±180° for thin regions").italics().weak());
+                        } else {
+                            ui.label(egui::RichText::new("Pipeline: (x,y,z) → (θ,φ,r) → Planar slice → Inverse").weak());
+                            ui.label(egui::RichText::new("⚠ Branch-cut artifact possible at θ = ±180° for thin regions").italics().weak());
+                        }
+                        ui.add_space(3.0);
+
+                        ui.separator();
+                        ui.label(egui::RichText::new("Transform Center").weak());
+
+                        ui.checkbox(&mut app.coord_transform_auto_center, "Auto-center on mesh")
+                            .on_hover_text("Automatically use the mesh centroid as the transform center");
+
+                        if !app.coord_transform_auto_center {
+                            ui.horizontal(|ui| {
+                                ui.label("Center X:");
+                                ui.add(egui::DragValue::new(&mut app.coord_transform_center_x).speed(0.5).suffix(" mm"));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Center Y:");
+                                ui.add(egui::DragValue::new(&mut app.coord_transform_center_y).speed(0.5).suffix(" mm"));
+                            });
+                            if app.slicing_mode == crate::gui::app::SlicingMode::CoordTransformSpherical {
+                                ui.horizontal(|ui| {
+                                    ui.label("Center Z:");
+                                    ui.add(egui::DragValue::new(&mut app.coord_transform_center_z).speed(0.5).suffix(" mm"));
+                                });
+                            }
+                        }
                     });
 
                     ui.add_space(5.0);
@@ -813,6 +902,40 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                 if app.has_motion_plan {
                     ui.label(egui::RichText::new("✓ Motion plan optimized").color(egui::Color32::from_rgb(100, 255, 100)));
                 }
+
+                ui.add_space(5.0);
+
+                // 5-axis G-code settings (TCP compensation + rotary axis labels)
+                ui.collapsing("5-Axis G-code Settings", |ui| {
+                    ui.label(egui::RichText::new("Rotary axis label format:").weak());
+                    use crate::gcode::RotaryAxisMode;
+                    egui::ComboBox::from_id_salt("rotary_axis_mode")
+                        .selected_text(match app.rotary_axis_mode {
+                            RotaryAxisMode::AB => "A/B (pitch + roll)",
+                            RotaryAxisMode::BC => "B/C (tilt + rotate)",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut app.rotary_axis_mode, RotaryAxisMode::AB, "A/B (pitch + roll)")
+                                .on_hover_text("A = rotation around X (pitch), B = rotation around Y (roll).\nDefault for most 5-axis head machines.");
+                            ui.selectable_value(&mut app.rotary_axis_mode, RotaryAxisMode::BC, "B/C (tilt + rotate)")
+                                .on_hover_text("B = tilt, C = rotate.\nCommon on table-tilt / table-rotate machine configurations.");
+                        });
+
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("TCP offset (pivot → nozzle tip):").weak());
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut app.tcp_offset)
+                            .speed(0.5)
+                            .range(0.0..=500.0)
+                            .suffix(" mm"));
+                        if app.tcp_offset < 1e-6 {
+                            ui.label(egui::RichText::new("(disabled)").weak());
+                        } else {
+                            ui.label(egui::RichText::new("✓ TCP active").color(egui::Color32::from_rgb(100, 200, 255)));
+                        }
+                    });
+                    ui.label(egui::RichText::new("Set to 0 to disable. Shifts XYZ so nozzle tip lands at target when axes are tilted.").italics().weak());
+                });
 
                 ui.add_space(5.0);
 

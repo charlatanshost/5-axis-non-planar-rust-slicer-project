@@ -40,7 +40,7 @@ pub struct TetScalarFieldConfig {
 impl Default for TetScalarFieldConfig {
     fn default() -> Self {
         Self {
-            smoothing_iterations: 5,
+            smoothing_iterations: 15,
             smoothing_weight: 0.3,
             use_deformed_z: true,
         }

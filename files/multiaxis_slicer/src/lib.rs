@@ -13,6 +13,7 @@ pub mod motion_planning;
 pub mod support_generation;
 pub mod s3_slicer;
 pub mod conical;
+pub mod coordinate_transform;
 pub mod contour_offset;
 pub mod geodesic;
 pub mod gui;

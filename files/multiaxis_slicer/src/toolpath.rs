@@ -148,10 +148,33 @@ impl ToolpathGenerator {
     ) {
         use crate::contour_offset::generate_wall_loops;
 
+        // For geodesic / coordinate-transform modes (skip_infill=true), 2D inward offset doesn't
+        // make sense for 3D surface curves: the XY projection of a surface contour is often
+        // concave or non-convex, and the offset can push vertices outside the actual mesh boundary,
+        // creating stray extrusion paths visible in the toolpath view.
+        // In these modes just extrude the original contours directly.
+        if self.pattern_config.skip_infill {
+            for contour in &layer.contours {
+                if contour.points.len() >= 2 {
+                    self.extrude_contour(contour, apply_nonplanar_offset, orientation, paths);
+                }
+            }
+            return;
+        }
+
         let wall_count = self.pattern_config.wall_count;
 
         for contour in &layer.contours {
             if contour.points.len() < 3 {
+                continue;
+            }
+
+            // Open arcs (e.g. from artifact-segment splitting at the base) must be extruded
+            // directly — the offset_contour algorithm uses (i+1)%n wrap-around and treats every
+            // contour as closed, so it creates a ghost closing edge for open arcs, producing
+            // endpoint vertices that can land outside the mesh (stray extrusions).
+            if !contour.closed {
+                self.extrude_contour(contour, apply_nonplanar_offset, orientation, paths);
                 continue;
             }
 
@@ -170,14 +193,22 @@ impl ToolpathGenerator {
             }
 
             // Generate infill inside the innermost wall
-            if self.pattern_config.infill_density > 0.01 {
+            if self.pattern_config.infill_density > 0.01 && !self.pattern_config.skip_infill {
                 let innermost = wall_loops.last().unwrap();
+
+                // Collect all wall loop points for better Z interpolation on curved layers.
+                // IDW across inner walls captures interior surface curvature more accurately
+                // than nearest-edge lookup on the boundary alone.
+                let z_ref_points: Vec<crate::geometry::Point3D> = wall_loops.iter()
+                    .flat_map(|c| c.points.iter().copied())
+                    .collect();
 
                 let infill_lines = generate_clipped_infill(
                     innermost,
                     &self.pattern_config,
                     layer.z,
                     Some(contour), // Validate against original contour
+                    Some(&z_ref_points),
                 );
 
                 for line in &infill_lines {
@@ -186,14 +217,12 @@ impl ToolpathGenerator {
                     }
 
                     // Travel to infill line start
-                    if !paths.is_empty() {
-                        paths.push(ToolpathSegment {
-                            position: apply_nonplanar_offset(line[0]),
-                            orientation,
-                            extrusion: 0.0,
-                            feedrate: self.pattern_config.travel_speed,
-                        });
-                    }
+                    paths.push(ToolpathSegment {
+                        position: apply_nonplanar_offset(line[0]),
+                        orientation,
+                        extrusion: 0.0,
+                        feedrate: self.pattern_config.travel_speed,
+                    });
 
                     // Extrude along infill line
                     for i in 0..line.len().saturating_sub(1) {
@@ -222,20 +251,32 @@ impl ToolpathGenerator {
         orientation: Vector3D,
         paths: &mut Vec<ToolpathSegment>,
     ) {
-        let contour_points = resample_contour(&contour.points, self.pattern_config.node_distance);
+        // For closed contours append the starting point so the loop visually closes.
+        // resample_contour only covers i..i+1 pairs so without this the closing edge
+        // (last_point → first_point) is never resampled or extruded.
+        let pts_for_resample: Vec<Point3D> = if contour.closed && !contour.points.is_empty() {
+            let mut p = contour.points.clone();
+            p.push(contour.points[0]);
+            p
+        } else {
+            contour.points.clone()
+        };
+
+        let contour_points = resample_contour(&pts_for_resample, self.pattern_config.node_distance);
         if contour_points.len() < 2 {
             return;
         }
 
-        // Travel move to contour start
-        if !paths.is_empty() {
-            paths.push(ToolpathSegment {
-                position: apply_nonplanar_offset(contour_points[0]),
-                orientation,
-                extrusion: 0.0,
-                feedrate: self.pattern_config.travel_speed,
-            });
-        }
+        // Always emit a travel move to the contour start.
+        // This ensures that the first contour of every layer also has a proper
+        // positioning move, so the toolpath visualization never draws a spurious
+        // extrusion line from the previous layer's endpoint to this contour.
+        paths.push(ToolpathSegment {
+            position: apply_nonplanar_offset(contour_points[0]),
+            orientation,
+            extrusion: 0.0,
+            feedrate: self.pattern_config.travel_speed,
+        });
 
         // Extrude along contour
         for i in 0..contour_points.len().saturating_sub(1) {

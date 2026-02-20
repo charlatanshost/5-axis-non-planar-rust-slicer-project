@@ -89,7 +89,7 @@ pub fn execute_conical_pipeline(
     let mut layers: Vec<Layer> = planar_layers.into_iter()
         .map(|layer| {
             let contours: Vec<Contour> = layer.contours.into_iter()
-                .map(|contour| {
+                .flat_map(|contour| {
                     let points: Vec<Point3D> = contour.points.into_iter()
                         .map(|p| {
                             let mut p = conical_inverse(p, center_x, center_y, tan_angle, sign);
@@ -98,7 +98,11 @@ pub fn execute_conical_pipeline(
                             p
                         })
                         .collect();
-                    Contour::new(points, contour.closed)
+                    let back_xf = Contour::new(points, contour.closed);
+                    // Split at artifact segments rather than discarding the whole contour:
+                    // artifact edges (both pts at bed_z, XY > 10mm) are removed individually
+                    // so the legitimate rim arc survives while pure-artifact triangles vanish.
+                    split_at_artifact_segments(back_xf, bed_z)
                 })
                 .collect();
 
@@ -174,6 +178,79 @@ fn conical_inverse(point: Point3D, cx: f64, cy: f64, tan_angle: f64, sign: f64) 
     let dy = point.y - cy;
     let r = (dx * dx + dy * dy).sqrt();
     Point3D::new(point.x, point.y, point.z - sign * r * tan_angle)
+}
+
+/// Split a back-transformed contour at "artifact" edges.
+///
+/// An artifact edge has both endpoints clamped to bed level AND spans more than 10 mm in XY.
+/// These come from bad STL facets (20-60 mm edges all at z_min) that the conical transform
+/// maps to extreme deformed-z values.
+///
+/// Strategy:
+/// * If no artifact edges are found → return the contour unchanged.
+/// * Otherwise, traverse the ring starting after the first artifact, collecting runs of
+///   good vertices.  Each time an artifact edge is hit, flush the current run as an *open*
+///   arc (closed = false) if it has ≥ 3 points, then start a new run.
+/// * Pure-artifact contours (artifact triangles) produce runs of only 1-2 points → discarded.
+/// * The legitimate bottom rim, which may contain 1-2 artifact edges, becomes 1-2 large
+///   open arcs that together cover almost the entire perimeter.
+fn split_at_artifact_segments(contour: Contour, bed_z: f64) -> Vec<Contour> {
+    const Z_EPS: f64 = 0.001;      // mm above bed_z — "at bed level"
+    const MAX_SEG_SQ: f64 = 100.0; // (10 mm)² — artifact threshold
+    const MIN_ARC_PTS: usize = 3;  // discard runs shorter than this
+
+    let closed = contour.closed;
+    let pts = contour.points;
+    let n = pts.len();
+
+    if n < 2 || !closed {
+        return vec![Contour::new(pts, closed)];
+    }
+
+    // Mark artifact edges.  Edge i connects pts[i] → pts[(i+1)%n].
+    let artifact: Vec<bool> = (0..n).map(|i| {
+        let j = (i + 1) % n;
+        if pts[i].z < bed_z + Z_EPS && pts[j].z < bed_z + Z_EPS {
+            let dx = pts[j].x - pts[i].x;
+            let dy = pts[j].y - pts[i].y;
+            dx * dx + dy * dy > MAX_SEG_SQ
+        } else {
+            false
+        }
+    }).collect();
+
+    // No artifacts → return unchanged.
+    if !artifact.iter().any(|&a| a) {
+        return vec![Contour::new(pts, closed)];
+    }
+
+    // Find the first artifact edge so we can start the ring traversal right after it.
+    let first_art = artifact.iter().position(|&a| a).unwrap();
+
+    let mut result: Vec<Contour> = Vec::new();
+    // Begin with the vertex immediately after the first artifact edge.
+    let mut run: Vec<Point3D> = vec![pts[(first_art + 1) % n]];
+
+    for k in 1..n {
+        let edge = (first_art + k) % n;
+        let next_vert = (first_art + k + 1) % n;
+
+        if artifact[edge] {
+            // Flush current run as an open arc, then start fresh.
+            if run.len() >= MIN_ARC_PTS {
+                result.push(Contour::new(run, false));
+            }
+            run = vec![pts[next_vert]];
+        } else {
+            run.push(pts[next_vert]);
+        }
+    }
+    // Flush the final run (ends at vertex `first_art`, just before the starting artifact).
+    if run.len() >= MIN_ARC_PTS {
+        result.push(Contour::new(run, false));
+    }
+
+    result
 }
 
 #[cfg(test)]
