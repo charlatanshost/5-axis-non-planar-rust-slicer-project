@@ -197,8 +197,13 @@ pub struct SlicerApp {
     pub geodesic_bottom_tolerance: f64,    // Z tolerance for bottom boundary
     pub geodesic_use_multiscale: bool,     // Enable multi-scale heat method
     pub geodesic_num_scales: usize,        // Number of doubling scales (default 6)
-    pub geodesic_use_adaptive: bool,       // Enable adaptive (variable-κ) heat method
-    pub geodesic_adaptive_kappa_base: f64, // Per-face κ = kappa_base × (avg_edge)²
+    /// Diffusion mode: 0=Isotropic, 1=AdaptiveScalar, 2=Anisotropic, 3=PrintDirectionBiased
+    pub geodesic_diffusion_mode: u8,
+    pub geodesic_adaptive_kappa_base: f64,  // Per-face κ = kappa_base × (avg_edge)² (mode 1)
+    pub geodesic_anisotropy_ratio: f64,     // Curvature-direction stretch ratio (mode 2)
+    pub geodesic_aniso_smooth_iters: usize, // Smoothing passes for curvature dirs (mode 2)
+    pub geodesic_print_dir_axis: u8,        // 0=X, 1=Y, 2=Z preferred print direction (mode 3)
+    pub geodesic_print_dir_ratio: f64,      // Diffusivity ratio along print direction (mode 3)
 
     // G-code / machine kinematics configuration
     pub tcp_offset: f64,                               // pivot-to-nozzle distance (mm); 0 = disabled
@@ -313,8 +318,12 @@ impl Default for SlicerApp {
             geodesic_bottom_tolerance: 0.1,
             geodesic_use_multiscale: true,
             geodesic_num_scales: 6,
-            geodesic_use_adaptive: false,
+            geodesic_diffusion_mode: 0,     // Isotropic
             geodesic_adaptive_kappa_base: 6.0,
+            geodesic_anisotropy_ratio: 0.3,
+            geodesic_aniso_smooth_iters: 2,
+            geodesic_print_dir_axis: 2,     // Z-axis
+            geodesic_print_dir_ratio: 10.0,
 
             // G-code kinematics defaults
             tcp_offset: 0.0,
@@ -756,8 +765,12 @@ impl SlicerApp {
         let bottom_tol = self.geodesic_bottom_tolerance;
         let use_multiscale = self.geodesic_use_multiscale;
         let num_scales = self.geodesic_num_scales;
-        let use_adaptive = self.geodesic_use_adaptive;
+        let diffusion_mode_idx = self.geodesic_diffusion_mode;
         let adaptive_kappa_base = self.geodesic_adaptive_kappa_base;
+        let anisotropy_ratio = self.geodesic_anisotropy_ratio;
+        let aniso_smooth_iters = self.geodesic_aniso_smooth_iters;
+        let print_dir_axis = self.geodesic_print_dir_axis;
+        let print_dir_ratio = self.geodesic_print_dir_ratio;
 
         let (tx, rx) = mpsc::channel();
         self.layers_receiver = Some(rx);
@@ -770,6 +783,28 @@ impl SlicerApp {
                 p.message = "Initializing geodesic pipeline (Heat Method)...".to_string();
             }
 
+            let diffusion_mode = match diffusion_mode_idx {
+                1 => crate::geodesic::GeodesicDiffusionMode::AdaptiveScalar {
+                    kappa_base: adaptive_kappa_base,
+                },
+                2 => crate::geodesic::GeodesicDiffusionMode::Anisotropic {
+                    anisotropy_ratio,
+                    smoothing_iters: aniso_smooth_iters,
+                },
+                3 => {
+                    let preferred_dir = match print_dir_axis {
+                        0 => crate::geometry::Vector3D::new(1.0, 0.0, 0.0),
+                        1 => crate::geometry::Vector3D::new(0.0, 1.0, 0.0),
+                        _ => crate::geometry::Vector3D::new(0.0, 0.0, 1.0),
+                    };
+                    crate::geodesic::GeodesicDiffusionMode::PrintDirectionBiased {
+                        preferred_dir,
+                        ratio: print_dir_ratio,
+                    }
+                }
+                _ => crate::geodesic::GeodesicDiffusionMode::Isotropic,
+            };
+
             let config = crate::geodesic::GeodesicSlicerConfig {
                 source,
                 layer_height,
@@ -777,8 +812,7 @@ impl SlicerApp {
                 bottom_tolerance: bottom_tol,
                 use_multiscale,
                 num_scales,
-                use_adaptive,
-                adaptive_kappa_base,
+                diffusion_mode,
             };
 
             let result = std::panic::catch_unwind(|| {

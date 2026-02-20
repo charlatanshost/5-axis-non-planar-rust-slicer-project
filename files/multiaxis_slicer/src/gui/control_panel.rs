@@ -297,9 +297,9 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                         if app.geodesic_source_mode == 0 {
                             ui.horizontal(|ui| {
                                 ui.label("Bottom tolerance:");
-                                ui.add(egui::Slider::new(&mut app.geodesic_bottom_tolerance, 0.01..=5.0)
+                                ui.add(egui::Slider::new(&mut app.geodesic_bottom_tolerance, 0.001..=50.0)
                                     .suffix(" mm")
-                                    .step_by(0.1))
+                                    .step_by(0.001))
                                     .on_hover_text("Z tolerance for detecting bottom boundary vertices.\nLarger = more source vertices at the base.");
                             });
                         } else {
@@ -328,36 +328,86 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                         if app.geodesic_use_multiscale {
                             ui.horizontal(|ui| {
                                 ui.label("  Base factor:");
-                                ui.add(egui::Slider::new(&mut app.geodesic_heat_factor, 0.1..=20.0)
-                                    .step_by(0.5))
+                                ui.add(egui::Slider::new(&mut app.geodesic_heat_factor, 0.001..=500.0)
+                                    .step_by(0.001))
                                     .on_hover_text("Finest (most detailed) heat timestep = factor × avg_edge².\nMulti-scale adds larger scales automatically for full coverage.\nSmaller = more local detail in thin features (feet, ears).");
                             });
                             ui.horizontal(|ui| {
                                 ui.label("  Scales:");
-                                ui.add(egui::Slider::new(&mut app.geodesic_num_scales, 3..=8)
+                                ui.add(egui::Slider::new(&mut app.geodesic_num_scales, 1..=16)
                                     .step_by(1.0))
                                     .on_hover_text("Number of doubling timestep scales.\n6 covers factor × [1,2,4,8,16,32] — enough for most meshes.\nIncrease if the mesh is very tall relative to its fine features.");
                             });
                         } else {
                             ui.horizontal(|ui| {
                                 ui.label("Heat timestep:");
-                                ui.add(egui::Slider::new(&mut app.geodesic_heat_factor, 0.1..=100.0)
-                                    .step_by(0.5))
+                                ui.add(egui::Slider::new(&mut app.geodesic_heat_factor, 0.001..=10000.0)
+                                    .step_by(0.001))
                                     .on_hover_text("Multiplier on avg_edge_length² for heat diffusion timestep.\nLarger = smoother but less accurate. Needs ~15+ for full mesh coverage on most objects.");
                             });
                         }
 
+                        // Diffusion mode selector
                         ui.horizontal(|ui| {
-                            ui.checkbox(&mut app.geodesic_use_adaptive, "Adaptive κ")
-                                .on_hover_text("Variable-diffusivity heat method (Grok/Crane adaptive extension).\nPer-face κ = kappa_base × (avg_edge)².\nSmall triangles (thin features, toes) → small κ → slow diffusion → sharp contours.\nLarge triangles (body, ears) → large κ → fast spread → full coverage.\nCombines well with multi-scale for best results.");
+                            ui.label("Diffusion:");
+                            egui::ComboBox::from_id_source("geodesic_diffusion_mode")
+                                .selected_text(match app.geodesic_diffusion_mode {
+                                    1 => "Adaptive Scalar",
+                                    2 => "Anisotropic",
+                                    3 => "Print Direction",
+                                    _ => "Isotropic",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut app.geodesic_diffusion_mode, 0, "Isotropic")
+                                        .on_hover_text("Standard cotangent-weight Laplacian. Most robust, recommended for most meshes.");
+                                    ui.selectable_value(&mut app.geodesic_diffusion_mode, 1, "Adaptive Scalar")
+                                        .on_hover_text("Per-face κ(f) = kappa_base × (avg_edge)².\nSmall triangles → slow diffusion → sharp local detail.\nLarge triangles → fast spread → full coverage.\nCombines well with multi-scale.");
+                                    ui.selectable_value(&mut app.geodesic_diffusion_mode, 2, "Anisotropic")
+                                        .on_hover_text("FEM tensor Laplacian aligned with curvature directions.\nratio < 1: heat slows across curvature → layers follow surface folds.\nratio > 1: heat speeds across curvature → smoother global wavefronts.\nSmoothing reduces noise in the curvature direction estimate.");
+                                    ui.selectable_value(&mut app.geodesic_diffusion_mode, 3, "Print Direction")
+                                        .on_hover_text("Heat flows ratio× faster along chosen axis (X/Y/Z).\nContours align with the print direction — natural non-planar toolpaths.\nZ-axis is typical for upright printing. Use ratio 5–20.");
+                                });
                         });
 
-                        if app.geodesic_use_adaptive {
+                        // Mode-specific controls
+                        if app.geodesic_diffusion_mode == 1 {
                             ui.horizontal(|ui| {
                                 ui.label("  κ base:");
-                                ui.add(egui::Slider::new(&mut app.geodesic_adaptive_kappa_base, 0.5..=20.0)
-                                    .step_by(0.5))
-                                    .on_hover_text("Scaling factor for per-face diffusivity κ.\nκ(face) = base × (avg_edge_length)², clamped to [0.05, 50].\nTypical range: 4–8. Higher = more aggressive spread in large regions.\nTry 6.0 as a starting point.");
+                                ui.add(egui::Slider::new(&mut app.geodesic_adaptive_kappa_base, 0.05..=200.0)
+                                    .step_by(0.05))
+                                    .on_hover_text("Per-face diffusivity scale.\nκ(face) = base × (avg_edge)², clamped [0.05, 50].\nTypical: 4–8. Higher = more spread in large regions.");
+                            });
+                        }
+
+                        if app.geodesic_diffusion_mode == 2 {
+                            ui.horizontal(|ui| {
+                                ui.label("  Aniso ratio:");
+                                ui.add(egui::Slider::new(&mut app.geodesic_anisotropy_ratio, 0.01..=50.0)
+                                    .step_by(0.01))
+                                    .on_hover_text("Curvature-direction stretch ratio.\n< 1: slow diffusion across bends (surface-hugging layers).\n> 1: fast diffusion across bends (smoother wavefronts).\n1.0 = isotropic. Start with 0.3.");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("  Smooth iters:");
+                                ui.add(egui::Slider::new(&mut app.geodesic_aniso_smooth_iters, 0..=20))
+                                    .on_hover_text("Laplacian smoothing passes on curvature directions.\n0 = raw (noisy on coarse meshes). 1–3 recommended.\nHigher = more spatially coherent contours.");
+                            });
+                        }
+
+                        if app.geodesic_diffusion_mode == 3 {
+                            ui.horizontal(|ui| {
+                                ui.label("  Axis:");
+                                ui.selectable_value(&mut app.geodesic_print_dir_axis, 0, "X")
+                                    .on_hover_text("Preferred direction: +X axis");
+                                ui.selectable_value(&mut app.geodesic_print_dir_axis, 1, "Y")
+                                    .on_hover_text("Preferred direction: +Y axis");
+                                ui.selectable_value(&mut app.geodesic_print_dir_axis, 2, "Z")
+                                    .on_hover_text("Preferred direction: +Z axis (upright printing)");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("  Ratio:");
+                                ui.add(egui::Slider::new(&mut app.geodesic_print_dir_ratio, 0.1..=200.0)
+                                    .step_by(0.1))
+                                    .on_hover_text("How much faster heat flows along chosen axis vs. perpendicular.\nHigher = stronger directional alignment. Typical: 5–20.");
                             });
                         }
                     });

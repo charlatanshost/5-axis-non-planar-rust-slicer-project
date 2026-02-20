@@ -28,6 +28,37 @@ pub enum GeodesicSource {
     Point(Point3D),
 }
 
+/// Diffusion mode controlling how the heat operator is built for geodesic distance.
+#[derive(Clone)]
+pub enum GeodesicDiffusionMode {
+    /// Standard isotropic cotangent-weight Laplacian (default, most robust).
+    Isotropic,
+    /// Adaptive scalar diffusivity: κ(f) = kappa_base × (avg_edge_length(f))².
+    /// Small triangles (thin features) → small κ → slow diffusion → sharp local detail.
+    /// Large triangles (smooth body) → large κ → fast diffusion → full coverage.
+    /// Can be combined with multi-scale for best results.
+    AdaptiveScalar { kappa_base: f64 },
+    /// Anisotropic tensor diffusivity using FEM gradient assembly.
+    /// Per-face tensor: σ_f = I + (anisotropy_ratio − 1) · d_f ⊗ d_f,
+    /// where d_f is the local curvature direction estimated from vertex-normal variation.
+    /// ratio < 1.0: heat slows across curvature (preserves surface detail).
+    /// ratio > 1.0: heat speeds across curvature (smooths over sharp bends).
+    /// `smoothing_iters`: Laplacian smoothing passes on the curvature direction field
+    /// before stiffness assembly (0 = raw/noisy, 1–3 recommended).
+    Anisotropic { anisotropy_ratio: f64, smoothing_iters: usize },
+    /// Print-direction biased: heat diffuses `ratio` × faster along `preferred_dir`
+    /// (projected onto each face's tangent plane) than perpendicular to it.
+    /// Contours produced by this mode tend to align with the intended print direction,
+    /// making them more natural for non-planar toolpath generation.
+    /// Typical range for `ratio`: 5–20.  `preferred_dir` need not be normalized.
+    PrintDirectionBiased { preferred_dir: Vector3D, ratio: f64 },
+    /// Custom vector field: bypass the heat step entirely.
+    /// The provided per-face normalized directions are used directly as the gradient field X,
+    /// which is then fed into the divergence → Poisson pipeline.
+    /// Useful for injecting externally-computed flow directions.
+    CustomVectorField(Vec<Vector3D>),
+}
+
 /// Configuration for geodesic slicing.
 #[derive(Clone)]
 pub struct GeodesicSlicerConfig {
@@ -42,18 +73,12 @@ pub struct GeodesicSlicerConfig {
     /// Use multi-scale heat method: run at several timesteps and fuse per-vertex
     /// using the finest scale that still reaches each vertex.  Gives fine detail in
     /// thin features (feet, ears) AND full-mesh coverage simultaneously.
+    /// (Not applicable to CustomVectorField mode which has no heat step.)
     pub use_multiscale: bool,
     /// Number of doubling scales in multi-scale mode (default 6 = factor × [1,2,4,8,16,32]).
     pub num_scales: usize,
-    /// Use adaptive (variable-diffusivity) heat method.
-    /// Per-face kappa = adaptive_kappa_base × (avg_edge_length)².
-    /// Small faces (thin features) get small κ → heat slows down → sharp local gradients.
-    /// Large faces (smooth regions) get large κ → heat spreads fast → full coverage.
-    /// Can be combined with multi-scale for best results.
-    pub use_adaptive: bool,
-    /// Base scaling factor for per-face diffusivity κ (default 6.0).
-    /// Increase for faster spread in large regions; decrease to preserve more feature detail.
-    pub adaptive_kappa_base: f64,
+    /// Diffusion mode for the heat step. Controls how the Laplacian is built.
+    pub diffusion_mode: GeodesicDiffusionMode,
 }
 
 impl Default for GeodesicSlicerConfig {
@@ -65,8 +90,7 @@ impl Default for GeodesicSlicerConfig {
             bottom_tolerance: 0.1,
             use_multiscale: true,
             num_scales: 6,
-            use_adaptive: false,
-            adaptive_kappa_base: 6.0,
+            diffusion_mode: GeodesicDiffusionMode::Isotropic,
         }
     }
 }
@@ -251,6 +275,345 @@ fn compute_kappa_per_face(topo: &MeshTopology, base_factor: f64) -> Vec<f64> {
     }).collect()
 }
 
+/// Estimate the principal curvature direction for each face.
+///
+/// For each face we take the tangential component of the per-vertex area-weighted normals
+/// (their deviation from the flat face normal).  The average of these three vectors points
+/// in the direction of greatest local bending, i.e. the principal curvature direction.
+/// Returns a unit vector in the face's tangent plane (zero if the face is flat / degenerate).
+fn compute_face_curvature_direction(topo: &MeshTopology) -> Vec<Vector3D> {
+    topo.faces.iter().map(|face| {
+        let [i, j, k] = *face;
+        let vi = topo.vertices[i];
+        let vj = topo.vertices[j];
+        let vk = topo.vertices[k];
+
+        let face_normal = (vj - vi).cross(&(vk - vi));
+        let area2 = face_normal.norm();
+        if area2 < 1e-15 {
+            return Vector3D::zeros();
+        }
+        let n_hat = face_normal / area2;
+
+        // Tangential component of each vertex normal = deviation from the face normal
+        let ni = topo.vertex_normals[i];
+        let nj = topo.vertex_normals[j];
+        let nk = topo.vertex_normals[k];
+        let ti = ni - ni.dot(&n_hat) * n_hat;
+        let tj = nj - nj.dot(&n_hat) * n_hat;
+        let tk = nk - nk.dot(&n_hat) * n_hat;
+
+        let avg = (ti + tj + tk) / 3.0;
+        let norm = avg.norm();
+        if norm > 1e-15 {
+            avg / norm
+        } else {
+            // Flat face (no curvature) — fall back to the first edge direction
+            let e = vj - vi;
+            let en = e.norm();
+            if en > 1e-15 { e / en } else { Vector3D::zeros() }
+        }
+    }).collect()
+}
+
+/// Build a face adjacency list (faces sharing an edge) from topology.
+/// Returns `adj[f]` = indices of faces that share an edge with face `f`.
+fn compute_face_adjacency(topo: &MeshTopology) -> Vec<Vec<usize>> {
+    let n_faces = topo.faces.len();
+    let mut edge_faces: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for (fi, face) in topo.faces.iter().enumerate() {
+        for k in 0..3 {
+            let a = face[k];
+            let b = face[(k + 1) % 3];
+            let key = if a < b { (a, b) } else { (b, a) };
+            edge_faces.entry(key).or_default().push(fi);
+        }
+    }
+    let mut adj = vec![Vec::new(); n_faces];
+    for faces in edge_faces.values() {
+        if faces.len() == 2 {
+            adj[faces[0]].push(faces[1]);
+            adj[faces[1]].push(faces[0]);
+        }
+    }
+    adj
+}
+
+/// Laplacian smoothing of per-face direction vectors on the manifold.
+///
+/// Each face's direction is replaced by the (tangent-plane-projected + renormalized)
+/// average of its own direction and those of its edge-adjacent neighbors.
+/// Reduces noise in curvature direction estimates, giving smoother contours.
+fn smooth_face_directions(
+    topo: &MeshTopology,
+    face_adj: &[Vec<usize>],
+    dirs: &[Vector3D],
+    iters: usize,
+) -> Vec<Vector3D> {
+    let mut current = dirs.to_vec();
+    for _ in 0..iters {
+        let mut next = current.clone();
+        for (f, face) in topo.faces.iter().enumerate() {
+            let [i, j, k] = *face;
+            let vi = topo.vertices[i];
+            let vj = topo.vertices[j];
+            let vk = topo.vertices[k];
+
+            let face_normal = (vj - vi).cross(&(vk - vi));
+            let area2 = face_normal.norm();
+            if area2 < 1e-15 { continue; }
+            let n_hat = face_normal / area2;
+
+            // Accumulate self + each neighbor's direction projected to this tangent plane
+            let mut acc = current[f];
+            let mut count = 1.0f64;
+            for &adj in &face_adj[f] {
+                let d = current[adj];
+                let d_tan = d - d.dot(&n_hat) * n_hat;
+                let dn = d_tan.norm();
+                if dn > 1e-15 {
+                    acc += d_tan / dn;
+                    count += 1.0;
+                }
+            }
+            acc /= count;
+            let an = acc.norm();
+            next[f] = if an > 1e-15 { acc / an } else { current[f] };
+        }
+        current = next;
+    }
+    current
+}
+
+/// Project a global preferred direction onto each face's tangent plane.
+/// Returns per-face unit tangent vectors.  Falls back to the first edge direction
+/// if the preferred direction is nearly parallel to the face normal.
+fn compute_print_direction_per_face(topo: &MeshTopology, preferred_dir: Vector3D) -> Vec<Vector3D> {
+    topo.faces.iter().map(|face| {
+        let [i, j, k] = *face;
+        let vi = topo.vertices[i];
+        let vj = topo.vertices[j];
+        let vk = topo.vertices[k];
+
+        let face_normal = (vj - vi).cross(&(vk - vi));
+        let area2 = face_normal.norm();
+        if area2 < 1e-15 { return Vector3D::zeros(); }
+        let n_hat = face_normal / area2;
+
+        let d_tan = preferred_dir - preferred_dir.dot(&n_hat) * n_hat;
+        let dn = d_tan.norm();
+        if dn > 1e-15 {
+            d_tan / dn
+        } else {
+            // preferred_dir parallel to face normal — use first edge as fallback
+            let e = vj - vi;
+            let en = e.norm();
+            if en > 1e-15 { e / en } else { Vector3D::zeros() }
+        }
+    }).collect()
+}
+
+/// Shared FEM stiffness assembly kernel for anisotropic Laplacians.
+///
+/// Per-face diffusion tensor: σ_f = I + (ratio − 1) · d_f ⊗ d_f,
+/// where `dirs[f]` is the per-face preferred diffusion direction (unit vector
+/// in the face tangent plane).
+///
+/// K[i,j] = Σ_f area_f · grad_i · (σ_f · grad_j)
+/// Shape-function gradients: grad_v = cross(n̂, e_opposite) / (2A)
+///
+/// Properties:
+///  - ratio > 1: heat flows faster along `dirs[f]` than perpendicular.
+///  - ratio < 1: heat flows slower along `dirs[f]` (i.e. faster perp to it).
+///  - ratio = 1: reduces to isotropic cotangent Laplacian.
+///  - Partition-of-unity (Σ grad_v = 0) guarantees row-sum = 0 for any ratio.
+fn build_stiffness_from_face_dirs(topo: &MeshTopology, dirs: &[Vector3D], ratio: f64) -> SparseSymmetric {
+    let n = topo.num_vertices();
+    let mut edge_weights: HashMap<(usize, usize), f64> = HashMap::new();
+    let mut diag = vec![0.0f64; n];
+    let ratio_minus_1 = ratio - 1.0;
+
+    let add_edge = |map: &mut HashMap<(usize, usize), f64>, a: usize, b: usize, w: f64| {
+        let key = if a < b { (a, b) } else { (b, a) };
+        *map.entry(key).or_insert(0.0) += w;
+    };
+
+    for (f_idx, face) in topo.faces.iter().enumerate() {
+        let [vi_idx, vj_idx, vk_idx] = *face;
+        let vi = topo.vertices[vi_idx];
+        let vj = topo.vertices[vj_idx];
+        let vk = topo.vertices[vk_idx];
+
+        let face_normal = (vj - vi).cross(&(vk - vi));
+        let area2 = face_normal.norm(); // = 2 × area
+        if area2 < 1e-15 { continue; }
+        let area = area2 * 0.5;
+        let n_hat = face_normal / area2;
+
+        // FEM shape-function gradients: grad_v = cross(n̂, e_opposite) / (2A)
+        let inv_2a = 1.0 / area2;
+        let grad = [
+            n_hat.cross(&(vk - vj)) * inv_2a, // vertex vi
+            n_hat.cross(&(vi - vk)) * inv_2a, // vertex vj
+            n_hat.cross(&(vj - vi)) * inv_2a, // vertex vk
+        ];
+        let verts = [vi_idx, vj_idx, vk_idx];
+
+        let d = if f_idx < dirs.len() { dirs[f_idx] } else { Vector3D::zeros() };
+        let dp = [d.dot(&grad[0]), d.dot(&grad[1]), d.dot(&grad[2])];
+
+        // K[a,b] = area × (grad_a · grad_b + (ratio−1) × dp[a] × dp[b])
+        // w_{a,b} = −K[a,b], clamped ≥ 0 for robustness with obtuse triangles.
+        for a in 0..3 {
+            for b in (a + 1)..3 {
+                let k_ab = area * (grad[a].dot(&grad[b]) + ratio_minus_1 * dp[a] * dp[b]);
+                let weight = (-k_ab).max(0.0);
+                add_edge(&mut edge_weights, verts[a], verts[b], weight);
+            }
+        }
+    }
+
+    let mut off_diag: Vec<(usize, usize, f64)> = Vec::with_capacity(edge_weights.len());
+    for (&(a, b), &w) in &edge_weights {
+        off_diag.push((a, b, -w));
+        diag[a] += w;
+        diag[b] += w;
+    }
+    SparseSymmetric { n, diag, off_diag }
+}
+
+/// Build the curvature-aligned anisotropic stiffness matrix.
+/// Wraps `build_stiffness_from_face_dirs` with curvature direction computation + optional smoothing.
+fn build_anisotropic_stiffness(topo: &MeshTopology, ratio: f64, smoothing_iters: usize) -> SparseSymmetric {
+    let raw_dirs = compute_face_curvature_direction(topo);
+    let dirs = if smoothing_iters > 0 {
+        let adj = compute_face_adjacency(topo);
+        smooth_face_directions(topo, &adj, &raw_dirs, smoothing_iters)
+    } else {
+        raw_dirs
+    };
+    build_stiffness_from_face_dirs(topo, &dirs, ratio)
+}
+
+/// Build the print-direction-biased anisotropic stiffness matrix.
+/// Projects `preferred_dir` onto each face's tangent plane, then calls `build_stiffness_from_face_dirs`.
+fn build_print_direction_stiffness(topo: &MeshTopology, preferred_dir: Vector3D, ratio: f64) -> SparseSymmetric {
+    let dirs = compute_print_direction_per_face(topo, preferred_dir);
+    build_stiffness_from_face_dirs(topo, &dirs, ratio)
+}
+
+/// Compute the integrated divergence at each vertex for a per-face vector field X.
+/// This is Step 3 of the Heat Method (Crane et al. 2013, eq. 7).
+fn compute_vertex_divergence(topo: &MeshTopology, face_grad: &[Vector3D]) -> Vec<f64> {
+    let n = topo.num_vertices();
+    let mut div = vec![0.0f64; n];
+
+    for (fi, face) in topo.faces.iter().enumerate() {
+        let [i, j, k] = *face;
+        let vi = topo.vertices[i];
+        let vj = topo.vertices[j];
+        let vk = topo.vertices[k];
+        let x_f = face_grad[fi];
+
+        let e_ij = vj - vi;
+        let e_ik = vk - vi;
+        let e_jk = vk - vj;
+        let e_ji = vi - vj;
+        let e_ki = vi - vk;
+        let e_kj = vj - vk;
+
+        let cross_i = (vj - vi).cross(&(vk - vi)).norm().max(1e-12);
+        let cross_j = (vi - vj).cross(&(vk - vj)).norm().max(1e-12);
+        let cross_k = (vi - vk).cross(&(vj - vk)).norm().max(1e-12);
+
+        let cot_i = (vj - vi).dot(&(vk - vi)) / cross_i;
+        let cot_j = (vi - vj).dot(&(vk - vj)) / cross_j;
+        let cot_k = (vi - vk).dot(&(vj - vk)) / cross_k;
+
+        div[i] += 0.5 * (cot_k * e_ij.dot(&x_f) + cot_j * e_ik.dot(&x_f));
+        div[j] += 0.5 * (cot_i * e_jk.dot(&x_f) + cot_k * e_ji.dot(&x_f));
+        div[k] += 0.5 * (cot_j * e_ki.dot(&x_f) + cot_i * e_kj.dot(&x_f));
+    }
+
+    div
+}
+
+/// Compute geodesic distances using a user-supplied per-face direction field.
+///
+/// Skips the heat step entirely.  Each entry in `directions` is the desired flow
+/// direction for that face (need not be normalized — it will be projected to the face
+/// tangent plane and renormalized here).  The divergence → Poisson pipeline then
+/// converts these directions to a smooth distance-like scalar field.
+///
+/// This is the "CustomVectorField" diffusion mode.
+fn geodesic_from_directions(
+    topo: &MeshTopology,
+    poisson_laplacian: &SparseSymmetric,
+    sources: &[usize],
+    directions: &[Vector3D],
+) -> Vec<f64> {
+    let n = topo.num_vertices();
+
+    // Project provided directions onto face tangent planes, then negate and normalize.
+    // The negation follows the Heat Method convention: face_grad points *toward* the source
+    // (i.e. opposite to the gradient of the distance field).
+    let face_grad: Vec<Vector3D> = topo.faces.iter().enumerate().map(|(f_idx, face)| {
+        let [i, j, k] = *face;
+        let vi = topo.vertices[i];
+        let vj = topo.vertices[j];
+        let vk = topo.vertices[k];
+
+        let face_normal = (vj - vi).cross(&(vk - vi));
+        let area2 = face_normal.norm();
+        if area2 < 1e-15 {
+            return Vector3D::zeros();
+        }
+        let n_hat = face_normal / area2;
+
+        let dir = if f_idx < directions.len() {
+            directions[f_idx]
+        } else {
+            Vector3D::new(0.0, 0.0, -1.0) // fallback: downward
+        };
+
+        // Remove normal component, normalize in tangent plane
+        let tangent = dir - dir.dot(&n_hat) * n_hat;
+        let tn = tangent.norm();
+        if tn > 1e-15 {
+            -tangent / tn
+        } else {
+            Vector3D::zeros()
+        }
+    }).collect();
+
+    // Divergence → Poisson → shift (identical pipeline to geodesic_at_t steps 3–5)
+    let div = compute_vertex_divergence(topo, &face_grad);
+
+    let mut poisson_diag = poisson_laplacian.diag.clone();
+    poisson_diag[0] += 1e-6; // pin vertex 0 to remove null space
+    let poisson_system = SparseSymmetric {
+        n,
+        diag: poisson_diag,
+        off_diag: poisson_laplacian.off_diag.clone(),
+    };
+    let phi = conjugate_gradient(&poisson_system, &div, 2000, 1e-8);
+
+    let source_mean: f64 = sources.iter().map(|&s| phi[s]).sum::<f64>() / sources.len() as f64;
+    let mut distances: Vec<f64> = phi.iter().map(|&p| p - source_mean).collect();
+    let source_avg: f64 = sources.iter().map(|&s| distances[s]).sum::<f64>() / sources.len() as f64;
+    let global_avg: f64 = distances.iter().sum::<f64>() / distances.len() as f64;
+    if source_avg > global_avg {
+        for d in &mut distances { *d = -*d; }
+    }
+    for d in &mut distances { if *d < 0.0 { *d = 0.0; } }
+    let min_d = distances.iter().cloned().fold(f64::INFINITY, f64::min);
+    for d in &mut distances { *d -= min_d; }
+
+    let max_dist = distances.iter().cloned().fold(0.0f64, f64::max);
+    log::info!("  Custom-field geodesic: max_dist={:.3}mm", max_dist);
+    distances
+}
+
 // ── Conjugate Gradient solver ───────────────────────────────────────
 
 /// Preconditioned Conjugate Gradient for symmetric positive definite systems.
@@ -411,41 +774,8 @@ fn geodesic_at_t(
         }
     }
 
-    // Step 3: Compute integrated divergence at each vertex
-    let mut div = vec![0.0; n];
-    for (fi, face) in topo.faces.iter().enumerate() {
-        let [i, j, k] = *face;
-        let vi = topo.vertices[i];
-        let vj = topo.vertices[j];
-        let vk = topo.vertices[k];
-        let x_f = face_grad[fi];
-
-        // For each half-edge in the face, accumulate divergence
-        // div[i] += 0.5 * (cot(angle_j) * dot(e_ij, X) + cot(angle_k) * dot(e_ik, X))
-        // where e_ij = vj - vi, e_ik = vk - vi
-        let e_ij = vj - vi;
-        let e_ik = vk - vi;
-        let e_jk = vk - vj;
-        let e_ji = vi - vj;
-        let e_ki = vi - vk;
-        let e_kj = vj - vk;
-
-        // Cotangents (same as Laplacian build but we need them per-vertex here)
-        let cross_i = (vj - vi).cross(&(vk - vi)).norm().max(1e-12);
-        let cross_j = (vi - vj).cross(&(vk - vj)).norm().max(1e-12);
-        let cross_k = (vi - vk).cross(&(vj - vk)).norm().max(1e-12);
-
-        let cot_i = (vj - vi).dot(&(vk - vi)) / cross_i;
-        let cot_j = (vi - vj).dot(&(vk - vj)) / cross_j;
-        let cot_k = (vi - vk).dot(&(vj - vk)) / cross_k;
-
-        // Divergence contribution for vertex i:
-        // 0.5 * (cot(angle_k) * dot(e_ij, X) + cot(angle_j) * dot(e_ik, X))
-        // Note: angle at k is opposite to edge ij, angle at j is opposite to edge ik
-        div[i] += 0.5 * (cot_k * e_ij.dot(&x_f) + cot_j * e_ik.dot(&x_f));
-        div[j] += 0.5 * (cot_i * e_jk.dot(&x_f) + cot_k * e_ji.dot(&x_f));
-        div[k] += 0.5 * (cot_j * e_ki.dot(&x_f) + cot_i * e_kj.dot(&x_f));
-    }
+    // Step 3: Compute integrated divergence at each vertex (shared helper).
+    let div = compute_vertex_divergence(topo, &face_grad);
 
     // Step 4: Solve Poisson equation L*phi = div using the ISOTROPIC Laplacian.
     // (Using poisson_laplacian, not heat_laplacian — distance must be Euclidean.)
@@ -777,37 +1107,75 @@ pub fn geodesic_slice(mesh: &Mesh, config: &GeodesicSlicerConfig) -> Vec<Layer> 
     }
     log::info!("  Found {} source vertices", sources.len());
 
-    // Step 4: Compute geodesic distances (single-scale or multi-scale, isotropic or adaptive).
+    // Step 4: Build the heat Laplacian (or get custom directions) based on diffusion_mode,
+    // then compute geodesic distances.
     //
-    // Adaptive mode (use_adaptive=true): build an adaptive Laplacian where each face's
-    // diffusivity κ(f) = adaptive_kappa_base × (avg_edge_length(f))².  Small triangles
-    // (thin features, toes) get small κ → slow diffusion → sharp local gradients.
-    // Large triangles (body) get large κ → fast spread → full coverage.
-    // The Poisson step always uses the ISOTROPIC Laplacian so distances are Euclidean.
-    let adapt_lap_opt: Option<SparseSymmetric> = if config.use_adaptive {
-        log::info!("  Adaptive mode: building per-face kappa Laplacian (base={:.1})...",
-            config.adaptive_kappa_base);
-        let kappa = compute_kappa_per_face(&topo, config.adaptive_kappa_base);
-        let kappa_min = kappa.iter().cloned().fold(f64::INFINITY, f64::min);
-        let kappa_max = kappa.iter().cloned().fold(0.0f64, f64::max);
-        log::info!("  κ range: [{:.3}, {:.3}]", kappa_min, kappa_max);
-        Some(build_cotangent_stiffness(&topo, &kappa))
-    } else {
-        None
-    };
-    let heat_lap = adapt_lap_opt.as_ref().unwrap_or(&laplacian);
+    // The Poisson step ALWAYS uses the isotropic `laplacian` to keep distances Euclidean.
+    // The heat step uses whichever Laplacian the chosen mode provides.
+    let heat_lap_built: Option<SparseSymmetric>;
+    let custom_dirs: Option<Vec<Vector3D>>;
 
-    let distances = if config.use_multiscale {
-        log::info!("Step 4: Computing MULTI-SCALE{}geodesic distances ({} scales, base factor={:.1})...",
-            if config.use_adaptive { " ADAPTIVE " } else { " " },
-            config.num_scales, config.heat_timestep_factor);
+    match &config.diffusion_mode {
+        GeodesicDiffusionMode::Isotropic => {
+            log::info!("  Diffusion mode: Isotropic (standard cotangent Laplacian)");
+            heat_lap_built = None;
+            custom_dirs    = None;
+        }
+        GeodesicDiffusionMode::AdaptiveScalar { kappa_base } => {
+            log::info!("  Diffusion mode: Adaptive scalar (kappa_base={:.1})", kappa_base);
+            let kappa = compute_kappa_per_face(&topo, *kappa_base);
+            let kappa_min = kappa.iter().cloned().fold(f64::INFINITY, f64::min);
+            let kappa_max = kappa.iter().cloned().fold(0.0f64, f64::max);
+            log::info!("  κ range: [{:.3}, {:.3}]", kappa_min, kappa_max);
+            heat_lap_built = Some(build_cotangent_stiffness(&topo, &kappa));
+            custom_dirs    = None;
+        }
+        GeodesicDiffusionMode::Anisotropic { anisotropy_ratio, smoothing_iters } => {
+            log::info!("  Diffusion mode: Anisotropic (ratio={:.2}, smooth_iters={})",
+                anisotropy_ratio, smoothing_iters);
+            heat_lap_built = Some(build_anisotropic_stiffness(&topo, *anisotropy_ratio, *smoothing_iters));
+            custom_dirs    = None;
+        }
+        GeodesicDiffusionMode::PrintDirectionBiased { preferred_dir, ratio } => {
+            // Normalize the direction (user may have provided un-normalized vector)
+            let pn = preferred_dir.norm();
+            let dir = if pn > 1e-10 { preferred_dir / pn } else { Vector3D::new(0.0, 0.0, 1.0) };
+            log::info!("  Diffusion mode: Print direction biased (ratio={:.1}, dir=[{:.2},{:.2},{:.2}])",
+                ratio, dir.x, dir.y, dir.z);
+            heat_lap_built = Some(build_print_direction_stiffness(&topo, dir, *ratio));
+            custom_dirs    = None;
+        }
+        GeodesicDiffusionMode::CustomVectorField(dirs) => {
+            log::info!("  Diffusion mode: Custom vector field ({} face directions)", dirs.len());
+            heat_lap_built = None;
+            custom_dirs    = Some(dirs.clone());
+        }
+    }
+
+    let heat_lap = heat_lap_built.as_ref().unwrap_or(&laplacian);
+
+    let mode_label = match &config.diffusion_mode {
+        GeodesicDiffusionMode::Isotropic                => "isotropic",
+        GeodesicDiffusionMode::AdaptiveScalar { .. }    => "adaptive",
+        GeodesicDiffusionMode::Anisotropic { .. }       => "anisotropic",
+        GeodesicDiffusionMode::PrintDirectionBiased { .. } => "print-direction",
+        GeodesicDiffusionMode::CustomVectorField(_)     => "custom-field",
+    };
+
+    let distances = if let Some(dirs) = custom_dirs {
+        // CustomVectorField: skip heat step, go directly to divergence → Poisson.
+        // Multi-scale does not apply (no timestep to vary).
+        log::info!("Step 4: Computing geodesic distances from custom vector field...");
+        geodesic_from_directions(&topo, &laplacian, &sources, &dirs)
+    } else if config.use_multiscale {
+        log::info!("Step 4: Computing MULTI-SCALE {} geodesic distances ({} scales, base factor={:.1})...",
+            mode_label, config.num_scales, config.heat_timestep_factor);
         compute_multiscale_geodesic_distance(
             &topo, &mass, heat_lap, &laplacian, &sources,
             config.heat_timestep_factor, config.num_scales,
         )
     } else {
-        log::info!("Step 4: Computing{}geodesic distance field (Heat Method)...",
-            if config.use_adaptive { " ADAPTIVE " } else { " " });
+        log::info!("Step 4: Computing {} geodesic distance field (Heat Method)...", mode_label);
         compute_geodesic_distance(
             &topo, &mass, heat_lap, &laplacian, &sources, config.heat_timestep_factor
         )
@@ -1048,8 +1416,7 @@ mod tests {
             bottom_tolerance: 0.5,
             use_multiscale: false,
             num_scales: 4,
-            use_adaptive: false,
-            adaptive_kappa_base: 6.0,
+            diffusion_mode: GeodesicDiffusionMode::Isotropic,
         };
         let layers = geodesic_slice(&mesh, &config);
         // Should get some layers (cube is 10mm tall, geodesic dist ~10mm, so ~3 layers at 3mm spacing)
