@@ -28,6 +28,12 @@ pub struct S4RotationConfig {
     /// Maximum rotation angle per tet (degrees)
     pub max_rotation_degrees: f64,
 
+    /// Z-bias for Dijkstra edge weights (0 = Euclidean, 1 = pure |ΔZ|).
+    /// Higher values make the distance field track actual print height rather than
+    /// graph path length, preventing topologically-close features at different heights
+    /// (e.g. the two ears of the Stanford Bunny) from landing on the same layer.
+    pub z_bias: f64,
+
     /// Number of smoothing iterations for the rotation field
     pub smoothing_iterations: usize,
 
@@ -41,6 +47,7 @@ impl Default for S4RotationConfig {
             build_direction: Vector3D::new(0.0, 0.0, 1.0),
             overhang_threshold: 45.0,
             max_rotation_degrees: 15.0,
+            z_bias: 0.8,
             smoothing_iterations: 25,
             smoothness_weight: 0.5,
         }
@@ -370,7 +377,7 @@ mod tests {
     #[test]
     fn test_s4_rotation_field_compute() {
         let mesh = make_test_mesh();
-        let dijkstra = TetDijkstraField::compute(&mesh);
+        let dijkstra = TetDijkstraField::compute(&mesh, 0.8);
         let config = S4RotationConfig::default();
 
         let field = S4RotationField::compute(&mesh, &dijkstra, &config);
@@ -387,7 +394,7 @@ mod tests {
     #[test]
     fn test_to_tet_quaternion_field() {
         let mesh = make_test_mesh();
-        let dijkstra = TetDijkstraField::compute(&mesh);
+        let dijkstra = TetDijkstraField::compute(&mesh, 0.8);
         let s4_config = S4RotationConfig::default();
         let field = S4RotationField::compute(&mesh, &dijkstra, &s4_config);
 
@@ -404,7 +411,7 @@ mod tests {
     #[test]
     fn test_smoothing_reduces_energy() {
         let mesh = make_test_mesh();
-        let dijkstra = TetDijkstraField::compute(&mesh);
+        let dijkstra = TetDijkstraField::compute(&mesh, 0.8);
 
         // With no smoothing
         let config_unsmoothed = S4RotationConfig {

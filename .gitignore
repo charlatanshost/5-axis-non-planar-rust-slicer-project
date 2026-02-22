@@ -1,0 +1,29 @@
+# Rust build artifacts
+target/
+files/multiaxis_slicer/target/
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*.DS_Store
+
+# Windows artifacts
+nul
+Thumbs.db
+desktop.ini
+
+# Backup directories
+non planar 5 axis files.bak/
+
+# Log files
+*.log
+
+# G-code output (don't commit test outputs)
+*.gcode
+*.nc
+
+# Claude workspace (private)
+.claude/

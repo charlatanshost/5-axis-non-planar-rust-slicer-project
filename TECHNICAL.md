@@ -189,10 +189,24 @@ Inspired by [jyjblrd/S4_Slicer](https://github.com/jyjblrd/S4_Slicer). The key i
 A regular grid covers the mesh bounding box. Each cube is split into 6 tetrahedra using Freudenthal decomposition. Tets with all 4 vertices outside the mesh are discarded. This bypasses TetGen entirely and works on any mesh.
 
 **Step 2 — Dijkstra distance field** (`tet_dijkstra_field.rs`)
-Multi-source Dijkstra from "base" tets (those touching the bottom of the mesh). Distance is the shortest weighted path through the tet graph. The gradient of this distance field gives a "height direction" for each tet.
+Multi-source Dijkstra from "base" tets (those touching the bottom of the mesh). Edge weights use a **Z-biased blend**:
+```
+weight = |ΔZ| × z_bias  +  Euclidean × (1 − z_bias)
+```
+`z_bias` defaults to 0.8. At 0.0 the field is pure Euclidean graph distance (original behaviour), which causes topologically-adjacent but geometrically-separated features — e.g. the two ears of the Stanford Bunny, which share the neck as a common path — to end up at the same distance and therefore on the same layer. At 0.8 the distance field strongly tracks actual vertical height, so each ear is correctly on its own set of layers. The Euclidean floor (via the `1 − z_bias` term) ensures horizontal adjacencies still cost something so gradient directions remain valid.
 
 **Step 3 — Rotation field** (`s4_rotation_field.rs`)
-For each tet, compute a rotation that aligns the local gradient with +Z. Apply SLERP smoothing over the tet graph to prevent discontinuities. The result is a per-tet quaternion.
+For each surface tet (those with at least one boundary face), compute the overhang angle. If it exceeds `overhang_threshold` (default 45°, preset 35°), compute a rotation about the horizontal axis perpendicular to the overhang normal to reduce the overhang to threshold. Clamp by `max_rotation_degrees` (default 15°, preset 35°). Interior tets copy a damped average of their surface neighbours. Apply SLERP smoothing over the tet graph for `smoothing_iterations` passes to prevent discontinuities. The result is a per-tet quaternion.
+
+**Support-Free Preset** (★ button in GUI, tuned for complex organic models like the Stanford Bunny):
+
+| Parameter | Default | Preset |
+|---|---|---|
+| `z_bias` | 0.80 | 0.85 |
+| `overhang_threshold` | 45° | 35° |
+| `max_rotation_degrees` | 15° | 35° |
+| `smoothing_iterations` | 25 | 40 |
+| `smoothness_weight` | 0.5 | 0.6 |
 
 **Step 4 — ASAP deformation** (`tet_asap_deformation.rs`)
 Apply the quaternion field as a volumetric deformation. Each tet's vertices are moved according to its rotation. "As-Rigid-As-Possible" minimizes distortion. See §3.4 for ASAP details.
@@ -450,12 +464,14 @@ Bypasses the heat step entirely. The user supplies per-face direction vectors. `
 
 ## 7. Toolpath Generation
 
-**File:** `toolpath.rs`, `toolpath_patterns.rs`, `contour_offset.rs`
+**File:** `toolpath.rs`, `toolpath_patterns.rs`, `contour_offset.rs`, `ruled_surface.rs`
 
 After slicing produces `Vec<Layer>`, toolpaths are generated per-layer.
 
 ### Wall Loops (`contour_offset.rs`)
 2D polygon offset using the Clipper algorithm concept: shrink each contour inward by one nozzle width per perimeter. The outermost perimeter is printed first (best surface quality).
+
+For non-planar layers, wall loop points are post-projected onto the original mesh surface using `MeshRayCaster::project_z()` after the 2D offset is computed — this corrects the Z values which would otherwise be approximated from boundary point interpolation.
 
 ### Infill (`toolpath_patterns.rs`)
 - **Rectilinear** — alternating horizontal/vertical lines
@@ -464,6 +480,36 @@ After slicing produces `Vec<Layer>`, toolpaths are generated per-layer.
 - **Spiral** — continuous Archimedean spiral
 
 Infill density is the line spacing as a fraction of the bounding box.
+
+### Mesh-Mapped Z Projection (`MeshRayCaster`)
+A 2D spatial bin grid (64×64 default) indexes all mesh triangles by XY bounding box. For any XY query point, a vertical ray is cast and the hit with Z nearest to the layer's nominal Z is returned (correctly handles multi-shell objects).
+
+**Vertical ray-triangle intersection (XY barycentric):**
+```
+denom = (v1y-v2y)(v0x-v2x) + (v2x-v1x)(v0y-v2y)
+a = ((v1y-v2y)(x-v2x) + (v2x-v1x)(y-v2y)) / denom
+b = ((v2y-v0y)(x-v2x) + (v0x-v2x)(y-v2y)) / denom
+c = 1-a-b
+if a,b,c >= -1e-6:  z_hit = a*v0.z + b*v1.z + c*v2.z
+```
+Priority order for infill Z: raycaster hit → IDW from wall loop points → boundary interpolation.
+
+### Coverage Gap Fill (`coverage_gap_fill`)
+After projecting infill scanlines onto the mesh, checks the 3D distance between consecutive scanline rows. If the 3D gap > 2 × `(line_width / infill_density)`, inserts a midpoint scanline at Y_mid, projects it onto the mesh, and recurses (max 3 levels = up to 8× refinement). Only fires when the mesh is available and the layer has curved Z.
+
+### Adaptive Layer Height
+`SlicingConfig.adaptive` enables per-layer height computation. `slope_factor()` in `slicing.rs` averages `|normal.z|` of triangles in a band around each candidate Z height:
+- Flat faces (`|normal.z|` ≈ 1) → `max_layer_height` (fast, coarser)
+- Vertical faces (`|normal.z|` ≈ 0) → `min_layer_height` (slow, finer)
+
+The per-layer height flows: `Layer.layer_height` → `Toolpath.layer_height` → viewport tube radius (`extrusion_radius = layer_height / 2`, clamped to [0.04, 0.30] mm). Travel moves use a fixed thin radius (0.05 mm) for visual distinction.
+
+`extrude_contour()` uses the per-layer height when computing extrusion volume, so extrusion amounts are correct for adaptive layers.
+
+### Wall Seam Transitions (`ruled_surface.rs`)
+Optional: when `wall_seam_transitions` is enabled and the layer has curved Z, generate a ruled-surface zigzag path between consecutive outer wall contours. This fills the staircase gap between layers on the outer surface.
+
+Algorithm: resample both contours to the same N points (N ≤ 256), find the minimum-rotation alignment offset by minimising total point-to-point distance, then generate a single-pass transition path: C_n[0]→C_{n+1}[0], C_n[1]→C_{n+1}[1], etc.
 
 ### 5-Axis Orientation
 For non-planar layers, each toolpath point carries a 3D orientation vector (the local surface normal, pointing away from the surface). The G-code generator converts this to A/B rotation angles.
@@ -602,7 +648,7 @@ Dark theme with custom accent colors applied to egui's `Visuals`.
 
 Run with: `cargo test --lib`
 
-**Passing: 105** (3 pre-existing failures unrelated to current work)
+**Passing: 108** (3 pre-existing failures unrelated to current work)
 
 | Module | Tests |
 |---|---|
@@ -649,8 +695,16 @@ Isotropic remeshing (legacy, now replaced by voxel reconstruction): ~28 minutes 
 
 - **S3 quality check:** If ASAP deformation produces > 30% inverted tets or expands the bounding box by > 5×, the system falls back to VirtualScalarField mode without warning in the viewport.
 
+- **S4 support-free on complex models:** Even with the support-free preset (z_bias 0.85, max_rotation 35°), very deep undercuts (> 60° overhang) may still require some support material. The `max_rotation_degrees` cap prevents the deformation from becoming so large it inverts tets.
+
 - **Geodesic CustomVectorField:** No multi-scale support. Single solve only.
 
 - **Examples don't compile:** `simple_slicer.rs` and `slice_benchy.rs` have a pre-existing missing field (`max_rotation_degrees`). Use `cargo test --lib` or `cargo run --bin gui` — do not use `cargo test` (which attempts to compile examples).
 
 - **No GPU acceleration:** All solvers are CPU-only. The CG solver for large meshes (> 200K vertices) may take 10–30s for a single geodesic solve.
+
+- **Conical floating-contour filter resolution:** The 64×64 bin grid may not separate very thin isolated features (< 2% of object footprint) from the main body. Such features may still be deferred indefinitely or printed at the wrong time.
+
+- **Wall seam transitions:** Off by default. Not fully validated on all layer topologies — contour resampling assumes single outer loops and may produce artifacts on multi-island layers.
+
+- **MeshRayCaster misses at mesh boundary:** Infill/wall points that project outside the mesh XY footprint get no raycaster hit and fall back to IDW interpolation. Visible as slight Z inaccuracy at the very edge of the print.

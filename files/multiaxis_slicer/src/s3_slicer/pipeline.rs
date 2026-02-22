@@ -77,6 +77,10 @@ pub struct S3PipelineConfig {
 
     /// ASAP convergence threshold
     pub asap_convergence_threshold: f64,
+
+    /// Z-bias for Dijkstra edge weights in the S4 pipeline (0 = Euclidean, 1 = pure |ΔZ|).
+    /// Only used by DeformationMethod::S4Deform.  Default 0.8 gives height-tracking layers.
+    pub z_bias: f64,
 }
 
 impl Default for S3PipelineConfig {
@@ -91,6 +95,7 @@ impl Default for S3PipelineConfig {
             deformation_method: DeformationMethod::VirtualScalarField,  // Default to virtual - no mesh collapse
             asap_max_iterations: 3,      // 3 iterations is usually enough for ARAP convergence
             asap_convergence_threshold: 1e-3,  // Higher threshold for faster termination
+            z_bias: 0.8,  // Height-tracking Dijkstra by default
         }
     }
 }
@@ -702,8 +707,8 @@ pub fn execute_s4_pipeline(
     };
 
     // Step 2: Dijkstra distance field
-    log::info!("Step 2/7: Computing Dijkstra distance field...");
-    let dijkstra_field = TetDijkstraField::compute(&tet_mesh);
+    log::info!("Step 2/7: Computing Dijkstra distance field (z_bias={:.2})...", config.z_bias);
+    let dijkstra_field = TetDijkstraField::compute(&tet_mesh, config.z_bias);
     log::info!("  → Max distance: {:.2}, {} base tets",
         dijkstra_field.max_distance, dijkstra_field.base_tets.len());
 
@@ -713,6 +718,7 @@ pub fn execute_s4_pipeline(
         build_direction: Vector3D::new(0.0, 0.0, 1.0),
         overhang_threshold: config.overhang_threshold,
         max_rotation_degrees: config.max_rotation_degrees,
+        z_bias: config.z_bias,
         smoothing_iterations: config.optimization_iterations / 2,
         smoothness_weight: config.smoothness_weight,
     };

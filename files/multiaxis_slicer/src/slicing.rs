@@ -86,12 +86,13 @@ impl Slicer {
         log::info!("Layer height: {}", self.config.layer_height);
 
         let slicing_planes = self.generate_slicing_planes(mesh);
-        log::info!("Generated {} slicing planes", slicing_planes.len());
+        log::info!("Generated {} slicing planes (adaptive={})",
+            slicing_planes.len(), self.config.adaptive);
 
         // Parallel slicing using Rayon
         let mut layers: Vec<Layer> = slicing_planes
             .par_iter()
-            .map(|&z| self.slice_at_height(mesh, z))
+            .map(|&(z, lh)| self.slice_at_height(mesh, z, lh))
             .filter(|layer| !layer.is_empty())
             .collect();
 
@@ -102,24 +103,62 @@ impl Slicer {
         Ok(layers)
     }
 
-    /// Generate slicing plane heights
-    fn generate_slicing_planes(&self, mesh: &Mesh) -> Vec<f64> {
+    /// Generate slicing plane heights, returning (z, layer_height) pairs.
+    /// When `config.adaptive` is true, layer height varies by local surface slope:
+    ///   flat faces (|normal.z| ≈ 1) → max_layer_height (fast, accurate enough)
+    ///   vertical faces (|normal.z| ≈ 0) → min_layer_height (slow, fine detail)
+    fn generate_slicing_planes(&self, mesh: &Mesh) -> Vec<(f64, f64)> {
         let z_min = mesh.bounds_min.z;
         let z_max = mesh.bounds_max.z;
 
+        if !self.config.adaptive {
+            // Uniform spacing
+            let mut planes = Vec::new();
+            let mut z = z_min + self.config.layer_height / 2.0;
+            while z < z_max {
+                planes.push((z, self.config.layer_height));
+                z += self.config.layer_height;
+            }
+            return planes;
+        }
+
+        // Adaptive spacing: sample slope at each candidate plane
+        let min_h = self.config.min_layer_height.max(0.001);
+        let max_h = self.config.max_layer_height.max(min_h);
+        let band  = max_h; // look within one max-height band for relevant triangles
+
         let mut planes = Vec::new();
-        let mut z = z_min + self.config.layer_height / 2.0;
+        let mut z = z_min + min_h / 2.0;
 
         while z < z_max {
-            planes.push(z);
-            z += self.config.layer_height;
+            let slope = self.slope_factor(mesh, z, band);
+            // slope ≈ 1 → horizontal → thicker layers; slope ≈ 0 → vertical → thinner
+            let h = (min_h + slope * (max_h - min_h)).clamp(min_h, max_h);
+            planes.push((z, h));
+            z += h;
         }
 
         planes
     }
 
+    /// Average |normal.z| of triangles whose Z range overlaps [z-band, z+band].
+    /// Returns 1.0 (horizontal) when no triangles are found.
+    fn slope_factor(&self, mesh: &Mesh, z: f64, band: f64) -> f64 {
+        let mut sum = 0.0_f64;
+        let mut count = 0usize;
+        for tri in &mesh.triangles {
+            let z_lo = tri.v0.z.min(tri.v1.z).min(tri.v2.z);
+            let z_hi = tri.v0.z.max(tri.v1.z).max(tri.v2.z);
+            if z_hi >= z - band && z_lo <= z + band {
+                sum += tri.normal().z.abs();
+                count += 1;
+            }
+        }
+        if count == 0 { 1.0 } else { (sum / count as f64).clamp(0.0, 1.0) }
+    }
+
     /// Slice mesh at a specific height
-    fn slice_at_height(&self, mesh: &Mesh, z: f64) -> Layer {
+    fn slice_at_height(&self, mesh: &Mesh, z: f64, layer_height: f64) -> Layer {
         // Step 1: Get relevant triangles (those that intersect this plane)
         let triangles = mesh.triangles_at_height(z, self.config.tolerance);
 
@@ -132,7 +171,7 @@ impl Slicer {
         // Step 3: Build contours from segments using hash-based chaining (O(m))
         let contours = self.build_contours(&segments);
 
-        Layer::new(z, contours, self.config.layer_height)
+        Layer::new(z, contours, layer_height)
     }
 
     /// Build contours from line segments using hash table (Algorithm from Paper 1)

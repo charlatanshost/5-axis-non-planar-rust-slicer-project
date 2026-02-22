@@ -126,6 +126,7 @@ fn generate_layer_toolpath(
     Toolpath {
         paths,
         z,
+        layer_height: 0.2,
     }
 }
 

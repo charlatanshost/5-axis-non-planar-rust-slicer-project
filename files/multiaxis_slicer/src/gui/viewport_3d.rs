@@ -852,8 +852,9 @@ impl Viewport3D {
         let mut tube_colors: Vec<Srgba> = Vec::new();
         let mut tube_indices: Vec<u32> = Vec::new();
 
-        let tube_radius = 0.2;     // Visible tubes
         let tube_segments = 4;     // Square cross-section for performance
+        // Travel moves are always drawn thin so they stand out from extrusion.
+        let travel_radius: f32 = 0.05;
 
         // Count total segments for gradient calculation
         let total_segments: usize = app.toolpaths.iter()
@@ -868,6 +869,11 @@ impl Viewport3D {
 
         // Process ALL toolpaths - no skipping!
         for toolpath in app.toolpaths.iter() {
+            // Tube radius for extrusion = half the layer height, so the tube diameter
+            // matches the deposited bead height.  Clamped to [0.04, 0.30] mm so even
+            // very thin or very thick adaptive layers remain visible.
+            let extrusion_radius: f32 = (toolpath.layer_height as f32 / 2.0).clamp(0.04, 0.30);
+
             // Create tube segments connecting consecutive points
             for window in toolpath.paths.windows(2) {
                 let p1 = vec3(window[0].position.x as f32, window[0].position.y as f32, window[0].position.z as f32);
@@ -892,16 +898,17 @@ impl Viewport3D {
                     }
                 }
 
-                let segment_color = if is_extrusion {
+                let (segment_color, tube_radius) = if is_extrusion {
                     // EXTRUSION: Gradient GREEN (120°) -> YELLOW (60°) -> RED (0°)
                     // Based on position in motion planning queue
                     let t = global_segment_idx as f32 / total_segments.max(1) as f32;
                     let hue = 120.0 * (1.0 - t); // 120° = green, 0° = red
                     let (r, g, b) = hsl_to_rgb(hue, 1.0, 0.5);
-                    Srgba::new((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, 255)
+                    (Srgba::new((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, 255),
+                     extrusion_radius)
                 } else {
-                    // TRAVEL: Bright cyan - clearly different from extrusion gradient
-                    Srgba::new(0, 220, 255, 220)
+                    // TRAVEL: Bright cyan, thin tube
+                    (Srgba::new(0, 220, 255, 220), travel_radius)
                 };
 
                 // Create tube geometry for this segment
@@ -971,14 +978,17 @@ impl Viewport3D {
         let mut tube_colors: Vec<Srgba> = Vec::new();
         let mut tube_indices: Vec<u32> = Vec::new();
 
-        let tube_radius = 0.2;
         let tube_segments = 4;
+        let travel_radius: f32 = 0.05;
 
         // Use visible count for gradient so color range covers what's shown
         let total_visible = max_segment + 1;
         let mut global_segment_idx = 0usize;
 
         'outer: for toolpath in app.toolpaths.iter() {
+            // Extrusion tube radius scales with layer height (diameter ≈ bead height).
+            let extrusion_radius: f32 = (toolpath.layer_height as f32 / 2.0).clamp(0.04, 0.30);
+
             for window in toolpath.paths.windows(2) {
                 if global_segment_idx > max_segment {
                     break 'outer;
@@ -1006,19 +1016,21 @@ impl Viewport3D {
                     }
                 }
 
-                let segment_color = if is_last {
+                let (segment_color, base_radius) = if is_last {
                     // Nozzle position: bright white
-                    Srgba::new(255, 255, 255, 255)
+                    (Srgba::new(255, 255, 255, 255), extrusion_radius)
                 } else if is_extrusion {
                     let t = global_segment_idx as f32 / total_visible.max(1) as f32;
                     let hue = 120.0 * (1.0 - t);
                     let (r, g, b) = hsl_to_rgb(hue, 1.0, 0.5);
-                    Srgba::new((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, 255)
+                    (Srgba::new((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, 255),
+                     extrusion_radius)
                 } else {
-                    Srgba::new(0, 220, 255, 220)
+                    (Srgba::new(0, 220, 255, 220), travel_radius)
                 };
 
-                let radius = if is_last { tube_radius * 2.5 } else { tube_radius };
+                // Nozzle marker is 2.5× larger so it's easy to spot during playback
+                let radius = if is_last { base_radius * 2.5 } else { base_radius };
 
                 create_tube_segment(
                     p1, p2, radius, tube_segments, segment_color,

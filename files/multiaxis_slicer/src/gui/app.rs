@@ -111,6 +111,8 @@ pub struct SlicerApp {
     pub toolpath_infill_density: f64,
     pub wall_count: usize,
     pub infill_pattern: crate::toolpath_patterns::InfillPattern,
+    pub force_nonplanar_infill: bool,  // Override skip_infill for geodesic/cylindrical/spherical
+    pub wall_seam_transitions: bool,   // Insert ruled-surface seam paths between consecutive curved layers
 
     // Support generation
     pub support_config: OverhangConfig,
@@ -176,6 +178,7 @@ pub struct SlicerApp {
     pub s4_smoothness_weight: f64,         // 0.0-1.0
     pub s4_asap_max_iterations: usize,     // 3-20
     pub s4_asap_convergence: f64,          // 1e-5 to 1e-3
+    pub s4_z_bias: f64,                    // Dijkstra Z-bias (0.0 = Euclidean, 1.0 = pure |ΔZ|)
 
     // Conical slicing configuration
     pub conical_angle_degrees: f64,        // Cone half-angle (5-60)
@@ -183,6 +186,7 @@ pub struct SlicerApp {
     pub conical_auto_center: bool,         // Auto-center on mesh centroid
     pub conical_center_x: f64,
     pub conical_center_y: f64,
+    pub conical_use_artifact_filter: bool, // Split contours at long bed-level edges
 
     // Cylindrical/Spherical coordinate transform configuration
     pub coord_transform_auto_center: bool,
@@ -241,6 +245,8 @@ impl Default for SlicerApp {
             toolpath_infill_density: 0.2,
             wall_count: 2,
             infill_pattern: crate::toolpath_patterns::InfillPattern::Rectilinear,
+            force_nonplanar_infill: false,
+            wall_seam_transitions: false,
 
             support_config: OverhangConfig::default(),
             support_result: None,
@@ -297,6 +303,7 @@ impl Default for SlicerApp {
             s4_smoothness_weight: 0.5,
             s4_asap_max_iterations: 10,
             s4_asap_convergence: 1e-4,
+            s4_z_bias: 0.8,
 
             // Conical slicing defaults
             conical_angle_degrees: 45.0,
@@ -304,6 +311,7 @@ impl Default for SlicerApp {
             conical_auto_center: true,
             conical_center_x: 0.0,
             conical_center_y: 0.0,
+            conical_use_artifact_filter: true,
 
             // Cylindrical/Spherical coordinate transform defaults
             coord_transform_auto_center: true,
@@ -533,6 +541,7 @@ impl SlicerApp {
                 deformation_method,
                 asap_max_iterations,
                 asap_convergence_threshold: asap_convergence,
+                ..S3PipelineConfig::default()
             };
 
             // Update progress
@@ -607,6 +616,7 @@ impl SlicerApp {
         let smoothness_weight = self.s4_smoothness_weight;
         let asap_max_iterations = self.s4_asap_max_iterations;
         let asap_convergence = self.s4_asap_convergence;
+        let z_bias = self.s4_z_bias;
 
         let (tx, rx) = mpsc::channel();
         self.layers_receiver = Some(rx);
@@ -630,6 +640,7 @@ impl SlicerApp {
                 deformation_method: crate::s3_slicer::DeformationMethod::S4Deform,
                 asap_max_iterations,
                 asap_convergence_threshold: asap_convergence,
+                z_bias,
             };
 
             {
@@ -690,6 +701,7 @@ impl SlicerApp {
         let progress = self.slicing_progress.clone();
         let cone_angle = self.conical_angle_degrees;
         let direction = self.conical_direction;
+        let use_artifact_filter = self.conical_use_artifact_filter;
 
         // Determine center: auto from mesh centroid or manual
         let (center_x, center_y) = if self.conical_auto_center {
@@ -714,6 +726,7 @@ impl SlicerApp {
             let result = std::panic::catch_unwind(|| {
                 crate::conical::execute_conical_pipeline(
                     &mesh, &config, cone_angle, center_x, center_y, direction,
+                    use_artifact_filter,
                 )
             });
 
@@ -1006,15 +1019,15 @@ impl SlicerApp {
             let mesh_clone = mesh.clone();
             // Use S4-specific config when in S4 mode, fall back to S3 config for legacy S4Deform
             let (overhang_threshold, smoothness_weight, optimization_iterations,
-                 max_rotation_degrees, asap_max_iterations, asap_convergence) =
+                 max_rotation_degrees, asap_max_iterations, asap_convergence, z_bias) =
                 if self.slicing_mode == SlicingMode::S4 {
                     (self.s4_overhang_threshold, self.s4_smoothness_weight,
                      self.s4_smoothing_iterations * 2, self.s4_max_rotation_degrees,
-                     self.s4_asap_max_iterations, self.s4_asap_convergence)
+                     self.s4_asap_max_iterations, self.s4_asap_convergence, self.s4_z_bias)
                 } else {
                     (self.s3_overhang_threshold, self.s3_smoothness_weight,
                      self.s3_optimization_iterations, self.config.max_rotation_degrees,
-                     self.s3_asap_max_iterations, self.s3_asap_convergence)
+                     self.s3_asap_max_iterations, self.s3_asap_convergence, 0.8f64)
                 };
 
             let (tx, rx) = mpsc::channel();
@@ -1041,8 +1054,8 @@ impl SlicerApp {
                 log::info!("  → {} vertices, {} tets", tet_mesh.vertices.len(), tet_mesh.tets.len());
 
                 // Step 2: Dijkstra field
-                log::info!("Step 2/4: Computing Dijkstra field...");
-                let dijkstra_field = TetDijkstraField::compute(&tet_mesh);
+                log::info!("Step 2/4: Computing Dijkstra field (z_bias={:.2})...", z_bias);
+                let dijkstra_field = TetDijkstraField::compute(&tet_mesh, z_bias);
 
                 // Step 3: S4 rotation field
                 log::info!("Step 3/4: Computing S4 rotation field...");
@@ -1050,6 +1063,7 @@ impl SlicerApp {
                     build_direction: crate::geometry::Vector3D::new(0.0, 0.0, 1.0),
                     overhang_threshold,
                     max_rotation_degrees,
+                    z_bias,
                     smoothing_iterations: optimization_iterations / 2,
                     smoothness_weight,
                 };
@@ -1251,13 +1265,50 @@ impl SlicerApp {
 
         use crate::toolpath_patterns::ToolpathConfig;
         // Geodesic and coordinate-transform contours are 3D surface curves whose XY projection
-        // covers the full cross-section — infill would penetrate the outer shell, so skip it.
+        // covers the full cross-section — naive scanline infill may penetrate the shell.
+        // The user can override this with force_nonplanar_infill (uses IDW Z interpolation).
         let skip_infill = matches!(
             self.slicing_mode,
             SlicingMode::Geodesic
             | SlicingMode::CoordTransformCylindrical
             | SlicingMode::CoordTransformSpherical
-        );
+        ) && !self.force_nonplanar_infill;
+        // Mesh ray-cast Z projection is only geometrically correct for geodesic slicing, where
+        // the toolpath should lie on the mesh surface.  All transform-based methods (conical, S4,
+        // cylindrical, spherical, S3) compute their own Z via back-transforms; using the raw mesh
+        // surface Z would corrupt those paths.
+        let use_mesh_raycaster = self.force_nonplanar_infill
+            && matches!(self.slicing_mode, SlicingMode::Geodesic);
+
+        // For conical mode, provide the analytic back-transform formula so the toolpath
+        // generator can compute exact Z values for every infill and wall-loop point.
+        // IDW from perimeter points gives badly wrong Z for interior points (e.g. the
+        // bunny body centre gets z≈50mm instead of the correct z≈20mm at deformed_z=20).
+        let conical_params: Option<(f64, f64, f64, f64)> = if matches!(self.slicing_mode, SlicingMode::Conical) {
+            use crate::conical::ConicalDirection;
+            let tan_angle = self.conical_angle_degrees.to_radians().tan();
+            // sign=-1 for Outward (outer regions pulled down), +1 for Inward
+            let sign = match self.conical_direction {
+                ConicalDirection::Outward => -1.0_f64,
+                ConicalDirection::Inward =>   1.0_f64,
+            };
+            let (cx, cy, z_min) = if self.conical_auto_center {
+                if let Some(mesh) = &self.mesh {
+                    let cx = (mesh.bounds_min.x + mesh.bounds_max.x) / 2.0;
+                    let cy = (mesh.bounds_min.y + mesh.bounds_max.y) / 2.0;
+                    (cx, cy, mesh.bounds_min.z)
+                } else {
+                    (self.conical_center_x, self.conical_center_y, 0.0)
+                }
+            } else {
+                let z_min = self.mesh.as_ref().map(|m| m.bounds_min.z).unwrap_or(0.0);
+                (self.conical_center_x, self.conical_center_y, z_min)
+            };
+            Some((cx, cy, sign * tan_angle, z_min))
+        } else {
+            None
+        };
+
         let pattern_config = ToolpathConfig {
             pattern: self.toolpath_pattern,
             line_width: self.toolpath_line_width,
@@ -1266,13 +1317,18 @@ impl SlicerApp {
             wall_count: self.wall_count,
             infill_pattern: self.infill_pattern,
             skip_infill,
+            wall_transitions: self.wall_seam_transitions,
+            use_mesh_raycaster,
+            conical_params,
             ..ToolpathConfig::default()
         };
 
         let generator = ToolpathGenerator::new(self.nozzle_diameter, self.config.layer_height)
             .with_config(pattern_config);
 
-        self.toolpaths = generator.generate(&self.layers);
+        // Pass the mesh so the generator can ray-cast accurate surface Z values onto infill/wall
+        // points, and to provide coverage gap fill on steep faces.
+        self.toolpaths = generator.generate(&self.layers, self.mesh.as_ref());
         self.has_toolpaths = true;
 
         let total_moves: usize = self.toolpaths.iter().map(|tp| tp.paths.len()).sum();

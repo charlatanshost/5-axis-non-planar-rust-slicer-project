@@ -174,11 +174,35 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                         ui.label(egui::RichText::new("Pipeline: Deform → Slice → Un-Deform").weak());
                         ui.add_space(3.0);
 
+                        // Support-Free Preset button
+                        ui.horizontal(|ui| {
+                            if ui.button("★ Support-Free Preset").clicked() {
+                                app.s4_z_bias = 0.85;
+                                app.s4_overhang_threshold = 35.0;
+                                app.s4_max_rotation_degrees = 35.0;
+                                app.s4_smoothing_iterations = 40;
+                                app.s4_smoothness_weight = 0.6;
+                            }
+                            ui.label(egui::RichText::new("(bunny, complex overhangs)").weak());
+                        });
+
+                        ui.separator();
+
+                        ui.horizontal(|ui| {
+                            ui.label("Z-bias:");
+                            ui.add(egui::Slider::new(&mut app.s4_z_bias, 0.0..=1.0)
+                                .step_by(0.05))
+                                .on_hover_text("Controls how the layer-ordering field is computed.\n\
+                                    0.0 = pure Euclidean graph distance (original — connects ears, back to head).\n\
+                                    0.8 = mostly Z-height (recommended — ears and back separate correctly).\n\
+                                    1.0 = pure |ΔZ| distance (maximally height-tracking).");
+                        });
+
                         ui.horizontal(|ui| {
                             ui.label("Overhang threshold:");
                             ui.add(egui::Slider::new(&mut app.s4_overhang_threshold, 30.0..=60.0)
                                 .suffix("°"))
-                                .on_hover_text("Surface faces steeper than this angle get rotated to reduce overhangs");
+                                .on_hover_text("Surface faces steeper than this angle get rotated to reduce overhangs.\nLower = catch more overhangs (more aggressive deformation).");
                         });
 
                         ui.horizontal(|ui| {
@@ -186,7 +210,9 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                             ui.add(egui::Slider::new(&mut app.s4_max_rotation_degrees, 5.0..=45.0)
                                 .suffix("°")
                                 .step_by(1.0))
-                                .on_hover_text("Maximum rotation per tet to fix overhangs.\nLower = gentler deformation, Higher = more aggressive.");
+                                .on_hover_text("Maximum rotation per tet to fix overhangs.\n\
+                                    15° = gentle (safe default).\n\
+                                    35° = support-free printing of complex models (bunny, etc.).");
                         });
 
                         ui.separator();
@@ -271,6 +297,10 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                                 ui.add(egui::DragValue::new(&mut app.conical_center_y).speed(0.5).suffix(" mm"));
                             });
                         }
+
+                        ui.separator();
+                        ui.checkbox(&mut app.conical_use_artifact_filter, "Artifact filter")
+                            .on_hover_text("Split contours at long bed-level edges caused by bad STL facets.\nON (default): removes artifact segments, keeps the legitimate rim arc.\nOFF (original): simple Z-clamp only — use if the filter cuts real geometry.");
                     });
 
                     ui.add_space(5.0);
@@ -596,17 +626,22 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
 
                 ui.horizontal(|ui| {
                     ui.label("Min height:");
-                    ui.add(egui::Slider::new(&mut app.config.min_layer_height, 0.05..=0.3)
-                        .suffix(" mm"));
+                    ui.add(egui::Slider::new(&mut app.config.min_layer_height, 0.01..=2.0)
+                        .suffix(" mm")
+                        .step_by(0.01))
+                        .on_hover_text("Thinnest layer used on steep/vertical surfaces (adaptive mode).");
                 });
 
                 ui.horizontal(|ui| {
                     ui.label("Max height:");
-                    ui.add(egui::Slider::new(&mut app.config.max_layer_height, 0.1..=1.0)
-                        .suffix(" mm"));
+                    ui.add(egui::Slider::new(&mut app.config.max_layer_height, 0.01..=5.0)
+                        .suffix(" mm")
+                        .step_by(0.01))
+                        .on_hover_text("Thickest layer used on flat/horizontal surfaces (adaptive mode).");
                 });
 
-                ui.checkbox(&mut app.config.adaptive, "Adaptive slicing");
+                ui.checkbox(&mut app.config.adaptive, "Adaptive layer height")
+                    .on_hover_text("Vary layer height by local surface slope.\nFlat faces → max height (fast). Vertical faces → min height (fine detail).\nUses triangle normals to estimate slope at each layer.");
 
                 // S3-Slicer specific parameter (only shown/used in S3 Curved mode — S4 has its own)
                 if app.slicing_mode == crate::gui::app::SlicingMode::Curved {
@@ -699,6 +734,22 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                             });
                     });
                 }
+
+                // Force-infill override for curved/surface modes
+                let is_curved_mode = matches!(
+                    app.slicing_mode,
+                    crate::gui::app::SlicingMode::Geodesic
+                    | crate::gui::app::SlicingMode::CoordTransformCylindrical
+                    | crate::gui::app::SlicingMode::CoordTransformSpherical
+                );
+                if is_curved_mode {
+                    ui.checkbox(&mut app.force_nonplanar_infill, "Force infill on curved layers")
+                        .on_hover_text("Enable XY scanline infill for surface-following modes.\nInfill Z is interpolated from the contour (IDW).\nWorks best on roughly-horizontal layers.\nMay print in air on highly curved geometry — use with care.");
+                }
+
+                // Wall seam transitions: ruled-surface zigzag bridging consecutive curved layers
+                ui.checkbox(&mut app.wall_seam_transitions, "Wall seam transitions")
+                    .on_hover_text("Insert a ruled-surface zigzag path between the outer walls of\nconsecutive curved layers. Fills the staircase gap so the surface\nhas no visible seams. Only activates when layers have varying Z.");
 
                 ui.separator();
 

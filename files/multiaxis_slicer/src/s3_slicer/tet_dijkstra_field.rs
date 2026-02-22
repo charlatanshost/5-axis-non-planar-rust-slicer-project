@@ -39,7 +39,13 @@ impl TetDijkstraField {
     /// 1. Identify base tets (boundary faces in bottom Z region)
     /// 2. Multi-source Dijkstra from all base tets
     /// 3. Compute per-tet gradient from neighbor distance differences
-    pub fn compute(tet_mesh: &TetMesh) -> Self {
+    ///
+    /// `z_bias` controls how much the edge weight favours vertical distance over
+    /// horizontal distance (0.0 = pure Euclidean, 1.0 = pure |ΔZ|).  A value of
+    /// ~0.8 makes the field track actual print height rather than graph path length,
+    /// which prevents topologically-close but geometrically-separated features
+    /// (e.g. both ears of the Stanford Bunny) from ending up on the same layer.
+    pub fn compute(tet_mesh: &TetMesh, z_bias: f64) -> Self {
         let num_tets = tet_mesh.tets.len();
         log::info!("Computing Dijkstra field on {} tets...", num_tets);
 
@@ -76,7 +82,7 @@ impl TetDijkstraField {
                 centroids[a].z.partial_cmp(&centroids[b].z).unwrap()
             }) {
                 fallback.base_tets = vec![min_ti];
-                let result = run_dijkstra(tet_mesh, &centroids, &fallback.base_tets);
+                let result = run_dijkstra(tet_mesh, &centroids, &fallback.base_tets, z_bias);
                 fallback.distances = result.0;
                 fallback.max_distance = result.1;
                 fallback.gradients = compute_gradients(tet_mesh, &centroids, &fallback.distances);
@@ -85,7 +91,7 @@ impl TetDijkstraField {
         }
 
         // Run multi-source Dijkstra
-        let (distances, max_distance) = run_dijkstra(tet_mesh, &centroids, &base_tets);
+        let (distances, max_distance) = run_dijkstra(tet_mesh, &centroids, &base_tets, z_bias);
         log::info!("  Dijkstra complete: max_distance={:.2}", max_distance);
 
         // Compute gradients
@@ -174,10 +180,16 @@ fn find_base_tets(tet_mesh: &TetMesh) -> Vec<usize> {
 
 /// Run multi-source Dijkstra from base tets.
 /// Returns (per-tet distances, max distance).
+///
+/// Edge weight = |ΔZ| * z_bias + Euclidean * (1 - z_bias).
+/// z_bias = 0.0 → original Euclidean behaviour.
+/// z_bias = 0.8 → strongly height-tracking: features at different Z get different distances
+///                  even when their graph-path lengths through wide/narrow regions are similar.
 fn run_dijkstra(
     tet_mesh: &TetMesh,
     centroids: &[Point3D],
     base_tets: &[usize],
+    z_bias: f64,
 ) -> (Vec<f64>, f64) {
     let num_tets = tet_mesh.tets.len();
     let mut distances = vec![f64::INFINITY; num_tets];
@@ -200,7 +212,11 @@ fn run_dijkstra(
         // Visit face-adjacent neighbors
         for fi in 0..4 {
             if let Some(ni) = tet_mesh.tet_neighbors[ti][fi] {
-                let weight = (centroids[ti] - centroids[ni]).norm();
+                let diff = centroids[ni] - centroids[ti];
+                let euclidean = (diff.x * diff.x + diff.y * diff.y + diff.z * diff.z).sqrt();
+                // Blend between pure Euclidean (z_bias=0) and pure |ΔZ| (z_bias=1).
+                // The Euclidean floor ensures horizontal adjacencies always cost something.
+                let weight = (diff.z.abs() * z_bias + euclidean * (1.0 - z_bias)).max(1e-10);
                 let new_dist = dist + weight;
 
                 if new_dist < distances[ni] {
@@ -307,7 +323,7 @@ mod tests {
     #[test]
     fn test_dijkstra_distances() {
         let mesh = make_two_tet_stack();
-        let field = TetDijkstraField::compute(&mesh);
+        let field = TetDijkstraField::compute(&mesh, 0.8);
 
         // Base tet (tet 0) should have distance 0
         assert_eq!(field.distances[0], 0.0, "Base tet distance should be 0");
@@ -329,7 +345,7 @@ mod tests {
     #[test]
     fn test_dijkstra_gradients() {
         let mesh = make_two_tet_stack();
-        let field = TetDijkstraField::compute(&mesh);
+        let field = TetDijkstraField::compute(&mesh, 0.8);
 
         // Gradients should generally point upward (positive Z component)
         // since the mesh is stacked vertically
@@ -353,7 +369,7 @@ mod tests {
     #[test]
     fn test_normalized_distance() {
         let mesh = make_two_tet_stack();
-        let field = TetDijkstraField::compute(&mesh);
+        let field = TetDijkstraField::compute(&mesh, 0.8);
 
         let d0 = field.normalized_distance(0);
         let d1 = field.normalized_distance(1);

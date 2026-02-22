@@ -1,7 +1,8 @@
 // Advanced toolpath pattern generation
 // Based on algorithms from SIGGRAPH Asia 2022 paper
 
-use crate::geometry::{Point3D, Vector3D, Contour};
+use crate::geometry::{Point3D, Vector3D, Contour, Triangle};
+use crate::mesh::Mesh;
 use crate::slicing::Layer;
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +53,20 @@ pub struct ToolpathConfig {
     pub infill_speed: f64,       // Infill extrusion speed (mm/s)
     pub travel_speed: f64,       // Non-extrusion travel speed (mm/s)
     pub skip_infill: bool,       // Skip infill generation (for geodesic/coord-transform modes)
+    pub wall_transitions: bool,  // Insert ruled-surface seam paths between consecutive curved layers
+    /// Apply mesh ray-cast Z projection to wall and infill points.
+    /// Only correct for geodesic mode where the toolpath should lie on the mesh surface.
+    /// Must NOT be enabled for conical / S4 / cylindrical / spherical modes because those
+    /// methods compute their own geometrically-correct Z values (back-transform / un-deform /
+    /// coordinate-transform) — overwriting them with raw mesh surface Z corrupts the paths.
+    pub use_mesh_raycaster: bool,
+    /// Conical back-transform parameters: (center_x, center_y, signed_tan, z_min).
+    /// `signed_tan = sign × tan(angle)`, where sign = -1 for Outward, +1 for Inward.
+    /// `z_min` = mesh.bounds_min.z (build plate Z) — prevents infill from going below the bed.
+    /// When Some, infill and wall-loop Z values are computed analytically:
+    ///   z(x,y) = max(deformed_z - signed_tan × sqrt((x−cx)² + (y−cy)²), z_min)
+    /// replacing IDW which gives badly wrong Z for interior points of large cross-sections.
+    pub conical_params: Option<(f64, f64, f64, f64)>,
 }
 
 impl Default for ToolpathConfig {
@@ -67,6 +82,9 @@ impl Default for ToolpathConfig {
             infill_speed: 40.0,
             travel_speed: 80.0,
             skip_infill: false,
+            wall_transitions: false,
+            use_mesh_raycaster: false,
+            conical_params: None,
         }
     }
 }
@@ -281,9 +299,247 @@ fn calculate_bounds(points: &[Point3D]) -> (f64, f64, f64, f64) {
     (min_x, max_x, min_y, max_y)
 }
 
+// ─── MeshRayCaster ────────────────────────────────────────────────────────────
+
+/// 2D spatial bin grid for fast vertical ray–triangle intersection.
+/// For any XY query, finds all triangles covering that position and returns
+/// the surface Z nearest to a reference Z (handles multi-shell objects correctly).
+pub struct MeshRayCaster {
+    bins: Vec<Vec<usize>>,
+    x_min: f64,
+    y_min: f64,
+    bin_size: f64,
+    nx: usize,
+    ny: usize,
+}
+
+impl MeshRayCaster {
+    /// Build the caster from a mesh with a `grid_res × grid_res` bin grid.
+    pub fn new(mesh: &Mesh, grid_res: usize) -> Self {
+        let grid_res = grid_res.max(1);
+        let x_min = mesh.bounds_min.x;
+        let y_min = mesh.bounds_min.y;
+        let x_max = mesh.bounds_max.x;
+        let y_max = mesh.bounds_max.y;
+        let span_x = (x_max - x_min).max(1e-6);
+        let span_y = (y_max - y_min).max(1e-6);
+        // Slightly oversize bins to avoid boundary off-by-one
+        let bin_size = (span_x.max(span_y) / grid_res as f64) * 1.001;
+        let nx = ((span_x / bin_size).ceil() as usize).max(1);
+        let ny = ((span_y / bin_size).ceil() as usize).max(1);
+
+        let mut bins: Vec<Vec<usize>> = vec![Vec::new(); nx * ny];
+        for (tri_idx, tri) in mesh.triangles.iter().enumerate() {
+            let tx0 = tri.v0.x.min(tri.v1.x).min(tri.v2.x);
+            let tx1 = tri.v0.x.max(tri.v1.x).max(tri.v2.x);
+            let ty0 = tri.v0.y.min(tri.v1.y).min(tri.v2.y);
+            let ty1 = tri.v0.y.max(tri.v1.y).max(tri.v2.y);
+
+            let bx0 = ((tx0 - x_min) / bin_size).floor() as isize;
+            let bx1 = ((tx1 - x_min) / bin_size).ceil() as isize;
+            let by0 = ((ty0 - y_min) / bin_size).floor() as isize;
+            let by1 = ((ty1 - y_min) / bin_size).ceil() as isize;
+
+            for bx in bx0.max(0)..(bx1 + 1).min(nx as isize) {
+                for by in by0.max(0)..(by1 + 1).min(ny as isize) {
+                    bins[bx as usize + by as usize * nx].push(tri_idx);
+                }
+            }
+        }
+
+        Self { bins, x_min, y_min, bin_size, nx, ny }
+    }
+
+    /// Find mesh surface Z nearest to `near_z` at (x, y).
+    /// Returns `None` if no triangle covers this XY position.
+    pub fn project_z(&self, x: f64, y: f64, near_z: f64, mesh: &Mesh) -> Option<f64> {
+        let bx = ((x - self.x_min) / self.bin_size) as isize;
+        let by = ((y - self.y_min) / self.bin_size) as isize;
+        if bx < 0 || bx >= self.nx as isize || by < 0 || by >= self.ny as isize {
+            return None;
+        }
+        let bin = &self.bins[bx as usize + by as usize * self.nx];
+        let mut best: Option<f64> = None;
+        for &tri_idx in bin {
+            let tri = &mesh.triangles[tri_idx];
+            if let Some(z_hit) = vertical_ray_triangle(x, y, tri) {
+                best = Some(match best {
+                    None => z_hit,
+                    Some(prev) => {
+                        if (z_hit - near_z).abs() < (prev - near_z).abs() { z_hit } else { prev }
+                    }
+                });
+            }
+        }
+        best
+    }
+}
+
+/// Vertical ray–triangle intersection using XY barycentric coordinates.
+/// Returns the Z at which a vertical ray through (x, y) hits the triangle, or None.
+fn vertical_ray_triangle(x: f64, y: f64, tri: &Triangle) -> Option<f64> {
+    let (v0x, v0y, v0z) = (tri.v0.x, tri.v0.y, tri.v0.z);
+    let (v1x, v1y, v1z) = (tri.v1.x, tri.v1.y, tri.v1.z);
+    let (v2x, v2y, v2z) = (tri.v2.x, tri.v2.y, tri.v2.z);
+
+    let denom = (v1y - v2y) * (v0x - v2x) + (v2x - v1x) * (v0y - v2y);
+    if denom.abs() < 1e-12 {
+        return None; // Degenerate triangle
+    }
+    let a = ((v1y - v2y) * (x - v2x) + (v2x - v1x) * (y - v2y)) / denom;
+    let b = ((v2y - v0y) * (x - v2x) + (v0x - v2x) * (y - v2y)) / denom;
+    let c = 1.0 - a - b;
+
+    const EPS: f64 = -1e-6;
+    if a >= EPS && b >= EPS && c >= EPS {
+        Some(a * v0z + b * v1z + c * v2z)
+    } else {
+        None
+    }
+}
+
+// ─── Gap-fill helpers ─────────────────────────────────────────────────────────
+
+/// Generate clipped infill scanlines at a single Y level with raycaster Z projection.
+/// Used by coverage_gap_fill to insert extra scanlines on steep surfaces.
+fn scanlines_at_y(
+    y: f64,
+    boundary_pts: &[Point3D],
+    config: &ToolpathConfig,
+    layer_z: f64,
+    caster: &MeshRayCaster,
+    mesh_ref: &Mesh,
+) -> Vec<Vec<Point3D>> {
+    let n = boundary_pts.len();
+    if n < 3 { return Vec::new(); }
+    let margin = config.line_width * 0.1;
+    let mut intersections: Vec<f64> = Vec::new();
+
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let yi = boundary_pts[i].y;
+        let yj = boundary_pts[j].y;
+        if (yi <= y && yj > y) || (yj <= y && yi > y) {
+            let t = (y - yi) / (yj - yi);
+            let x = boundary_pts[i].x + t * (boundary_pts[j].x - boundary_pts[i].x);
+            intersections.push(x);
+        }
+    }
+    intersections.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut lines: Vec<Vec<Point3D>> = Vec::new();
+    let mut i = 0;
+    while i + 1 < intersections.len() {
+        let x_start = intersections[i] + margin;
+        let x_end = intersections[i + 1] - margin;
+        if x_end > x_start + config.line_width {
+            let mut pts = Vec::new();
+            let mut x = x_start;
+            while x <= x_end {
+                let z = caster.project_z(x, y, layer_z, mesh_ref).unwrap_or(layer_z);
+                pts.push(Point3D::new(x, y, z));
+                x += config.node_distance;
+            }
+            if pts.last().map(|p| (x_end - p.x).abs() > config.node_distance * 0.3).unwrap_or(true) {
+                let z = caster.project_z(x_end, y, layer_z, mesh_ref).unwrap_or(layer_z);
+                pts.push(Point3D::new(x_end, y, z));
+            }
+            if pts.len() >= 2 {
+                lines.push(pts);
+            }
+        }
+        i += 2;
+    }
+    lines
+}
+
+/// One-pass coverage gap fill: for each consecutive pair of scanlines, check if their
+/// 3D separation (accounting for slope-driven Z difference) exceeds 2× the target spacing.
+/// If so, insert a midpoint scanline. Only runs when raycaster is available.
+fn coverage_gap_fill(
+    infill_lines: &[Vec<Point3D>],
+    boundary_pts: &[Point3D],
+    config: &ToolpathConfig,
+    layer_z: f64,
+    nominal_spacing: f64,
+    caster: &MeshRayCaster,
+    mesh_ref: &Mesh,
+) -> Vec<Vec<Point3D>> {
+    if infill_lines.len() < 2 {
+        return Vec::new();
+    }
+    let target_3d = nominal_spacing * 2.0;
+    let mut extra: Vec<Vec<Point3D>> = Vec::new();
+
+    for i in 0..infill_lines.len() - 1 {
+        let y_i = match infill_lines[i].first() { Some(p) => p.y, None => continue };
+        let y_j = match infill_lines[i + 1].first() { Some(p) => p.y, None => continue };
+
+        let dy = (y_j - y_i).abs();
+        // Only check pairs that are nominally adjacent (within 50% of expected spacing)
+        if dy < nominal_spacing * 0.5 || dy > nominal_spacing * 1.5 {
+            continue;
+        }
+
+        // Sample mesh Z at the horizontal midpoint of scanline[i] to estimate slope
+        let mid_x = infill_lines[i]
+            .get(infill_lines[i].len() / 2)
+            .map(|p| p.x)
+            .unwrap_or(0.0);
+        let z_i = caster.project_z(mid_x, y_i, layer_z, mesh_ref).unwrap_or(layer_z);
+        let z_j = caster.project_z(mid_x, y_j, layer_z, mesh_ref).unwrap_or(layer_z);
+
+        let dz = (z_j - z_i).abs();
+        let gap_3d = (dy * dy + dz * dz).sqrt();
+
+        if gap_3d > target_3d {
+            let y_mid = (y_i + y_j) / 2.0;
+            extra.extend(scanlines_at_y(y_mid, boundary_pts, config, layer_z, caster, mesh_ref));
+        }
+    }
+
+    extra
+}
+
+// ─── Infill generation ────────────────────────────────────────────────────────
+
+/// Collect all X intersections of a closed/open polygon at scan-line Y.
+/// Returns a sorted vec of X coordinates (even count → inside/outside pairs).
+fn scanline_x_at_y(pts: &[Point3D], closed: bool, y: f64) -> Vec<f64> {
+    let n = pts.len();
+    let mut xs = Vec::new();
+    for i in 0..n {
+        let j = if closed {
+            (i + 1) % n
+        } else if i + 1 < n {
+            i + 1
+        } else {
+            break;
+        };
+        let yi = pts[i].y;
+        let yj = pts[j].y;
+        if (yi <= y && yj > y) || (yj <= y && yi > y) {
+            let t = (y - yi) / (yj - yi);
+            xs.push(pts[i].x + t * (pts[j].x - pts[i].x));
+        }
+    }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    xs
+}
+
 /// Generate infill lines clipped to the interior of a boundary contour.
 /// Uses scanline approach: horizontal lines at spacing, clipped to boundary edges.
-/// `outer_boundary` is used to validate that infill lines stay inside the original contour.
+///
+/// Dual-clip: each scanline segment is clipped to BOTH `boundary` (the innermost wall
+/// loop) AND `outer_boundary` (the original contour).  This ensures infill never
+/// escapes the model shell even when the 2D inward-offset algorithm places a wall-loop
+/// vertex slightly outside the original contour for non-convex geometries (e.g. conical
+/// slicing with complex cross-sections).
+///
+/// `raycaster` (when Some) gives accurate surface Z from the mesh; falls back to IDW /
+/// boundary interpolation otherwise.
+/// `z_override` (when Some) overrides ALL other Z methods — used for conical mode where
+/// the exact analytic formula is known.
 /// Returns individual line segments (each is a vec of points to extrude along).
 pub fn generate_clipped_infill(
     boundary: &Contour,
@@ -291,17 +547,67 @@ pub fn generate_clipped_infill(
     layer_z: f64,
     outer_boundary: Option<&Contour>,
     z_ref_points: Option<&[Point3D]>,
+    raycaster: Option<(&MeshRayCaster, &Mesh)>,
+    z_override: Option<&dyn Fn(f64, f64) -> f64>,
 ) -> Vec<Vec<Point3D>> {
     let pts = &boundary.points;
     if pts.len() < 3 || config.infill_density < 0.01 {
         return Vec::new();
     }
 
-    let (min_x, max_x, min_y, max_y) = calculate_bounds(pts);
+    let (_min_x, _max_x, min_y, max_y) = calculate_bounds(pts);
 
     // Line spacing based on density
     let line_spacing = config.line_width / config.infill_density;
     let margin = config.line_width * 0.1; // Small margin to avoid edge artifacts
+
+    // Unified Z lookup priority:
+    //   1. z_override (analytic formula — conical mode)
+    //   2. raycaster  (mesh surface — geodesic mode)
+    //   3. IDW from reference points
+    //   4. nearest-edge boundary interpolation
+    let compute_z = |x: f64, y: f64| -> f64 {
+        if let Some(zfn) = z_override {
+            return zfn(x, y);
+        }
+        if let Some((caster, mesh_ref)) = raycaster {
+            if let Some(z) = caster.project_z(x, y, layer_z, mesh_ref) {
+                return z;
+            }
+        }
+        if let Some(refs) = z_ref_points {
+            return interpolate_z_idw(x, y, refs, layer_z);
+        }
+        interpolate_z_for_infill(x, y, boundary, layer_z)
+    };
+
+    // Helper: emit a line from x_start..x_end at fixed y in the current direction.
+    let emit_line = |x_start: f64, x_end: f64, y: f64, forward: bool, compute_z: &dyn Fn(f64,f64)->f64| -> Option<Vec<Point3D>> {
+        if x_end <= x_start + config.line_width {
+            return None;
+        }
+        let mut pts_out = Vec::new();
+        if forward {
+            let mut x = x_start;
+            while x <= x_end {
+                pts_out.push(Point3D::new(x, y, compute_z(x, y)));
+                x += config.node_distance;
+            }
+            if pts_out.last().map(|p| (x_end - p.x).abs() > config.node_distance * 0.3).unwrap_or(true) {
+                pts_out.push(Point3D::new(x_end, y, compute_z(x_end, y)));
+            }
+        } else {
+            let mut x = x_end;
+            while x >= x_start {
+                pts_out.push(Point3D::new(x, y, compute_z(x, y)));
+                x -= config.node_distance;
+            }
+            if pts_out.last().map(|p| (p.x - x_start).abs() > config.node_distance * 0.3).unwrap_or(true) {
+                pts_out.push(Point3D::new(x_start, y, compute_z(x_start, y)));
+            }
+        }
+        if pts_out.len() >= 2 { Some(pts_out) } else { None }
+    };
 
     let mut infill_lines: Vec<Vec<Point3D>> = Vec::new();
     let mut direction_forward = true;
@@ -309,105 +615,72 @@ pub fn generate_clipped_infill(
     // Generate scanlines
     let mut y = min_y + line_spacing / 2.0;
     while y < max_y {
-        // Find all intersections of horizontal line y with boundary edges
-        let mut intersections: Vec<f64> = Vec::new();
-        let n = pts.len();
+        // Intersections with inner boundary (innermost wall loop)
+        let inner_xs = scanline_x_at_y(pts, true, y);
 
-        for i in 0..n {
-            let j = (i + 1) % n;
-            let yi = pts[i].y;
-            let yj = pts[j].y;
+        // Intersections with outer boundary (original contour) — used for dual-clipping.
+        // If no outer boundary, fall back to inner only.
+        let outer_xs: Vec<f64> = match outer_boundary {
+            Some(outer) => scanline_x_at_y(&outer.points, outer.closed, y),
+            None => Vec::new(),
+        };
 
-            // Check if this edge crosses the scanline
-            if (yi <= y && yj > y) || (yj <= y && yi > y) {
-                // Compute x intersection
-                let t = (y - yi) / (yj - yi);
-                let x = pts[i].x + t * (pts[j].x - pts[i].x);
-                intersections.push(x);
-            }
-        }
+        let mut ii = 0;
+        while ii + 1 < inner_xs.len() {
+            let xi_s = inner_xs[ii] + margin;
+            let xi_e = inner_xs[ii + 1] - margin;
 
-        // Sort intersections by x
-        intersections.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Pair up entry/exit: intersections[0..1] is inside, [1..2] is outside, etc.
-        let mut i = 0;
-        while i + 1 < intersections.len() {
-            let x_start = intersections[i] + margin;
-            let x_end = intersections[i + 1] - margin;
-
-            if x_end > x_start + config.line_width {
-                // Generate points along this infill segment
-                let mut line_points = Vec::new();
-
-                if direction_forward {
-                    let mut x = x_start;
-                    while x <= x_end {
-                        let z = if let Some(refs) = z_ref_points {
-                            interpolate_z_idw(x, y, refs, layer_z)
-                        } else {
-                            interpolate_z_for_infill(x, y, boundary, layer_z)
-                        };
-                        line_points.push(Point3D::new(x, y, z));
-                        x += config.node_distance;
+            if outer_xs.len() >= 2 {
+                // Dual-clip: intersect the inner pair against every outer pair.
+                // For convex outer boundaries there is only one pair; non-convex boundaries
+                // may have multiple pairs (holes, concavities).
+                let mut oi = 0;
+                while oi + 1 < outer_xs.len() {
+                    let xo_s = outer_xs[oi] + margin;
+                    let xo_e = outer_xs[oi + 1] - margin;
+                    let x_start = xi_s.max(xo_s);
+                    let x_end   = xi_e.min(xo_e);
+                    if let Some(line) = emit_line(x_start, x_end, y, direction_forward, &compute_z) {
+                        infill_lines.push(line);
                     }
-                    // Add final point
-                    if line_points.last().map(|p| (x_end - p.x).abs() > config.node_distance * 0.3).unwrap_or(true) {
-                        let z = if let Some(refs) = z_ref_points {
-                            interpolate_z_idw(x_end, y, refs, layer_z)
-                        } else {
-                            interpolate_z_for_infill(x_end, y, boundary, layer_z)
-                        };
-                        line_points.push(Point3D::new(x_end, y, z));
-                    }
-                } else {
-                    let mut x = x_end;
-                    while x >= x_start {
-                        let z = if let Some(refs) = z_ref_points {
-                            interpolate_z_idw(x, y, refs, layer_z)
-                        } else {
-                            interpolate_z_for_infill(x, y, boundary, layer_z)
-                        };
-                        line_points.push(Point3D::new(x, y, z));
-                        x -= config.node_distance;
-                    }
-                    if line_points.last().map(|p| (p.x - x_start).abs() > config.node_distance * 0.3).unwrap_or(true) {
-                        let z = if let Some(refs) = z_ref_points {
-                            interpolate_z_idw(x_start, y, refs, layer_z)
-                        } else {
-                            interpolate_z_for_infill(x_start, y, boundary, layer_z)
-                        };
-                        line_points.push(Point3D::new(x_start, y, z));
-                    }
+                    oi += 2;
                 }
-
-                if line_points.len() >= 2 {
-                    infill_lines.push(line_points);
+            } else {
+                // No outer boundary — clip to inner only (original behaviour)
+                if let Some(line) = emit_line(xi_s, xi_e, y, direction_forward, &compute_z) {
+                    infill_lines.push(line);
                 }
             }
 
-            i += 2; // Skip to next entry/exit pair
+            ii += 2;
         }
 
-        direction_forward = !direction_forward; // Zigzag alternation
+        direction_forward = !direction_forward;
         y += line_spacing;
     }
 
-    // Validate infill lines against the outer boundary (original contour) if provided.
-    // This catches cases where the offset contour is malformed for complex shapes.
+    // Coverage gap fill: insert midpoint scanlines where 3D slope creates gaps > 2× target.
+    // Only runs when the mesh raycaster is available (curved layers).
+    if let Some((caster, mesh_ref)) = raycaster {
+        let extra = coverage_gap_fill(
+            &infill_lines, pts, config, layer_z, line_spacing, caster, mesh_ref,
+        );
+        if !extra.is_empty() {
+            infill_lines.extend(extra);
+            infill_lines.sort_by(|a, b| {
+                let ya = a.first().map(|p| p.y).unwrap_or(0.0);
+                let yb = b.first().map(|p| p.y).unwrap_or(0.0);
+                ya.partial_cmp(&yb).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+    }
+
+    // Final safety filter: reject any infill line whose every point is not inside
+    // the outer boundary.  The dual-clip above handles the common case; this catches
+    // any remaining escapes from floating-point rounding or concave degenerate cases.
     if let Some(outer) = outer_boundary {
         infill_lines.retain(|line| {
-            if line.len() < 2 {
-                return false;
-            }
-            // Check midpoint of the line — if it's outside the original contour, discard
-            let mid_idx = line.len() / 2;
-            let mid = &line[mid_idx];
-            if !is_point_in_contour(mid, outer) {
-                return false;
-            }
-            // Also check endpoints
-            is_point_in_contour(&line[0], outer) && is_point_in_contour(line.last().unwrap(), outer)
+            line.len() >= 2 && line.iter().all(|pt| is_point_in_contour(pt, outer))
         });
     }
 
@@ -465,8 +738,8 @@ fn interpolate_z_idw(x: f64, y: f64, ref_points: &[Point3D], layer_z: f64) -> f6
     if tw > 1e-12 { wz / tw } else { layer_z }
 }
 
-/// Check if a point is inside a contour using ray casting
-fn is_point_in_contour(point: &Point3D, contour: &Contour) -> bool {
+/// Check if a point is inside a contour using ray casting (XY only, ignores Z).
+pub fn is_point_in_contour(point: &Point3D, contour: &Contour) -> bool {
     if contour.points.len() < 3 {
         return false;
     }

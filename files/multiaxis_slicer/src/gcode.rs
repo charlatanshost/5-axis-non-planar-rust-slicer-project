@@ -300,6 +300,7 @@ mod tests {
         
         let toolpath = Toolpath {
             z: 0.2,
+            layer_height: 0.2,
             paths: vec![
                 ToolpathSegment {
                     position: Point3D::new(0.0, 0.0, 0.2),

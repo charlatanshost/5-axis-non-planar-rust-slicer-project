@@ -23,7 +23,7 @@ The output is standard G-code extended with A/B rotation axes for 5-axis machine
 |---|---|
 | **Planar** | Traditional flat-layer slicing. Fast baseline. |
 | **Conical** | Cone-shifted Z for radially symmetric overhangs (RotBot-style). |
-| **S4 Non-Planar** | Dijkstra-based mesh deformation → planar slice → barycentric untransform. |
+| **S4 Non-Planar** | Dijkstra-based mesh deformation → planar slice → barycentric untransform. Z-biased distance field keeps topologically-close features (e.g. two ears of the Stanford Bunny) on separate layers. |
 | **S3 Curved Layer** | Full S3-Slicer pipeline: quaternion field + volumetric ASAP deformation + marching tetrahedra. |
 | **Geodesic (Heat Method)** | Layers follow geodesic distance from a source boundary using the heat method. Multiple diffusion modes: isotropic, adaptive scalar, anisotropic, print-direction biased. |
 | **Cylindrical** | Coordinate transform to cylindrical space — layers are concentric radial shells. |
@@ -36,11 +36,16 @@ The output is standard G-code extended with A/B rotation axes for 5-axis machine
 - **Voxel reconstruction** — SDF + Marching Cubes repairs self-intersecting STL files in 2–5 seconds (versus ~28 minutes for isotropic remeshing)
 - **Multi-scale geodesic** — runs heat diffusion at several doubling timesteps and fuses results, giving both fine local detail and full-mesh coverage simultaneously
 - **Anisotropic diffusion** — curvature-aligned, print-direction biased, or custom vector field modes shape how geodesic layers follow the geometry
+- **S4 Z-biased Dijkstra** — edge weights blend |ΔZ| and Euclidean distance so the distance field tracks actual print height, not graph path length; includes a one-click "Support-Free Preset" (35° overhang, 35° max rotation, z_bias 0.85) tuned for complex organic models
+- **Adaptive layer height** — per-layer height set by local surface slope; viewport tube diameter scales to match actual layer height
+- **Mesh-mapped gap filling** — `MeshRayCaster` projects infill and wall loop Z onto the actual surface; slope-adaptive scanline insertion fills 3D coverage gaps on steep curved surfaces
+- **Wall seam transitions** — optional ruled-surface zigzag paths between consecutive curved layers to fill the staircase gap at the outer wall
 - **5-axis G-code** — direct output with A/B (or B/C) rotary axes and TCP compensation
 - **Capsule-vs-mesh collision detection** — parry3d capsule shape tested against every triangle with AABB pre-filter
-- **Interactive 3D GUI** — egui sidebar with live parameter controls, three-d viewport, G-code preview panel
+- **Conical floating-contour filter** — 2D per-XY bin grid tracks maximum printed Z at each location; defers unsupported contours until the print surface below them has been deposited
+- **Interactive 3D GUI** — egui sidebar with live parameter controls, three-d viewport with layer-height-scaled tube rendering, G-code preview panel
 - **Parallel processing** — Rayon used throughout slicing and field computation
-- **105 unit tests** passing (3 pre-existing failures unrelated to current work)
+- **108 unit tests** passing (3 pre-existing failures unrelated to current work)
 
 ---
 
