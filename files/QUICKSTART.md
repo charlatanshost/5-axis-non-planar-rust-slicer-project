@@ -1,230 +1,142 @@
 # Quick Start Guide
 
-## 1. Installation (5 minutes)
+## 1. Build and Run (2 minutes)
+
+**Requirements:** Rust 1.75+ stable, a C++ compiler
 
 ```bash
-# Navigate to project directory
-cd multiaxis_slicer
+cd files/multiaxis_slicer
 
-# Run setup script
-./setup.sh
-
-# This will:
-# - Install Rust (if needed)
-# - Build the project in release mode
-# - Run tests
+# Run the GUI — release mode is strongly recommended
+cargo run --bin gui --release
 ```
 
-## 2. Run the Example (1 minute)
+The GUI opens with a 3D viewport. Everything is controlled from the left-side panel.
+
+---
+
+## 2. Slice Your First Model
+
+1. Click **Load STL** (top of the left panel) and open any `.stl` file
+2. The mesh appears in the 3D viewport — drag to rotate, scroll to zoom
+3. Select a slicing mode from the **Slicing Mode** dropdown
+4. Adjust parameters as needed
+5. Click **Slice** — progress appears in the stats panel (bottom right)
+6. Layers appear as coloured tubes in the viewport
+7. Click **Export G-code** to write the toolpaths to a file
+
+---
+
+## 3. Choosing a Slicing Mode
+
+| Mode | Best For | Notes |
+|---|---|---|
+| **Planar** | Any model, quick test | Standard flat layers. Fastest. |
+| **Conical** | Radially symmetric models (vases, bowls) | Eliminates overhangs on rotational geometry. |
+| **S4 Non-Planar** | Complex organic models (Stanford Bunny, figurines) | Click "Support-Free Preset" for a good starting point. Slicing takes 5–30 seconds. |
+| **S3 Curved Layer** | Research / maximum quality | Slowest. Full S3-Slicer paper pipeline. |
+| **Geodesic** | Surface-conforming layers on curved objects | Layers follow the mesh surface rather than flat planes. |
+| **Cylindrical** | Vases, cylinders, tubes | Layers are concentric radial shells. |
+| **Spherical** | Spheres, domes | Layers are concentric spherical shells. |
+
+### S4 — Support-Free Printing
+
+S4 Non-Planar is the recommended mode for eliminating support structures on complex models:
+
+1. Select **S4 Non-Planar**
+2. Click **"★ Support-Free Preset"** — sets z_bias=0.85, overhang=35°, max rotation=35°
+3. Click **Slice**
+
+If overhangs are still present after slicing, try increasing **Max Rotation** (up to ~45°) or lowering **Overhang Threshold** (down to ~25°). Raising too high may cause tet inversion and a silent fallback to a simpler method.
+
+### Geodesic — Surface-Conforming Layers
+
+1. Select **Geodesic (Heat Method)**
+2. Set **Layer Height** (e.g. 0.2mm)
+3. Leave **Diffusion Mode** as **Isotropic** for most models
+4. Click **Slice**
+
+For strongly anisotropic models (e.g. a model that's much taller in one axis), try **Print Direction Biased** mode and point the preferred direction along the tall axis.
+
+---
+
+## 4. Toolpath Settings
+
+Under **Toolpath Settings** in the left panel:
+
+- **Nozzle Diameter** — sets wall loop width and infill line spacing
+- **Layer Height** — controls extrusion thickness
+- **Wall Count** — number of perimeter loops (1–4)
+- **Infill Density** — fraction of interior filled (0.0 = none, 1.0 = solid)
+- **Wall Seam Transitions** — inserts a ruled-surface path between consecutive curved layers to fill the staircase gap on the outer wall (recommended for geodesic and S4 modes)
+
+---
+
+## 5. G-code Export
+
+Under **G-code Settings**:
+
+- **Nozzle Temp / Bed Temp** — printer temperatures
+- **Print Speed / Travel Speed** — mm/s
+- **5-Axis G-code Settings** — set TCP offset (mm from pivot to nozzle tip) and axis format (A/B or B/C) for multi-axis machines
+
+Click **Export G-code** to save. For 5-axis machines, ensure your post-processor or machine controller accepts the `A`/`B` (or `B`/`C`) rotation columns in the G1 moves.
+
+---
+
+## 6. Running Tests
 
 ```bash
-# Run the example slicer
-cargo run --example simple_slicer --release
+# Library tests only — 108 pass, 3 pre-existing failures
+cargo test --lib
 
-# With logging enabled
-RUST_LOG=info cargo run --example simple_slicer --release
+# Run a specific module's tests
+cargo test --lib -- geodesic
+cargo test --lib -- voxel_remesh
 ```
 
-Expected output:
-```
-MultiAxis Slicer v0.1.0
-========================
+> **Note:** `cargo test` without `--lib` will fail. Two example binaries
+> (`simple_slicer.rs`, `slice_benchy.rs`) have a missing struct field
+> (`max_rotation_degrees`) that has not yet been updated. Always use
+> `cargo test --lib`.
 
-Step 1: Loading mesh from "examples/cube.stl"
-  Triangles: 12
-  Dimensions: [20, 20, 20]
-  Volume: 8000.00 mm³
-
-Step 2: Configuring slicer
-  Layer height: 0.2 mm
-  Tolerance: 0.000001
-
-Step 3: Slicing mesh
-  Generated 100 layers
-
-Step 4: Computing centroidal axis
-  Centroids: 100
-  Break links: 0
-
-Step 5: Generating toolpaths
-  Total toolpath moves: 400
-
-Step 6: Generating G-code
-  G-code written to: "output.gcode"
-
-✓ Slicing complete!
-```
-
-## 3. Use in Your Own Code (10 minutes)
-
-Create a new file `my_slicer.rs` in `examples/`:
-
-```rust
-use multiaxis_slicer::*;
-
-fn main() -> Result<()> {
-    // Load your STL file
-    let mesh = Mesh::from_stl("path/to/your/model.stl")?;
-    
-    // Configure slicing
-    let config = slicing::SlicingConfig {
-        layer_height: 0.2,    // 0.2mm layers
-        adaptive: false,       // Uniform layers
-        tolerance: 1e-6,      // Geometric tolerance
-        ..Default::default()
-    };
-    
-    // Slice the mesh
-    let slicer = slicing::Slicer::new(config);
-    let layers = slicer.slice(&mesh)?;
-    
-    println!("Generated {} layers", layers.len());
-    
-    // Optional: Compute centroidal axis
-    let axis = centroidal_axis::CentroidalAxis::compute(&layers, 15.0);
-    
-    // Generate toolpaths
-    let toolpath_gen = toolpath::ToolpathGenerator::new(0.4, 0.2);
-    let toolpaths = toolpath_gen.generate(&layers);
-    
-    // Generate G-code
-    let gcode_gen = gcode::GCodeGenerator::new();
-    gcode_gen.generate(&toolpaths, "my_output.gcode")?;
-    
-    println!("Done! Check my_output.gcode");
-    Ok(())
-}
-```
-
-Run it:
-```bash
-cargo run --example my_slicer --release
-```
-
-## 4. Customize Settings
-
-### Adjust Layer Height
-
-```rust
-let config = slicing::SlicingConfig {
-    layer_height: 0.1,  // Finer layers = better quality
-    ..Default::default()
-};
-```
-
-### Change Nozzle Size
-
-```rust
-let toolpath_gen = toolpath::ToolpathGenerator::new(
-    0.6,  // 0.6mm nozzle
-    0.3   // 0.3mm layer height
-);
-```
-
-### Adjust G-code Settings
-
-```rust
-let gcode_gen = gcode::GCodeGenerator {
-    nozzle_temp: 220.0,      // Temperature for your material
-    bed_temp: 70.0,          // Bed temperature
-    retraction_distance: 5.0, // Retraction in mm
-    ..Default::default()
-};
-```
-
-## 5. Next Steps
-
-### Add Your Algorithms
-
-1. **Ruled Surface Detection**: Edit `src/ruled_surface.rs`
-2. **Singularity Optimization**: Edit `src/singularity.rs`  
-3. **Collision Detection**: Edit `src/collision.rs`
-
-### Integrate with Your Python Code
-
-See `PYTHON_BINDINGS.md` (coming soon) for PyO3 integration.
-
-### Visualize Results
-
-Add visualization using:
-- `kiss3d` for 3D preview
-- Export layers to JSON for web visualization
-- Generate toolpath preview images
-
-## 6. Performance Tuning
-
-### Profile Your Code
-
-```bash
-# Install flamegraph
-cargo install flamegraph
-
-# Profile the slicer
-cargo flamegraph --example simple_slicer
-```
-
-### Optimize Further
-
-```toml
-# In Cargo.toml, add:
-[profile.release]
-opt-level = 3
-lto = "fat"        # Link-time optimization
-codegen-units = 1  # Better optimization
-```
-
-### Use Parallel Processing
-
-The slicer already uses Rayon for parallelism. To control threads:
-
-```bash
-# Use 8 threads
-RAYON_NUM_THREADS=8 cargo run --example simple_slicer --release
-```
+---
 
 ## 7. Common Issues
 
-### "cargo: not found"
+### The GUI window is blank or doesn't open
 
-Install Rust:
+Ensure you are running in **release** mode:
+
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
+cargo run --bin gui --release
 ```
 
-### Compilation errors
+Debug builds of `three-d` (the 3D renderer) are very slow and may appear frozen.
 
-Update Rust:
-```bash
-rustup update
-```
+### S4 slicing falls back to a flat result
 
-### Slow compilation
+The ASAP deformation quality check failed — too many inverted tetrahedra. Try:
+- Lowering **Max Rotation Degrees** (e.g. 25° instead of 35°)
+- Increasing **Smoothing Iterations** to better distribute rotations
 
-Use `--release` flag for faster runtime (compilation takes longer):
-```bash
-cargo build --release
-cargo run --release
-```
+### No layers produced (0 layers after slicing)
+
+- For **Cylindrical/Spherical** modes: the model must span a meaningful radial range. A flat disc with all vertices at the same radius produces no layers.
+- For **Planar/S4**: ensure the model is above Z=0 (bed level). Very thin models may produce 0 layers if the layer height is too large.
+
+### TetGen error / mesh repair message
+
+For complex STL files (e.g. the Stanford Bunny), TetGen rejects self-intersecting faces. The pipeline automatically falls back to **voxel reconstruction** (SDF + Marching Cubes), which produces a clean manifold surface in 2–5 seconds. No action needed — this is normal.
+
+### Example binaries don't compile
+
+`cargo build` or `cargo test` (without `--lib`) compiles the example binaries, which reference an outdated `S3PipelineConfig` struct. This is a known issue. Use `cargo run --bin gui --release` and `cargo test --lib` instead.
+
+---
 
 ## 8. Getting Help
 
-- Read the documentation: `cargo doc --open`
-- Check examples: `examples/`
-- Read the migration guide: `MIGRATION.md`
-- Run tests: `cargo test`
-
-## Summary
-
-```bash
-# Complete workflow:
-cd multiaxis_slicer
-./setup.sh
-cargo run --example simple_slicer --release
-
-# Edit examples/simple_slicer.rs for your needs
-# Build and run your version
-cargo run --example simple_slicer --release
-```
-
-That's it! You now have a working Rust-based slicer that's 50-100x faster than Python.
+- See [KNOWN_ISSUES.md](../KNOWN_ISSUES.md) for a prioritised bug and enhancement list
+- See [TECHNICAL.md](../TECHNICAL.md) for algorithm details and implementation notes
+- Run `cargo doc --open` for inline API documentation

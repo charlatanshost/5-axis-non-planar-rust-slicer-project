@@ -1,273 +1,142 @@
-# MultiAxis Slicer - Project Summary
+# MultiAxis Slicer — Project Summary
 
-## What You Have
+## What This Is
 
-A complete, production-ready Rust foundation for a 5-axis non-planar slicer with:
+A fully-implemented Rust slicer for multi-axis non-planar 3D printing. All major features are complete and working. The GUI runs, slices real STL files, and exports valid G-code.
 
-### ✅ Core Functionality (Working)
-- **Mesh loading** from STL files
-- **Optimal slicing algorithm** O(n log k + k + m) complexity
-- **Hash-based contour building** O(m) complexity
-- **Centroidal axis computation** (100x faster than medial axis)
-- **Toolpath generation** with 5-axis support (A/B rotation)
-- **G-code generation** with proper formatting
-- **Parallel processing** using Rayon
-- **Comprehensive error handling**
+---
 
-### 🚧 Advanced Features (Stubs Ready)
-- **Ruled surface detection** - Algorithm placeholder ready
-- **Singularity optimization** - Structure in place
-- **Collision detection** - Interface defined
+## What's Implemented
+
+### Slicing Modes (7 total)
+
+| Mode | Status | Key Algorithm |
+|---|---|---|
+| Planar | Complete | O(n log k + k + m) plane-intersection slicer |
+| Conical | Complete | Z-shift by r·tan(α), planar slice, inverse shift |
+| S4 Non-Planar | Complete | Z-biased Dijkstra + ASAP deformation + barycentric untransform |
+| S3 Curved Layer | Complete | Quaternion field + volumetric ASAP + marching tetrahedra |
+| Geodesic (Heat Method) | Complete | Cotangent Laplacian, CG solver, 4 diffusion modes, multi-scale |
+| Cylindrical | Complete | (x,y,z) → (θ, z, r) coordinate transform |
+| Spherical | Complete | (x,y,z) → (θ, φ, r) coordinate transform |
+
+### Core Infrastructure
+
+- **Mesh loading** — STL (ASCII and binary), bounds computation, triangle adjacency
+- **Voxel reconstruction** — SDF + Marching Cubes repairs self-intersecting meshes in 2–5 seconds
+- **Tetrahedral mesh generation** — TetGen (via `tritet`) with 4-strategy cascade: direct, voxel reconstruction, vertex clustering, convex hull
+- **Toolpath generation** — wall loops (contour offset), rectilinear infill, adaptive layer height
+- **MeshRayCaster** — 2D bin grid + vertical ray casting; projects wall loop and infill Z onto the actual mesh surface for curved layers
+- **Coverage gap fill** — slope-adaptive scanline insertion fills 3D coverage gaps where infill spacing exceeds 2× nominal on steep surfaces
+- **Wall seam transitions** — ruled-surface zigzag path between consecutive curved layer contours; fills staircase gap on the outer wall
+- **5-axis G-code** — A/B or B/C rotary axis output with TCP (tool-centre-point) compensation
+- **Capsule collision detection** — parry3d capsule vs mesh triangles with AABB pre-filter
+- **Conical floating-contour filter** — 2D per-XY bin grid; defers unsupported contours until the bed below is printed
+- **Support generation** — overhang detection, tree skeleton, support toolpaths (not yet integrated into non-planar GUI flow)
+- **Interactive 3D GUI** — egui sidebar, three-d viewport with layer-height-scaled tube rendering, G-code preview, stats panel
+
+### S4 Non-Planar — Key Details
+
+- **Z-biased Dijkstra** (`tet_dijkstra_field.rs`): edge weight = `|ΔZ| × z_bias + Euclidean × (1 − z_bias)`. Prevents topologically-close features (e.g. two ears of the Stanford Bunny) from merging onto the same layer because they have the same graph path length.
+- **Support-Free Preset**: z_bias=0.85, overhang_threshold=35°, max_rotation_degrees=35°, smoothing_iterations=40, smoothness_weight=0.6
+- **Quality check**: if ASAP deformation produces >30% inverted tets or >5× bounding-box growth, the pipeline silently falls back to VirtualScalarField
+
+### Geodesic Slicing — Diffusion Modes
+
+- **Isotropic** — standard cotangent-weight Laplacian
+- **AdaptiveScalar** — per-face κ(f) = kappa_base × (avg_edge)², clamped [0.05, 50]
+- **Anisotropic** — FEM tensor aligned to local curvature direction, with optional Laplacian smoothing
+- **PrintDirectionBiased** — FEM tensor aligned to a user-specified global direction projected per-face
+- **Multi-scale** — runs at several doubling timesteps and fuses results for fine detail + full coverage
+
+---
+
+## Code Statistics
+
+- **Language**: Rust (stable 1.75+)
+- **Build target**: `cargo run --bin gui --release`
+- **Test count**: 108 passing, 3 pre-existing failures (unrelated to current features)
+- **Key source files**: ~25 `.rs` files in `src/`, ~15 in `src/s3_slicer/`, ~6 in `src/gui/`
+
+---
 
 ## File Structure
 
 ```
-multiaxis_slicer/
-├── Cargo.toml              # Dependencies and build config
-├── README.md               # Main documentation
-├── QUICKSTART.md           # Getting started guide
-├── MIGRATION.md            # Python to Rust migration
-├── setup.sh                # One-command setup script
-├── .gitignore              # Git ignore rules
-│
-├── src/                    # Core library code
-│   ├── lib.rs              # Main entry point
-│   ├── geometry.rs         # Point, Triangle, LineSegment, Contour (810 lines)
-│   ├── mesh.rs             # Mesh loading and manipulation (170 lines)
-│   ├── slicing.rs          # Core slicing algorithm (340 lines)
-│   ├── centroidal_axis.rs  # Fast axis computation (260 lines)
-│   ├── toolpath.rs         # Toolpath generation (130 lines)
-│   ├── gcode.rs            # G-code output (190 lines)
-│   ├── ruled_surface.rs    # Ruled surface detection (stub)
-│   ├── singularity.rs      # Singularity optimization (stub)
-│   └── collision.rs        # Collision detection (stub)
-│
-├── examples/               # Example applications
-│   └── simple_slicer.rs    # Complete working example (180 lines)
-│
-└── tests/                  # Test directory (empty, ready for integration tests)
+files/multiaxis_slicer/
+├── Cargo.toml                   Dependencies (nalgebra, egui, three-d, tritet, parry3d, rayon, sprs)
+├── src/
+│   ├── lib.rs                   Module declarations
+│   ├── geometry.rs              Point3D, Vector3D, Plane, Triangle
+│   ├── mesh.rs                  Mesh, STL I/O
+│   ├── slicing.rs               Planar slicer (Layer, Contour, adaptive height)
+│   ├── toolpath.rs              ToolpathGenerator (walls, infill, mesh Z-projection, transitions)
+│   ├── toolpath_patterns.rs     MeshRayCaster, coverage_gap_fill, infill patterns
+│   ├── contour_offset.rs        2D polygon offset for wall loops
+│   ├── gcode.rs                 G-code with 5-axis TCP compensation, AB/BC axis modes
+│   ├── geodesic.rs              Heat Method, all diffusion modes, multi-scale, marching triangles
+│   ├── conical.rs               Conical pipeline + floating-contour filter
+│   ├── coordinate_transform.rs  Cylindrical + spherical pipelines
+│   ├── ruled_surface.rs         Wall seam transition generation (RuledSurface, resample, align)
+│   ├── centroidal_axis.rs       Fast centroidal axis computation
+│   ├── singularity.rs           Singularity avoidance utilities
+│   ├── collision.rs             Legacy stub (active implementation in motion_planning/)
+│   ├── s3_slicer/
+│   │   ├── pipeline.rs          execute_s3_pipeline, execute_s4_pipeline, execute_tet_pipeline
+│   │   ├── tet_mesh.rs          TetMesh, TetGen integration, 4-strategy cascade
+│   │   ├── voxel_remesh.rs      SDF + Marching Cubes mesh repair
+│   │   ├── tet_asap_deformation.rs  Volumetric ASAP (SVD per-tet)
+│   │   ├── tet_quaternion_field.rs  Per-tet quaternion optimization
+│   │   ├── tet_dijkstra_field.rs    Z-biased multi-source Dijkstra
+│   │   ├── s4_rotation_field.rs     Overhang-based rotation field, SLERP smoothing
+│   │   ├── tet_point_location.rs    Spatial bin grid + barycentric coordinates
+│   │   ├── marching_tet.rs      Marching tetrahedra isosurface extraction
+│   │   ├── tet_scalar_field.rs  Per-vertex scalar field, Laplacian smoothing
+│   │   └── isotropic_remesh.rs  Legacy isotropic remeshing (no longer active path)
+│   ├── motion_planning/
+│   │   └── collision.rs         check_collision_with_mesh() — capsule vs triangles (parry3d)
+│   ├── support_generation/
+│   │   ├── overhang_detection.rs
+│   │   ├── tree_skeleton.rs
+│   │   └── support_toolpath.rs
+│   └── gui/
+│       ├── app.rs               SlicerApp, background slicing threads, mesh preview
+│       ├── control_panel.rs     All parameter controls (all 7 modes + toolpath + G-code)
+│       ├── viewport_3d.rs       3D rendering (tube mesh per layer)
+│       └── stats_panel.rs       Slicing statistics display
+└── src/bin/
+    ├── gui.rs                   Entry point for cargo run --bin gui
+    ├── simple_slicer.rs         Example (currently does not compile — missing struct field)
+    └── slice_benchy.rs          Example (currently does not compile — missing struct field)
 ```
 
-## Code Statistics
+---
 
-- **Total Rust code**: ~2,100 lines
-- **Fully implemented modules**: 7
-- **Stub modules ready for expansion**: 3
-- **Working tests**: 12
-- **Dependencies**: 15 carefully chosen libraries
+## Known Limitations
 
-## Performance Expectations
+See [KNOWN_ISSUES.md](../KNOWN_ISSUES.md) for the full prioritised list. Key items:
 
-Compared to your Python version:
+- Example binaries (`simple_slicer.rs`, `slice_benchy.rs`) need one struct field added before they compile
+- S4 deep undercuts (>55°) may not be fully corrected even with the support-free preset
+- Wall seam transitions produce artifacts on layers with multiple separate contour islands
+- Branch-cut seam artifact at θ = ±π in cylindrical and spherical modes
+- Support generation is not yet wired into the non-planar slicing modes in the GUI
 
-| Operation | Python | Rust | Speedup |
-|-----------|--------|------|---------|
-| Load 10MB STL | 500ms | 50ms | 10x |
-| Slice 100k triangles | 5000ms | 100ms | 50x |
-| Build contours | 1000ms | 15ms | 67x |
-| Centroidal axis | 3000ms | 30ms | 100x |
-| **Total pipeline** | **~10s** | **~0.2s** | **50x** |
+---
 
-## What's Implemented vs What's Not
+## Dependencies
 
-### ✅ Fully Implemented
-1. **Mesh loading** - STL support with bounds computation
-2. **Geometric primitives** - Point, Vector, Triangle, Plane, LineSegment, Contour
-3. **Triangle-plane intersection** - Efficient intersection testing
-4. **Slicing algorithm** - O(n log k + k + m) from Paper 1
-5. **Contour building** - Hash-based O(m) algorithm
-6. **Centroidal axis** - Fast computation from Paper 2
-7. **Break link detection** - Identifies C1 discontinuities
-8. **Component decomposition** - Splits at break points
-9. **Toolpath generation** - Basic generation with extrusion calculation
-10. **G-code output** - Complete with header/footer, 5-axis support
-11. **Parallel processing** - Multi-threaded slicing with Rayon
-12. **Error handling** - Comprehensive error types and Result types
+| Crate | License | Purpose |
+|---|---|---|
+| `nalgebra` | Apache-2.0/MIT | Linear algebra, quaternions, SVD |
+| `tritet` (optional) | AGPL-3.0 | TetGen wrapper — Delaunay tetrahedralization |
+| `sprs` | Apache-2.0/MIT | Sparse matrix storage and arithmetic |
+| `rayon` | Apache-2.0/MIT | Parallel iteration |
+| `parry3d` | Apache-2.0 | Collision detection |
+| `eframe`/`egui` | Apache-2.0/MIT | GUI framework |
+| `three-d` | MIT | 3D viewport rendering |
+| `stl_io` | MIT | STL file parsing |
+| `crossbeam` | Apache-2.0/MIT | Background thread channels |
+| `rfd` | MIT | Native file dialogs |
 
-### 🚧 Stub (Ready to Implement)
-1. **Ruled surface detection** - Your existing Python algorithm can be ported
-2. **Singularity optimization** - Based on MultiAxis_3DP_MotionPlanning paper
-3. **Collision detection** - Head vs platform, head vs printed material
-4. **Graph search** - For collision-free path planning
-5. **Adaptive layer heights** - Framework in place, needs algorithm
-6. **Infill generation** - Not started
-7. **Support generation** - Not started
-
-## Next Steps Priority
-
-### Phase 1: Port Your Existing Algorithms (1-2 weeks)
-1. **Ruled surface detection** → `src/ruled_surface.rs`
-   - Port your Python algorithm
-   - Add KD-tree spatial indexing
-   - Implement sync line generation
-
-2. **Test with real models**
-   - Add your test STL files
-   - Compare output with Python version
-   - Benchmark performance
-
-### Phase 2: Add Motion Planning (2-3 weeks)
-1. **Singularity optimization** → `src/singularity.rs`
-   - Port MultiAxis_3DP_MotionPlanning algorithms
-   - Implement IK solution switching
-   - Add graph-based optimization
-
-2. **Collision detection** → `src/collision.rs`
-   - Implement head-platform collision
-   - Add head-model collision
-   - Integrate with parry3d for efficient queries
-
-### Phase 3: Integration & Testing (1-2 weeks)
-1. Create comprehensive test suite
-2. Add visualization (optional: kiss3d or export to JSON)
-3. Optimize performance (profiling with flamegraph)
-4. Write documentation
-
-### Phase 4: Optional Enhancements
-1. Python bindings with PyO3
-2. Web interface with WASM
-3. GUI with egui or Bevy
-4. Cloud rendering support
-
-## How to Get Started
-
-### Option 1: Quick Test (5 minutes)
-```bash
-cd multiaxis_slicer
-./setup.sh
-cargo run --example simple_slicer --release
-```
-
-### Option 2: Port Your Code (Start Now)
-```bash
-# 1. Copy your Python ruled surface code
-# 2. Open src/ruled_surface.rs
-# 3. Start translating, referring to MIGRATION.md
-# 4. Test as you go: cargo test
-
-# Example workflow:
-vim src/ruled_surface.rs
-cargo test ruled_surface
-cargo run --example simple_slicer --release
-```
-
-### Option 3: Integrate Existing Work
-```bash
-# 1. Add your STL test files to examples/
-# 2. Modify examples/simple_slicer.rs to use your files
-# 3. Compare results with your Python version
-```
-
-## Key Design Decisions
-
-### Why These Libraries?
-- **nalgebra**: Industry-standard linear algebra, used in robotics
-- **parry3d**: Fast collision detection, well-maintained
-- **rayon**: Easy data parallelism, zero overhead
-- **stl_io**: Simple, reliable STL parsing
-- **serde**: Universal serialization (JSON, TOML, etc.)
-
-### Why This Architecture?
-- **Modular**: Each algorithm in its own file
-- **Testable**: Pure functions, easy to unit test
-- **Extensible**: Stub files show where to add features
-- **Fast**: Zero-cost abstractions, compiled to native code
-
-### Why Stubs?
-- Shows you *exactly* where to add your algorithms
-- Provides correct type signatures
-- Lets you implement incrementally
-- Doesn't break the build
-
-## Common Questions
-
-**Q: Can I still use Python for some parts?**
-A: Yes! Use PyO3 to create Python bindings. Keep Python for:
-- Visualization (matplotlib)
-- Analysis (Jupyter notebooks)
-- Rapid prototyping
-
-**Q: How do I debug Rust code?**
-A: Use `println!` or `dbg!` macros, or set up VSCode with rust-analyzer.
-
-**Q: What if I get stuck?**
-A: 
-1. Check MIGRATION.md for Python→Rust patterns
-2. Read the inline documentation: `cargo doc --open`
-3. Look at the tests for examples
-4. The Rust Book is excellent: doc.rust-lang.org/book
-
-**Q: Is this production-ready?**
-A: The implemented parts are solid. Add your algorithms and it will be!
-
-## Testing Strategy
-
-```bash
-# Run all tests
-cargo test
-
-# Run specific test
-cargo test test_triangle_plane_intersection
-
-# Run with output
-cargo test -- --nocapture
-
-# Run benchmarks (when you add them)
-cargo bench
-```
-
-Add tests as you implement features:
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_my_feature() {
-        // Your test here
-        assert_eq!(result, expected);
-    }
-}
-```
-
-## Deployment
-
-### As a Library
-```toml
-# Other projects can use it:
-[dependencies]
-multiaxis_slicer = { path = "../multiaxis_slicer" }
-```
-
-### As a CLI Tool
-```bash
-cargo install --path .
-multiaxis_slicer input.stl output.gcode
-```
-
-### As Python Module
-```bash
-# With PyO3 bindings (see MIGRATION.md)
-pip install maturin
-maturin develop
-python -c "import multiaxis_slicer; print(multiaxis_slicer.__version__)"
-```
-
-## Summary
-
-You have a **complete, working foundation** that's 50x faster than Python. 
-
-The hard work (optimal algorithms, parallel processing, error handling) is done.
-
-Now you just need to:
-1. Port your ruled surface algorithm
-2. Add singularity optimization
-3. Add collision detection
-4. Test with real models
-
-Everything else (mesh loading, slicing, toolpaths, G-code) **already works**.
-
-**Time to first working slicer: ~1 hour** (just run the example!)
-**Time to full 5-axis non-planar slicer: ~2-4 weeks** (adding your algorithms)
-
-Good luck! 🦀
+> TetGen (`tritet`) is AGPL-3.0. Build with `--no-default-features` to disable it and use the grid-based fallback instead.

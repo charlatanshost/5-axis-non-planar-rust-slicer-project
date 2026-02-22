@@ -1,149 +1,146 @@
 # MultiAxis Slicer
 
-High-performance multi-axis non-planar 3D printing slicer written in Rust with egui GUI.
+High-performance multi-axis non-planar 3D printing slicer written in Rust with an interactive egui GUI.
 
-## Features
+## Slicing Modes
 
-### Slicing Modes
-- **Planar (Traditional)** - Fast flat-layer slicing at constant Z height
-- **Conical (RotBot)** - Cone-based Z-shift for radially symmetric overhangs
-- **S4 Non-Planar** - Deform mesh via Dijkstra distance field, planar slice, un-deform toolpaths
-- **S3 Curved Layer** - Full quaternion field optimization with multiple deformation methods (TetVolumetric, ASAP, Virtual Scalar Field)
-- **Geodesic (Heat Method)** - Layers follow surface curvature via geodesic distance field (Crane et al. 2013)
+| Mode | Description |
+|---|---|
+| **Planar** | Traditional flat-layer slicing. Fast baseline. |
+| **Conical** | Cone-shifted Z for radially symmetric overhangs (RotBot-style). |
+| **S4 Non-Planar** | Z-biased Dijkstra distance field → mesh deformation → planar slice → barycentric untransform. One-click Support-Free Preset (35° overhang, 35° max rotation, z_bias 0.85). |
+| **S3 Curved Layer** | Full S3-Slicer pipeline: quaternion field + volumetric ASAP deformation + marching tetrahedra. |
+| **Geodesic (Heat Method)** | Layers follow geodesic distance from a source boundary. Four diffusion modes: isotropic, adaptive scalar, anisotropic, print-direction biased. |
+| **Cylindrical** | Coordinate transform to cylindrical space — layers are concentric radial shells. |
+| **Spherical** | Coordinate transform to spherical space — layers are concentric spherical shells. |
 
-### Core Capabilities
-- Fast mesh slicing - O(n log k + k + m) algorithm
-- 5-axis toolpath generation with tool orientation
-- G-code generation for multi-axis CNC/3D printers
-- Wall loops (perimeters) and rectilinear infill
-- Centroidal axis computation (100x faster than medial axis)
-- Interactive egui GUI with 3D viewport
-- Parallel processing with Rayon
+## Key Features
 
-### Non-Planar Pipeline (S3/S4)
-- Volumetric tetrahedral mesh generation (TetGen or grid-based)
-- Per-tet quaternion field optimization
-- ASAP deformation with SVD-based scaling
-- Voxel reconstruction for self-intersecting STL files (SDF + Marching Cubes)
-- Barycentric untransform for original mesh topology preservation
-
-### Geodesic Slicing (NEW)
-- Heat Method distance field computation on mesh surface
-- Cotangent Laplacian + Conjugate Gradient sparse solver
-- Two source modes: bottom boundary (auto-detect) or point source
-- Marching triangles level-set extraction
-- Layers naturally conform to surface curvature
+- **Voxel reconstruction** — SDF + Marching Cubes repairs self-intersecting STL files in 2–5 seconds
+- **S4 Z-biased Dijkstra** — edge weights blend `|ΔZ|` and Euclidean distance so the distance field tracks actual print height; prevents topologically-close features (e.g. bunny ears) from merging onto the same layer
+- **Support-Free Preset** — one-click configuration for complex organic models (35° overhang / 35° max rotation / z_bias 0.85)
+- **Adaptive layer height** — per-layer height set by local surface slope; viewport tube diameter scales to match
+- **Multi-scale geodesic** — heat diffusion at several doubling timesteps, fused for fine detail + full coverage
+- **Anisotropic geodesic diffusion** — curvature-aligned, print-direction biased, or custom vector field modes
+- **Mesh-mapped gap filling** — `MeshRayCaster` projects infill and wall loop Z onto the actual surface; slope-adaptive scanline insertion fills 3D coverage gaps on steep curved surfaces
+- **Wall seam transitions** — optional ruled-surface zigzag paths between consecutive curved layers
+- **5-axis G-code** — A/B or B/C rotary axes with TCP (tool-centre-point) compensation
+- **Capsule-vs-mesh collision detection** — parry3d capsule tested against every triangle with AABB pre-filter
+- **Conical floating-contour filter** — 2D bin grid defers unsupported contours until the print surface below has been deposited
+- **Interactive 3D GUI** — egui sidebar with live parameter controls, three-d viewport, G-code preview panel
+- **Parallel processing** — Rayon used throughout slicing and field computation
+- **108 unit tests** passing (3 pre-existing failures unrelated to current work)
 
 ## Quick Start
 
-### Prerequisites
-
-```bash
-# Install Rust (if not already installed)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-### Build & Run
+**Requirements:** Rust stable 1.75+, a C++ compiler (for TetGen)
 
 ```bash
 cd files/multiaxis_slicer
 
-# Build release version
-cargo build --release
+# Run the GUI (release mode strongly recommended)
+cargo run --bin gui --release
 
-# Run the GUI application
-cargo run --release
-
-# Run tests (skip examples with pre-existing compile issues)
+# Run tests
 cargo test --lib
 ```
+
+The GUI opens with a 3D viewport. Use **File → Load STL** to open a mesh, choose a slicing mode from the left panel, configure parameters, then click **Slice**.
 
 ## Architecture
 
 ```
-multiaxis_slicer/src/
-├── lib.rs                  # Module declarations and re-exports
-├── geometry.rs             # Point3D, Vector3D, Triangle, Contour, Plane
-├── mesh.rs                 # Mesh struct, STL I/O
-├── slicing.rs              # Planar slicer (Layer, Contour extraction)
-├── toolpath.rs             # ToolpathGenerator (walls, infill, extrusion)
-├── toolpath_patterns.rs    # Spiral, Zigzag, Contour, infill patterns
-├── contour_offset.rs       # 2D polygon offset for wall loops
-├── geodesic.rs             # Geodesic slicing (Heat Method + level sets)
-├── conical.rs              # Conical slicing pipeline
-├── gcode.rs                # G-code output
-├── centroidal_axis.rs      # Centroidal axis computation
-├── collision.rs            # Collision detection
-├── ruled_surface.rs        # Ruled surface detection
-├── singularity.rs          # Singularity optimization
-├── motion_planning.rs      # Path planning
-├── support_generation/     # Support structure generation
-│   ├── mod.rs
+src/
+├── geometry.rs              Point3D, Vector3D, Plane, Triangle
+├── mesh.rs                  Mesh loading, STL I/O
+├── slicing.rs               Core planar slicer
+├── toolpath.rs              Wall loops and infill generation (mesh-mapped Z)
+├── toolpath_patterns.rs     MeshRayCaster, coverage_gap_fill, infill patterns
+├── contour_offset.rs        2D polygon offset for wall loops
+├── gcode.rs                 G-code output with 5-axis TCP compensation
+├── geodesic.rs              Heat Method geodesic slicing (all diffusion modes)
+├── conical.rs               Conical coordinate-transform pipeline
+├── coordinate_transform.rs  Cylindrical and spherical pipelines
+├── ruled_surface.rs         Wall seam transition path generation
+├── centroidal_axis.rs       Centroidal axis computation
+├── singularity.rs           Singularity avoidance (motion planning)
+├── s3_slicer/
+│   ├── pipeline.rs          S3 and S4 pipeline orchestration
+│   ├── tet_mesh.rs          TetMesh — TetGen + grid-based Freudenthal decomposition
+│   ├── voxel_remesh.rs      SDF + Marching Cubes mesh repair
+│   ├── tet_asap_deformation.rs  Volumetric ASAP deformation (SVD)
+│   ├── tet_quaternion_field.rs  Per-tet quaternion field optimization
+│   ├── tet_dijkstra_field.rs    Multi-source Z-biased Dijkstra for S4
+│   ├── s4_rotation_field.rs     Overhang-based rotation field for S4
+│   ├── marching_tet.rs      Isosurface extraction via marching tetrahedra
+│   └── tet_point_location.rs   Spatial bin grid + barycentric coordinates
+├── motion_planning/
+│   └── collision.rs         Capsule-vs-mesh collision detection (parry3d)
+├── support_generation/
 │   ├── overhang_detection.rs
-│   └── tree_skeleton.rs
-├── s3_slicer/              # S3/S4 non-planar pipeline
-│   ├── mod.rs
-│   ├── pipeline.rs         # Main pipelines (S3, S4, Tet)
-│   ├── quaternion_field.rs # Per-triangle quaternion optimization
-│   ├── tet_mesh.rs         # TetMesh (TetGen + grid-based)
-│   ├── tet_quaternion_field.rs
-│   ├── tet_asap_deformation.rs
-│   ├── tet_scalar_field.rs
-│   ├── tet_dijkstra_field.rs
-│   ├── s4_rotation_field.rs
-│   ├── tet_point_location.rs
-│   ├── marching_tet.rs
-│   ├── voxel_remesh.rs     # SDF + Marching Cubes mesh repair
-│   └── ...
+│   ├── tree_skeleton.rs
+│   └── support_toolpath.rs
 └── gui/
-    ├── app.rs              # SlicerApp state, slicing dispatch
-    ├── control_panel.rs    # UI for all slicing modes
-    ├── viewport_3d.rs      # 3D visualization
-    └── theme.rs            # Visual theme
+    ├── app.rs               Application state, background slicing threads
+    ├── control_panel.rs     Full parameter UI for all modes
+    ├── viewport_3d.rs       3D rendering (three-d)
+    └── stats_panel.rs       Slicing statistics
 ```
 
-## Slicing Pipeline Overview
+## Pipeline Overviews
 
 ```
-Load STL → Select Mode → Mode-specific pipeline → Vec<Layer> → Toolpath → G-code
-
-Planar:    Flat planes at constant Z
-Conical:   Z-shift by r·tan(angle) → Planar slice → Reverse shift
-S4:        TetMesh → Dijkstra → Rotations → Deform → Slice → Untransform
-S3:        Quaternion field → Deformation method → Isosurface extraction
-Geodesic:  Build topology → Cotangent Laplacian → Heat Method → Level sets
+Planar:      Flat planes at constant Z
+Conical:     Z-shift by r·tan(angle) → planar slice → reverse shift
+S4:          TetMesh → Z-biased Dijkstra → overhang rotations → ASAP deform → slice → bary untransform
+S3:          TetMesh → quaternion field → ASAP deform → scalar field → marching tets
+Geodesic:    Cotangent Laplacian → heat diffusion → gradient normalize → Poisson → level sets
+Cylindrical: (x,y,z) → (θ, z, r) → planar slice → inverse transform
+Spherical:   (x,y,z) → (θ, φ, r) → planar slice → inverse transform
 ```
 
 ## Testing
 
 ```bash
-# Run library tests (93 pass, 3 pre-existing failures)
+# Run all library tests (108 pass, 3 pre-existing failures)
 cargo test --lib
 
-# Run specific module tests
-cargo test --lib geodesic
-cargo test --lib contour_offset
-cargo test --lib toolpath
+# Run specific module
+cargo test --lib -- geodesic
+cargo test --lib -- voxel_remesh
+cargo test --lib -- collision
 ```
 
-## Dependencies
+Note: `cargo test` without `--lib` fails because two example binaries (`simple_slicer.rs`,
+`slice_benchy.rs`) need a missing `max_rotation_degrees` field added to their config structs.
+Use `cargo test --lib` until that is fixed.
 
-- **nalgebra** 0.32 - Linear algebra (vectors, matrices, quaternions)
-- **nalgebra-sparse** 0.9 - Sparse matrix support
-- **egui/eframe** - Immediate-mode GUI framework
-- **three-d** - 3D rendering
-- **rayon** 1.8 - Parallel processing
-- **sprs** 0.11 - Sparse matrices
-- **tritet** 3.1 (optional) - TetGen integration (AGPL, `tetgen` feature flag)
+## Key Dependencies
+
+| Crate | Purpose |
+|---|---|
+| `nalgebra` 0.32 | Linear algebra, quaternions, SVD, sparse matrices |
+| `tritet` 3.1 (optional) | TetGen wrapper — constrained Delaunay tetrahedralization |
+| `sprs` 0.11 | Sparse matrix storage and arithmetic (Laplacian systems) |
+| `rayon` 1.8 | Data-parallel iteration |
+| `parry3d` 0.13 | Collision detection — capsule vs triangle |
+| `eframe`/`egui` | Immediate-mode GUI |
+| `three-d` | 3D viewport rendering |
+| `stl_io` | STL file parsing |
+
+> **TetGen note:** `tritet` is AGPL-3.0 licensed. Disable with `--no-default-features` to use the grid-based fallback tetrahedralization instead.
 
 ## References
 
-1. "An Optimal Algorithm for 3D Triangle Mesh Slicing"
-2. "Support-Free Volume Printing by Multi-Axis Motion" (TOG 2020) - S3-Slicer
-3. "S4-Slicer" (jyjblrd) - Deform/slice/untransform approach
-4. "The Heat Method for Distance Computation" (Crane et al. 2013) - Geodesic slicing
-5. "Singularity-Aware Motion Planning for Multi-Axis Additive Manufacturing" (RAL 2021)
+1. "S3-Slicer: A General Slicing Framework for Multi-Axis 3D Printing" — Zhang et al., SIGGRAPH Asia 2022
+2. "Geodesics in Heat" — Crane, Weischedel, Wardetzky, ACM TOG 2013
+3. "An Optimal Algorithm for 3D Triangle Mesh Slicing" — Minetto, Volpato et al., CAD 2017
+4. "Support-Free Volume Printing by Multi-Axis Motion" — Xu et al., ACM TOG 2020
+5. "TetGen: A Delaunay-Based Quality Tetrahedral Mesh Generator" — Hang Si, ACM TOMS 2015
+6. "A Remeshing Approach to Multiresolution Modeling" — Botsch & Kobbelt, SGP 2004
+7. "Singularity-Aware Motion Planning for Multi-Axis Additive Manufacturing" — RAL 2021
+8. "S4-Slicer" — jyjblrd (deform/slice/untransform approach)
 
 ## License
 
-GNU General Public License v3 - See LICENSE file for details
+GNU General Public License v3 — see [LICENSE](../../LICENSE).
