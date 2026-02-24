@@ -511,8 +511,28 @@ Optional: when `wall_seam_transitions` is enabled and the layer has curved Z, ge
 
 Algorithm: resample both contours to the same N points (N ≤ 256), find the minimum-rotation alignment offset by minimising total point-to-point distance, then generate a single-pass transition path: C_n[0]→C_{n+1}[0], C_n[1]→C_{n+1}[1], etc.
 
-### 5-Axis Orientation
-For non-planar layers, each toolpath point carries a 3D orientation vector (the local surface normal, pointing away from the surface). The G-code generator converts this to A/B rotation angles.
+### Surface Normal Orientations (`apply_surface_normal_orientations` in `app.rs`)
+After toolpaths are generated for any slicing mode (except Conical which uses the analytical formula below), each segment's rotary-axis direction is set from the nearest mesh face normal.
+
+**Algorithm:**
+1. Build a 48×48 XY bin grid over all mesh triangles (keyed by triangle centroid XY).
+2. For each toolpath segment at XY position `(sx, sy)`, find the bin cell and expand outward (ring 0–4) until a triangle is found.
+3. Among all triangles within the found ring, pick the one with the minimum centroid distance.
+4. Use that triangle's face normal as the orientation vector (enforcing upper hemisphere: if `nz < 0`, flip sign).
+5. Clamp tilt: if `acos(nz) > max_tilt_rad`, scale XY by `sin(max_tilt)/|n.xy|`, set `nz = cos(max_tilt)`.
+
+**Conical mode** uses an analytical formula instead:
+```
+Outward cone (sign = -1):
+  n = (-sin(α)·dx/r,  -sin(α)·dy/r,  cos(α))
+
+Inward cone (sign = +1):
+  n = (+sin(α)·dx/r,  +sin(α)·dy/r,  cos(α))
+```
+where α is the cone angle, r = sqrt(dx²+dy²), and (dx, dy) = point center relative to cone axis.
+
+### Travel Z-Lift (`apply_travel_lifts` in `app.rs`)
+For travel moves (extrusion ≈ 0) with XY distance ≥ 1 mm, the destination Z is raised to `max(Z, last_extrude_z + lift)`. Default lift = 2 mm, configurable in the "Rotary Axes & Collision Avoidance" panel. Note: the current implementation raises the destination point Z; it does not insert an explicit Z-only departure move.
 
 ---
 
@@ -590,13 +610,29 @@ Supports are sliced the same as the main object (planar by default) and given a 
 Slicing runs on a background thread to keep the UI responsive. Launched via `std::thread::spawn` in `app.rs`. Results are sent back on a `crossbeam::channel`. The main thread polls the channel each frame and updates the viewport when results arrive.
 
 ### State (`app.rs`)
-`SlicerApp` holds all UI state: loaded mesh, slice results, all parameter values for every mode. Parameters are plain `f64`/`u8`/`bool` fields — no trait objects or dynamic dispatch.
+`SlicerApp` holds all UI state: loaded mesh, slice results, all parameter values for every mode, printer profiles list, and machine simulation state. Parameters are plain `f64`/`u8`/`bool` fields — no trait objects or dynamic dispatch.
+
+### Printer Profiles (`app.rs` + `printer_profiles_page.rs`)
+Each `PrinterProfile` stores axis configuration, TCP offset, nozzle geometry, bed/head dimensions, and optional STL override paths. Profiles are serialized to JSON and stored in eframe's key-value storage (`storage.get_string` / `storage.set_string`) so they persist across sessions.
+
+On startup `new()` loads profiles from storage and calls `apply_active_profile()` to wire the active profile into the main state. On shutdown `save()` writes profiles back.
+
+The Printer Profiles page (`printer_profiles_page.rs`) provides: profile list with add/delete/rename, axis configuration, TCP offset, nozzle length, and a "Machine Simulation" collapsible with bed/head dims, STL file pickers, and STL tip offset controls.
 
 ### Control Panel (`control_panel.rs`)
-Immediate-mode egui: every frame, the panel redraws all controls. Conditional sections (e.g., geodesic diffusion mode options) are shown/hidden using `if app.geodesic_diffusion_mode == N { ... }` — no retained widget state.
+Immediate-mode egui: every frame, the panel redraws all controls. Conditional sections (e.g., geodesic diffusion mode options) are shown/hidden using `if app.geodesic_diffusion_mode == N { ... }` — no retained widget state. A "Rotary Axes & Collision Avoidance" collapsible at the bottom controls `use_surface_normals` and `travel_z_lift`.
 
 ### 3D Viewport (`viewport_3d.rs`)
-three-d renders the mesh and toolpath preview. The mesh is uploaded as a vertex buffer once on load. Layer contours are rendered as line strips. Camera is orbit-controlled (mouse drag to rotate, scroll to zoom).
+three-d renders the mesh, toolpath preview, and machine geometry. The mesh is uploaded as a vertex buffer once on load. Layer contours are rendered as tube meshes scaled to per-layer height. Camera is orbit-controlled (mouse drag to rotate, scroll to zoom).
+
+**Machine simulation rendering:**
+- `machine_head_gm` and `machine_bed_gm` are rebuilt when the profile hash (`machine_profile_sig`) changes.
+- Head geometry: box (head body) + cylinder (nozzle) + UV sphere (gold tip sphere at nozzle contact point).
+- Bed geometry: flat box.
+- STL overrides: loaded via `load_stl_cpu_mesh()`, replacing the parametric shapes.
+- STL tip offset: `world_origin = seg_pos - R_head × tip_local` — pins the user-specified local point to the nozzle contact world position.
+- Per-frame transform: axis angles are computed from `compute_segment_axis_angles()`, split into head and bed rotations, and applied as `Mat4` transforms.
+- Viewport renders machine geometry even when no mesh is loaded (gate checks `has_machine || has_mesh`).
 
 ### Theme (`theme.rs`)
 Dark theme with custom accent colors applied to egui's `Visuals`.
@@ -636,10 +672,11 @@ Dark theme with custom accent colors applied to egui's `Visuals`.
 | `motion_planning::graph_search` | `motion_planning/graph_search.rs` | Graph-based path planning |
 | `support_generation::overhang_detection` | `support_generation/overhang_detection.rs` | Overhang angle classification |
 | `support_generation::tree_skeleton` | `support_generation/tree_skeleton.rs` | Tree support structure generation |
-| `gui::app` | `gui/app.rs` | `SlicerApp`, background thread dispatch |
-| `gui::control_panel` | `gui/control_panel.rs` | Full sidebar UI |
-| `gui::viewport_3d` | `gui/viewport_3d.rs` | three-d 3D rendering |
-| `gui::stats_panel` | `gui/stats_panel.rs` | Slicing statistics display |
+| `gui::app` | `gui/app.rs` | `SlicerApp`, background thread dispatch, surface normals, travel lift |
+| `gui::control_panel` | `gui/control_panel.rs` | Full sidebar UI + rotary axes & collision avoidance |
+| `gui::printer_profiles_page` | `gui/printer_profiles_page.rs` | Printer profile editor, machine simulation settings |
+| `gui::viewport_3d` | `gui/viewport_3d.rs` | three-d 3D rendering, machine simulation, kinematic transforms |
+| `gui::stats_panel` | `gui/stats_panel.rs` | Slicing statistics + collision count display |
 | `gui::gcode_panel` | `gui/gcode_panel.rs` | G-code text preview |
 
 ---
@@ -648,7 +685,7 @@ Dark theme with custom accent colors applied to egui's `Visuals`.
 
 Run with: `cargo test --lib`
 
-**Passing: 108** (3 pre-existing failures unrelated to current work)
+**Passing: 113** (3 pre-existing failures unrelated to current work)
 
 | Module | Tests |
 |---|---|

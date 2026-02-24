@@ -7,7 +7,7 @@ High-performance multi-axis non-planar 3D printing slicer written in Rust with a
 | Mode | Description |
 |---|---|
 | **Planar** | Traditional flat-layer slicing. Fast baseline. |
-| **Conical** | Cone-shifted Z for radially symmetric overhangs (RotBot-style). |
+| **Conical** | Cone-shifted Z for radially symmetric overhangs (RotBot-style). Axis tilt assigned analytically from cone-surface normal. |
 | **S4 Non-Planar** | Z-biased Dijkstra distance field → mesh deformation → planar slice → barycentric untransform. One-click Support-Free Preset (35° overhang, 35° max rotation, z_bias 0.85). |
 | **S3 Curved Layer** | Full S3-Slicer pipeline: quaternion field + volumetric ASAP deformation + marching tetrahedra. |
 | **Geodesic (Heat Method)** | Layers follow geodesic distance from a source boundary. Four diffusion modes: isotropic, adaptive scalar, anisotropic, print-direction biased. |
@@ -16,6 +16,12 @@ High-performance multi-axis non-planar 3D printing slicer written in Rust with a
 
 ## Key Features
 
+- **Printer profiles** — named machine profiles persist across sessions (eframe key-value storage); each profile stores axis limits, TCP offset, nozzle geometry, bed/head dimensions, and optional STL overrides; loaded and applied automatically on startup
+- **Machine simulation** — bed and printhead rendered in the 3D viewport using parametric boxes/cylinders or custom STL files; geometry updates live as the toolpath playback scrubber moves; nozzle tip marked with a gold sphere; viewport renders even before a mesh is loaded
+- **STL head/bed geometry** — override box shapes with any STL file; per-STL "tip offset" pins the model's local nozzle contact point to the segment world position
+- **Surface normal orientations** — for all slicing modes a 48×48 XY bin grid finds the nearest mesh face; the face normal becomes the segment's rotary-axis direction, clamped to profile axis limits
+- **Travel Z-lift** — travel moves longer than 1 mm are raised above the last extrusion Z by a configurable clearance (default 2 mm), preventing surface graze during traversal
+- **Conical axis orientations** — analytical tilt from cone-surface normal: n = (−sinα·dx/r, −sinα·dy/r, cosα) for outward cone
 - **Voxel reconstruction** — SDF + Marching Cubes repairs self-intersecting STL files in 2–5 seconds
 - **S4 Z-biased Dijkstra** — edge weights blend `|ΔZ|` and Euclidean distance so the distance field tracks actual print height; prevents topologically-close features (e.g. bunny ears) from merging onto the same layer
 - **Support-Free Preset** — one-click configuration for complex organic models (35° overhang / 35° max rotation / z_bias 0.85)
@@ -29,7 +35,7 @@ High-performance multi-axis non-planar 3D printing slicer written in Rust with a
 - **Conical floating-contour filter** — 2D bin grid defers unsupported contours until the print surface below has been deposited
 - **Interactive 3D GUI** — egui sidebar with live parameter controls, three-d viewport, G-code preview panel
 - **Parallel processing** — Rayon used throughout slicing and field computation
-- **108 unit tests** passing (3 pre-existing failures unrelated to current work)
+- **113 unit tests** passing (3 pre-existing failures unrelated to current work)
 
 ## Quick Start
 
@@ -81,10 +87,11 @@ src/
 │   ├── tree_skeleton.rs
 │   └── support_toolpath.rs
 └── gui/
-    ├── app.rs               Application state, background slicing threads
-    ├── control_panel.rs     Full parameter UI for all modes
-    ├── viewport_3d.rs       3D rendering (three-d)
-    └── stats_panel.rs       Slicing statistics
+    ├── app.rs               Application state, slicing threads, surface normal orientations, travel lift
+    ├── control_panel.rs     Full parameter UI for all modes + Rotary Axes & Collision Avoidance
+    ├── printer_profiles_page.rs  Printer profile editor — axes, TCP, bed/head geometry, STL overrides
+    ├── viewport_3d.rs       3D rendering, machine bed/head, kinematic transforms, collision overlay
+    └── stats_panel.rs       Slicing statistics + collision count
 ```
 
 ## Pipeline Overviews
@@ -102,7 +109,7 @@ Spherical:   (x,y,z) → (θ, φ, r) → planar slice → inverse transform
 ## Testing
 
 ```bash
-# Run all library tests (108 pass, 3 pre-existing failures)
+# Run all library tests (113 pass, 3 pre-existing failures)
 cargo test --lib
 
 # Run specific module

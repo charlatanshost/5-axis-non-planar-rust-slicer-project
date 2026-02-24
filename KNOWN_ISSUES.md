@@ -1,6 +1,6 @@
 # Known Issues, Bugs, and Todo List
 
-Last updated: 2026-02-21
+Last updated: 2026-02-23
 
 ---
 
@@ -65,6 +65,15 @@ None of these were introduced by recent work. All three need fresh test geometry
 **Symptom:** If TetVolumetric ASAP deformation fails quality checks (>30% inverted tets or >5× bounding-box growth), the pipeline silently falls back to VirtualScalarField. The user sees slightly different layers with no warning.
 **Fix:** Set a flag in `S3PipelineResult` (e.g. `used_fallback: bool`) and show a warning banner in the GUI stats panel.
 
+### [BUG] Surface normal orientation near mesh boundary / thin edges
+**Symptom:** The 48×48 XY bin grid lookup for surface normal orientations occasionally misses triangles near the mesh boundary or on very thin features. The expanding-ring search falls back to the last-found normal from a distant face, causing a few segments at the mesh edge to get an incorrect tilt angle.
+**Root cause:** Grid resolution (48×48) is tuned for mid-range meshes. Very large or very elongated models map all triangles into a narrow band of cells, leaving the outer ring mostly empty.
+**Fix:** Scale grid resolution to `sqrt(triangle_count).clamp(32, 128)` instead of the hardcoded 48, or fall back to a linear scan when no bin-neighbours are found within radius 4.
+
+### [BUG] Travel Z-lift doesn't insert explicit lift segments
+**Symptom:** The current travel-lift implementation raises the Z coordinate of the travel destination point but does not insert a separate "lift" move at the departure point. On machines that interpret linear G1 moves literally this means the Z rise happens simultaneously with the XY travel, which may cause a slight graze at the start of the travel.
+**Fix:** Before each lifted travel segment, insert an explicit Z-only move to `last_extrude_z + lift`, then the XY travel, then the contact Z move at arrival.
+
 ---
 
 ## P3 — Minor / Cosmetic
@@ -103,14 +112,27 @@ Currently interior tets (those with no surface boundary face) copy a damped aver
 Voxel reconstruction takes 2–5 seconds with no visible feedback. The GUI shows the last slicing message but does not update during the repair step.
 **Fix:** Break `voxel_remesh()` into stages (SDF, sign, MC) and send progress updates on the channel, or at minimum log a "Voxel reconstruction in progress..." message that appears in the stats panel.
 
+### [ENH] ✅ Printer profiles with persistence — COMPLETE (2026-02-23)
+Named printer profiles now persist across sessions via eframe key-value storage. Each profile stores nozzle geometry, TCP offset, axis limits, bed/head dimensions, and optional STL overrides. Profiles load and apply automatically on startup.
+
+### [ENH] ✅ Machine simulation in viewport — COMPLETE (2026-02-23)
+Bed and printhead are now rendered in the 3D viewport as parametric boxes/cylinders or custom STL files. Geometry updates live as the toolpath playback scrubber moves. Nozzle tip is marked with a gold sphere. Viewport renders even before a mesh is loaded.
+
+### [ENH] ✅ Surface normal orientations for all slicing modes — COMPLETE (2026-02-23)
+A 48×48 XY bin grid assigns each toolpath segment's rotary-axis direction from the nearest mesh face normal. Axis tilt is clamped to the profile's configured limits. Conical mode uses analytical cone-surface normals.
+
+### [ENH] ✅ Travel Z-lift — COMPLETE (2026-02-23)
+Travel moves longer than 1 mm are raised above the last extrusion Z by a configurable clearance (default 2 mm). Exposed in the "Rotary Axes & Collision Avoidance" collapsible in the control panel.
+
 ### [ENH] Machine profile presets
-The Machine Profile section is a free-text name field with manual numeric inputs. Add a dropdown of built-in presets for common 5-axis configurations (e.g. "Generic AB head-tilt", "Rotary table BC", "Robotic arm 6-axis") that fills in nozzle radius, TCP offset, and axis mode automatically.
+The Machine Profile section currently uses individual named profiles saved to disk. Add a dropdown of built-in presets for common 5-axis configurations (e.g. "Generic AB head-tilt", "Rotary table BC", "Robotic arm 6-axis") that fills in nozzle radius, TCP offset, and axis mode automatically.
 
 ### [ENH] Geodesic — multi-scale for CustomVectorField
 Run the Poisson solve twice at different regularisation strengths and fuse the results, analogous to what multi-scale does for the heat step. This would give CustomVectorField the same fine-detail / full-coverage blend as other modes.
 
 ### [ENH] S3 — expose fallback warning in GUI
 When VirtualScalarField fallback is triggered, show a yellow warning banner in the stats panel: "Deformation quality too low — fell back to VirtualScalarField". Currently only logged to console.
+**Note:** Stats panel now shows collision count (red text) when collision segments are present.
 
 ### [ENH] Adaptive layer height — expose min/max height in GUI
 `min_layer_height` and `max_layer_height` are currently hardcoded constants in `slicing.rs`. Expose them as sliders in the control panel so users can tune the range without recompiling.

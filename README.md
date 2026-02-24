@@ -22,7 +22,7 @@ The output is standard G-code extended with A/B rotation axes for 5-axis machine
 | Mode | Description |
 |---|---|
 | **Planar** | Traditional flat-layer slicing. Fast baseline. |
-| **Conical** | Cone-shifted Z for radially symmetric overhangs (RotBot-style). |
+| **Conical** | Cone-shifted Z for radially symmetric overhangs (RotBot-style). Axis tilt assigned analytically from cone-surface normal. |
 | **S4 Non-Planar** | Dijkstra-based mesh deformation → planar slice → barycentric untransform. Z-biased distance field keeps topologically-close features (e.g. two ears of the Stanford Bunny) on separate layers. |
 | **S3 Curved Layer** | Full S3-Slicer pipeline: quaternion field + volumetric ASAP deformation + marching tetrahedra. |
 | **Geodesic (Heat Method)** | Layers follow geodesic distance from a source boundary using the heat method. Multiple diffusion modes: isotropic, adaptive scalar, anisotropic, print-direction biased. |
@@ -33,6 +33,12 @@ The output is standard G-code extended with A/B rotation axes for 5-axis machine
 
 ## Key Features
 
+- **Printer profiles** — named machine profiles persist across sessions; each profile stores nozzle geometry, TCP offset, axis limits, bed/head dimensions, and optional STL overrides; profiles load automatically on startup
+- **Machine simulation** — bed and printhead rendered in the 3D viewport as parametric boxes/cylinders or custom STL files; updates live as the toolpath playback scrubber moves; nozzle tip marked with a gold sphere
+- **STL head/bed geometry** — load any STL file to replace the default box shapes; set a local "tip offset" so the model's nozzle contact point aligns exactly with the toolpath position
+- **Surface normal orientations** — for all slicing modes, each toolpath segment's rotary-axis angle is set from the nearest mesh face normal; axis tilt is clamped to the profile's configured limits
+- **Travel Z-lift** — travel moves longer than 1 mm are raised by a configurable clearance height (default 2 mm) above the last extruded position, avoiding surface collisions during traversal
+- **Conical axis orientations** — in Conical mode the rotary tilt is computed analytically from the cone-surface normal rather than from the mesh surface
 - **Voxel reconstruction** — SDF + Marching Cubes repairs self-intersecting STL files in 2–5 seconds (versus ~28 minutes for isotropic remeshing)
 - **Multi-scale geodesic** — runs heat diffusion at several doubling timesteps and fuses results, giving both fine local detail and full-mesh coverage simultaneously
 - **Anisotropic diffusion** — curvature-aligned, print-direction biased, or custom vector field modes shape how geodesic layers follow the geometry
@@ -43,9 +49,9 @@ The output is standard G-code extended with A/B rotation axes for 5-axis machine
 - **5-axis G-code** — direct output with A/B (or B/C) rotary axes and TCP compensation
 - **Capsule-vs-mesh collision detection** — parry3d capsule shape tested against every triangle with AABB pre-filter
 - **Conical floating-contour filter** — 2D per-XY bin grid tracks maximum printed Z at each location; defers unsupported contours until the print surface below them has been deposited
-- **Interactive 3D GUI** — egui sidebar with live parameter controls, three-d viewport with layer-height-scaled tube rendering, G-code preview panel
+- **Interactive 3D GUI** — egui sidebar with live parameter controls, three-d viewport with layer-height-scaled tube rendering, G-code preview panel; viewport renders machine geometry even without a loaded mesh
 - **Parallel processing** — Rayon used throughout slicing and field computation
-- **108 unit tests** passing (3 pre-existing failures unrelated to current work)
+- **113 unit tests** passing (3 pre-existing failures unrelated to current work)
 
 ---
 
@@ -95,9 +101,10 @@ files/multiaxis_slicer/src/
 │   ├── overhang_detection.rs
 │   └── tree_skeleton.rs
 └── gui/
-    ├── app.rs               Application state, background slicing threads
-    ├── control_panel.rs     Full parameter UI for all modes
-    ├── viewport_3d.rs       3D rendering (three-d)
+    ├── app.rs               Application state, background slicing threads, surface normals, travel lift
+    ├── control_panel.rs     Full parameter UI for all modes + rotary axes & collision avoidance
+    ├── printer_profiles_page.rs  Printer profile editor with machine simulation settings
+    ├── viewport_3d.rs       3D rendering, machine bed/head geometry, collision highlighting
     └── stats_panel.rs       Slicing statistics
 ```
 

@@ -33,7 +33,11 @@ A fully-implemented Rust slicer for multi-axis non-planar 3D printing. All major
 - **Capsule collision detection** — parry3d capsule vs mesh triangles with AABB pre-filter
 - **Conical floating-contour filter** — 2D per-XY bin grid; defers unsupported contours until the bed below is printed
 - **Support generation** — overhang detection, tree skeleton, support toolpaths (not yet integrated into non-planar GUI flow)
-- **Interactive 3D GUI** — egui sidebar, three-d viewport with layer-height-scaled tube rendering, G-code preview, stats panel
+- **Printer profiles** — named machine profiles with persistent storage (eframe key-value); each stores axis limits, TCP offset, nozzle geometry, bed/head dimensions, and optional STL overrides; applied automatically on startup
+- **Machine simulation** — bed and printhead rendered in the 3D viewport as parametric boxes/cylinders or custom STL files; live kinematic updates during toolpath playback; nozzle tip marked with gold sphere
+- **Surface normal orientations** — per-segment rotary axis direction from nearest mesh face normal (48×48 XY bin grid), clamped to profile axis limits; conical mode uses analytical cone-surface normals
+- **Travel Z-lift** — travel moves raised above last extrusion Z by configurable clearance (default 2 mm)
+- **Interactive 3D GUI** — egui sidebar, three-d viewport with layer-height-scaled tube rendering, G-code preview, stats panel; renders machine geometry even without a loaded mesh
 
 ### S4 Non-Planar — Key Details
 
@@ -55,8 +59,8 @@ A fully-implemented Rust slicer for multi-axis non-planar 3D printing. All major
 
 - **Language**: Rust (stable 1.75+)
 - **Build target**: `cargo run --bin gui --release`
-- **Test count**: 108 passing, 3 pre-existing failures (unrelated to current features)
-- **Key source files**: ~25 `.rs` files in `src/`, ~15 in `src/s3_slicer/`, ~6 in `src/gui/`
+- **Test count**: 113 passing, 3 pre-existing failures (unrelated to current features)
+- **Key source files**: ~25 `.rs` files in `src/`, ~15 in `src/s3_slicer/`, ~7 in `src/gui/`
 
 ---
 
@@ -100,10 +104,11 @@ files/multiaxis_slicer/
 │   │   ├── tree_skeleton.rs
 │   │   └── support_toolpath.rs
 │   └── gui/
-│       ├── app.rs               SlicerApp, background slicing threads, mesh preview
-│       ├── control_panel.rs     All parameter controls (all 7 modes + toolpath + G-code)
-│       ├── viewport_3d.rs       3D rendering (tube mesh per layer)
-│       └── stats_panel.rs       Slicing statistics display
+│       ├── app.rs               SlicerApp, slicing threads, surface normals, travel lift
+│       ├── control_panel.rs     All parameter controls (all 7 modes + toolpath + G-code + rotary axes)
+│       ├── printer_profiles_page.rs  Printer profile editor, machine simulation settings
+│       ├── viewport_3d.rs       3D rendering, machine bed/head, kinematic transforms
+│       └── stats_panel.rs       Slicing statistics + collision count display
 └── src/bin/
     ├── gui.rs                   Entry point for cargo run --bin gui
     ├── simple_slicer.rs         Example (currently does not compile — missing struct field)
