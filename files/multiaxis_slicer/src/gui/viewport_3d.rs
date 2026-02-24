@@ -1,6 +1,6 @@
 // 3D visualization viewport with hardware-accelerated rendering using three-d
 
-use crate::gui::app::SlicerApp;
+use crate::gui::app::{SlicerApp, BedShape};
 use crate::Mesh as SlicerMesh;
 use egui;
 use eframe::glow;
@@ -72,6 +72,13 @@ pub struct Viewport3D {
 
     // Face selection
     last_mesh_triangle_count: usize,
+
+    // Machine simulation geometry
+    machine_head_gm: Option<Arc<Gm<Mesh, ColorMaterial>>>,
+    machine_bed_gm: Option<Arc<Gm<Mesh, ColorMaterial>>>,
+    machine_profile_sig: u64,  // simple hash to detect profile or playback changes
+    collision_lines_gm: Option<Arc<Gm<Mesh, ColorMaterial>>>,
+    collision_lines_sig: usize, // collision_segments.len() at last rebuild
 }
 
 impl Viewport3D {
@@ -120,6 +127,12 @@ impl Viewport3D {
             last_section_enabled_for_content: false,
             last_show_travel_moves: true,
             last_mesh_triangle_count: 0,
+
+            machine_head_gm: None,
+            machine_bed_gm: None,
+            machine_profile_sig: u64::MAX,
+            collision_lines_gm: None,
+            collision_lines_sig: usize::MAX,
         }
     }
 
@@ -1230,6 +1243,50 @@ impl Viewport3D {
             self.last_playback_position = usize::MAX;
         }
 
+        // Update machine simulation geometry
+        {
+            let profile_sig = app.profiles.get(app.active_profile_index)
+                .map(|p| {
+                    let show = p.show_machine as u64;
+                    let bdims = ((p.bed_dims[0] as u32) as u64) << 32
+                              | ((p.bed_dims[1] as u32) as u64) << 16
+                              | (p.bed_dims[2] as u32) as u64;
+                    let hdims = ((p.head_dims[0] as u32) as u64) << 32
+                              | ((p.head_dims[1] as u32) as u64) << 16
+                              | (p.head_dims[2] as u32) as u64;
+                    let stl_h = p.bed_stl_path.as_ref()
+                        .map(|s| s.bytes().fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(b as u64)))
+                        .unwrap_or(0)
+                        ^ p.head_stl_path.as_ref()
+                        .map(|s| s.bytes().fold(0u64, |a, b| a.wrapping_mul(37).wrapping_add(b as u64)))
+                        .unwrap_or(0);
+                    let shape_h = match p.bed_shape { BedShape::Rectangle => 0u64, BedShape::Circle => 1 };
+                    let grid_z_h = self.mesh_bounds.map(|(mn, _)| (mn[2] * 100.0) as u64).unwrap_or(0);
+                    let nozzle_h = ((p.nozzle_radius * 10.0) as u64)
+                        ^ (((p.nozzle_length * 10.0) as u64) << 20)
+                        ^ (((p.head_stl_tip_offset[0] * 10.0) as u64).wrapping_mul(1000003))
+                        ^ (((p.head_stl_tip_offset[1] * 10.0) as u64).wrapping_mul(999983))
+                        ^ (((p.head_stl_tip_offset[2] * 10.0) as u64).wrapping_mul(999979));
+                    show ^ bdims.wrapping_add(hdims)
+                        ^ (app.toolpath_playback_position as u64)
+                        ^ (app.active_profile_index as u64) << 48
+                        ^ stl_h ^ (shape_h << 56) ^ (grid_z_h << 16) ^ nozzle_h
+                })
+                .unwrap_or(0);
+
+            if profile_sig != self.machine_profile_sig {
+                self.update_machine_geometry(app);
+                self.machine_profile_sig = profile_sig;
+            }
+
+            // Collision overlay: rebuild when collision_segments changes
+            let col_sig = app.collision_segments.len();
+            if col_sig != self.collision_lines_sig {
+                self.update_collision_lines(app);
+                self.collision_lines_sig = col_sig;
+            }
+        }
+
         // Update layer contour lines if they changed or section changed
         if app.layers.len() != self.last_layer_count || section_content_changed {
             log::info!("Updating layer visualization ({} layers)", app.layers.len());
@@ -1289,9 +1346,22 @@ impl Viewport3D {
         // Handle input
         let clicked_face = self.handle_input(&response, app);
 
-        // Render using three-d
-        if self.mesh_object.is_some() {
+        // Render using three-d — always render if there is a mesh OR machine geometry to show.
+        let has_machine = self.machine_head_gm.is_some() || self.machine_bed_gm.is_some();
+        if self.mesh_object.is_some() || has_machine {
             self.render_3d(ui, rect, app);
+
+            // Overlay "No mesh loaded" hint when machine is showing but no mesh yet
+            if self.mesh_object.is_none() {
+                let painter = ui.painter();
+                painter.text(
+                    egui::pos2(rect.center().x, rect.top() + 22.0),
+                    egui::Align2::CENTER_TOP,
+                    "No mesh loaded",
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_rgba_unmultiplied(200, 200, 200, 120),
+                );
+            }
 
             // Show camera controls hint
             let painter = ui.painter();
@@ -1304,14 +1374,9 @@ impl Viewport3D {
                 egui::Color32::from_rgba_unmultiplied(200, 200, 200, 180),
             );
         } else {
-            // Show empty viewport
+            // No mesh and no machine geometry — show empty placeholder
             let painter = ui.painter();
-            painter.rect_filled(
-                rect,
-                0.0,
-                egui::Color32::from_rgb(15, 15, 20),
-            );
-
+            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(15, 15, 20));
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -1324,10 +1389,254 @@ impl Viewport3D {
         clicked_face
     }
 
+    /// Rebuild machine head + bed geometry for the current playback position.
+    fn update_machine_geometry(&mut self, app: &SlicerApp) {
+        let profile = match app.profiles.get(app.active_profile_index) {
+            Some(p) => p.clone(),
+            None => {
+                self.machine_head_gm = None;
+                self.machine_bed_gm = None;
+                return;
+            }
+        };
+
+        if !profile.show_machine {
+            self.machine_head_gm = None;
+            self.machine_bed_gm = None;
+            return;
+        }
+
+        // Find current segment's position and orientation
+        let (seg_pos, seg_orient) = {
+            let mut found = None;
+            let mut idx = 0usize;
+            'outer: for tp in &app.toolpaths {
+                for seg in &tp.paths {
+                    if idx == app.toolpath_playback_position {
+                        found = Some((
+                            [seg.position.x as f32, seg.position.y as f32, seg.position.z as f32],
+                            seg.orientation,
+                        ));
+                        break 'outer;
+                    }
+                    idx += 1;
+                }
+            }
+            found.unwrap_or_else(|| (
+                [0.0f32, 0.0, 0.0],
+                crate::geometry::Vector3D::new(0.0, 0.0, 1.0),
+            ))
+        };
+
+        // Compute axis angles for this orientation
+        let angles = app.compute_segment_axis_angles(&seg_orient);
+        let gcode_axes = app.build_gcode_axes();
+
+        let head_angles: Vec<f64> = gcode_axes.iter().zip(angles.iter())
+            .filter(|(ax, _)| ax.is_head).take(2)
+            .map(|(_, (_, d))| *d).collect();
+        let bed_angles: Vec<f64> = gcode_axes.iter().zip(angles.iter())
+            .filter(|(ax, _)| !ax.is_head).take(2)
+            .map(|(_, (_, d))| *d).collect();
+
+        let ha = head_angles.first().copied().unwrap_or(0.0).to_radians() as f32;
+        let hb = head_angles.get(1).copied().unwrap_or(0.0).to_radians() as f32;
+        let ba = bed_angles.first().copied().unwrap_or(0.0).to_radians() as f32;
+        let bb = bed_angles.get(1).copied().unwrap_or(0.0).to_radians() as f32;
+
+        let tcp = app.tcp_offset as f32;
+        let olen = ((seg_orient.x * seg_orient.x + seg_orient.y * seg_orient.y + seg_orient.z * seg_orient.z) as f32).sqrt().max(1e-6);
+
+        // Head pivot = nozzle_pos minus tcp along orientation
+        let pivot_head = Vec3::new(
+            seg_pos[0] - tcp * seg_orient.x as f32 / olen,
+            seg_pos[1] - tcp * seg_orient.y as f32 / olen,
+            seg_pos[2] - tcp * seg_orient.z as f32 / olen,
+        );
+
+        // ── Head ─────────────────────────────────────────────────────────
+        let rh = machine_rot_xy(ha, hb);
+        let (w, d, h) = (profile.head_dims[0] as f32, profile.head_dims[1] as f32, profile.head_dims[2] as f32);
+        let nr = profile.nozzle_radius as f32;
+        // nozzle_length drives the visual cylinder; tcp drives G-code compensation
+        let nl = profile.nozzle_length as f32;
+        let head_color   = Srgba::new(80, 140, 220, 200);
+        let nozzle_color = Srgba::new(200, 200, 200, 220);
+        let tip_color    = Srgba::new(255, 200, 60, 255); // bright gold tip marker
+
+        // Nozzle tip in world space (the actual contact point)
+        let seg_pos_vec3 = Vec3::new(seg_pos[0], seg_pos[1], seg_pos[2]);
+
+        self.machine_head_gm = {
+            // Try STL override first
+            let cpu_opt: Option<CpuMesh> = profile.head_stl_path.as_ref().and_then(|path_str| {
+                match crate::Mesh::from_stl(std::path::Path::new(path_str)) {
+                    Ok(sm) => {
+                        // The user-specified tip offset tells us which point in the STL is the
+                        // nozzle tip.  We pin that local point to seg_pos_vec3 in world space:
+                        //   world_origin = seg_pos - rh * tip_local
+                        let tip_local = Vec3::new(
+                            profile.head_stl_tip_offset[0] as f32,
+                            profile.head_stl_tip_offset[1] as f32,
+                            profile.head_stl_tip_offset[2] as f32,
+                        );
+                        let world_origin = seg_pos_vec3 - machine_apply_rot(rh, tip_local);
+                        Some(machine_slicer_mesh_to_cpu_mesh(&sm, head_color, world_origin, rh))
+                    }
+                    Err(e) => { log::warn!("Head STL load failed ({}): {}", path_str, e); None }
+                }
+            });
+
+            if let Some(cpu) = cpu_opt {
+                // STL mesh loaded
+                Some(Arc::new(Gm::new(Mesh::new(&self.context, &cpu), ColorMaterial::default())))
+            } else {
+                // Parametric box + nozzle cylinder + nozzle-tip sphere
+                let mut pos: Vec<Vec3> = Vec::new();
+                let mut nor: Vec<Vec3> = Vec::new();
+                let mut col: Vec<Srgba> = Vec::new();
+                let mut idx: Vec<u32> = Vec::new();
+
+                // Head carriage box: local bottom at z=0 (pivot plane), extends up
+                machine_append_box(&mut pos, &mut nor, &mut col, &mut idx,
+                    w, d, h, head_color,
+                    Vec3::new(0.0, 0.0, h / 2.0),
+                    pivot_head, rh);
+
+                // Nozzle cylinder hanging below pivot — uses nozzle_length, not tcp
+                if nl > 0.5 {
+                    machine_append_cylinder(&mut pos, &mut nor, &mut col, &mut idx,
+                        nr, nl, 12, nozzle_color,
+                        Vec3::new(0.0, 0.0, -nl),
+                        pivot_head, rh);
+
+                    // Bright tip sphere at the nozzle tip so it's easy to identify
+                    let tip_r = (nr * 1.5).max(2.5);
+                    machine_append_sphere(&mut pos, &mut nor, &mut col, &mut idx,
+                        tip_r, 8, tip_color,
+                        Vec3::new(0.0, 0.0, -nl),
+                        pivot_head, rh);
+                }
+
+                if pos.is_empty() { None } else {
+                    let cpu = CpuMesh {
+                        positions: Positions::F32(pos),
+                        normals: Some(nor), colors: Some(col), indices: Indices::U32(idx),
+                        ..Default::default()
+                    };
+                    Some(Arc::new(Gm::new(Mesh::new(&self.context, &cpu), ColorMaterial::default())))
+                }
+            }
+        };
+
+        // ── Bed ──────────────────────────────────────────────────────────
+        let rb = machine_rot_xy(ba, bb);
+        let (bw, bd, bh) = (profile.bed_dims[0] as f32, profile.bed_dims[1] as f32, profile.bed_dims[2] as f32);
+
+        // Snap bed's top face to just below the grid (mesh bottom Z), falling back to z=0
+        let grid_z = self.mesh_bounds.map(|(mn, _)| mn[2]).unwrap_or(0.0f32);
+        let bed_world_pivot = Vec3::new(
+            profile.bed_pivot[0] as f32,
+            profile.bed_pivot[1] as f32,
+            grid_z - bh,  // top face of bed aligns with the build-plate grid
+        );
+        let bed_color = Srgba::new(180, 100, 60, 200);
+
+        self.machine_bed_gm = {
+            // Try STL override first
+            let cpu_opt: Option<CpuMesh> = profile.bed_stl_path.as_ref().and_then(|path_str| {
+                match crate::Mesh::from_stl(std::path::Path::new(path_str)) {
+                    Ok(sm) => Some(machine_slicer_mesh_to_cpu_mesh(&sm, bed_color, bed_world_pivot, rb)),
+                    Err(e) => { log::warn!("Bed STL load failed ({}): {}", path_str, e); None }
+                }
+            });
+
+            if let Some(cpu) = cpu_opt {
+                Some(Arc::new(Gm::new(Mesh::new(&self.context, &cpu), ColorMaterial::default())))
+            } else {
+                // Parametric bed shape
+                let mut pos: Vec<Vec3> = Vec::new();
+                let mut nor: Vec<Vec3> = Vec::new();
+                let mut col: Vec<Srgba> = Vec::new();
+                let mut idx: Vec<u32> = Vec::new();
+
+                match profile.bed_shape {
+                    BedShape::Rectangle => {
+                        // Box with bottom at z=0, top at z=bh
+                        machine_append_box(&mut pos, &mut nor, &mut col, &mut idx,
+                            bw, bd, bh, bed_color,
+                            Vec3::new(0.0, 0.0, bh / 2.0),
+                            bed_world_pivot, rb);
+                    }
+                    BedShape::Circle => {
+                        // Cylinder: radius = min(bw, bd)/2, along +Z
+                        let radius = bw.min(bd) / 2.0;
+                        machine_append_cylinder(&mut pos, &mut nor, &mut col, &mut idx,
+                            radius, bh, 32, bed_color,
+                            Vec3::new(0.0, 0.0, 0.0),
+                            bed_world_pivot, rb);
+                    }
+                }
+
+                if pos.is_empty() { None } else {
+                    let cpu = CpuMesh {
+                        positions: Positions::F32(pos),
+                        normals: Some(nor), colors: Some(col), indices: Indices::U32(idx),
+                        ..Default::default()
+                    };
+                    Some(Arc::new(Gm::new(Mesh::new(&self.context, &cpu), ColorMaterial::default())))
+                }
+            }
+        };
+    }
+
+    /// Rebuild the red collision overlay tubes from `app.collision_segments`.
+    fn update_collision_lines(&mut self, app: &SlicerApp) {
+        if app.collision_segments.is_empty() || !app.collision_segments.iter().any(|&c| c) {
+            self.collision_lines_gm = None;
+            return;
+        }
+
+        let mut positions: Vec<Vec3> = Vec::new();
+        let mut normals: Vec<Vec3> = Vec::new();
+        let mut colors: Vec<Srgba> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let red = Srgba::new(255, 30, 30, 255);
+        let tube_segments = 4u32;
+
+        let mut flat_idx = 0usize;
+        for toolpath in &app.toolpaths {
+            for window in toolpath.paths.windows(2) {
+                let is_collision = app.collision_segments.get(flat_idx).copied().unwrap_or(false);
+                flat_idx += 1;
+                if !is_collision { continue; }
+
+                let p1 = vec3(window[0].position.x as f32, window[0].position.y as f32, window[0].position.z as f32);
+                let p2 = vec3(window[1].position.x as f32, window[1].position.y as f32, window[1].position.z as f32);
+                let r = (toolpath.layer_height as f32 / 2.0).clamp(0.08, 0.35) * 1.5;
+                create_tube_segment(p1, p2, r, tube_segments, red,
+                    &mut positions, &mut normals, &mut colors, &mut indices);
+            }
+        }
+
+        self.collision_lines_gm = if positions.is_empty() {
+            None
+        } else {
+            let cpu = CpuMesh {
+                positions: Positions::F32(positions),
+                normals: Some(normals),
+                colors: Some(colors),
+                indices: Indices::U32(indices),
+                ..Default::default()
+            };
+            Some(Arc::new(Gm::new(Mesh::new(&self.context, &cpu), ColorMaterial::default())))
+        };
+    }
+
     fn render_3d(&mut self, ui: &mut egui::Ui, rect: egui::Rect, app: &SlicerApp) {
-        // Render directly to screen framebuffer using paint callback
-        if let Some(mesh_obj) = &self.mesh_object {
-            // Log occasionally to verify rendering is happening
+        // Render directly to screen framebuffer using paint callback.
+        // Works both with and without a loaded mesh (machine geometry is visible even with no model).
+        {
             static mut RENDER_COUNT: u32 = 0;
             unsafe {
                 RENDER_COUNT += 1;
@@ -1336,12 +1645,12 @@ impl Viewport3D {
                 }
             }
             let context = self.context.clone();
-            // Use section mesh when section view is active, otherwise full mesh
+            // Use section mesh when section view is active, otherwise full mesh if available
             let mesh_arc = if app.show_mesh {
                 if app.section_enabled {
                     self.section_mesh.clone()
                 } else {
-                    Some(Arc::clone(mesh_obj))
+                    self.mesh_object.clone()
                 }
             } else {
                 None
@@ -1353,6 +1662,12 @@ impl Viewport3D {
             let layer_lines_arc = if app.show_layers { self.layer_lines.clone() } else { None };
             let wireframe_arc = if app.show_wireframe { self.wireframe_mesh.clone() } else { None };
             let axes_arc = self.axes_mesh.clone();
+            let show_machine = app.profiles.get(app.active_profile_index)
+                .map(|p| p.show_machine)
+                .unwrap_or(false);
+            let machine_head_arc = if show_machine { self.machine_head_gm.clone() } else { None };
+            let machine_bed_arc = if show_machine { self.machine_bed_gm.clone() } else { None };
+            let collision_lines_arc = self.collision_lines_gm.clone();
             let camera_yaw = self.camera_yaw;
             let camera_pitch = self.camera_pitch;
             let camera_distance = self.camera_distance;
@@ -1496,6 +1811,25 @@ impl Viewport3D {
                         if let Some(ref axes) = axes_arc {
                             axes_ref = axes.clone();
                             objects.push(&*axes_ref);
+                        }
+
+                        // Add machine simulation geometry (bed and head)
+                        let machine_head_ref;
+                        if let Some(ref mh) = machine_head_arc {
+                            machine_head_ref = mh.clone();
+                            objects.push(&*machine_head_ref);
+                        }
+                        let machine_bed_ref;
+                        if let Some(ref mb) = machine_bed_arc {
+                            machine_bed_ref = mb.clone();
+                            objects.push(&*machine_bed_ref);
+                        }
+
+                        // Add collision overlay (red segments on top of normal toolpaths)
+                        let collision_lines_ref;
+                        if let Some(ref cl) = collision_lines_arc {
+                            collision_lines_ref = cl.clone();
+                            objects.push(&*collision_lines_ref);
                         }
 
                         // CRITICAL: Set three-d context render states to disable culling globally
@@ -2005,6 +2339,251 @@ fn create_tube_segment(
         indices.push(v3);
     }
 }
+
+// ─── Machine simulation geometry helpers ─────────────────────────────────────
+
+/// Convert a `SlicerMesh` (from `crate::Mesh::from_stl`) into a `CpuMesh`
+/// with the given rotation + translation baked into each vertex position.
+fn machine_slicer_mesh_to_cpu_mesh(
+    slicer_mesh: &crate::Mesh,
+    color: Srgba,
+    world_pivot: Vec3,
+    rot: [[f32; 3]; 3],
+) -> CpuMesh {
+    let mut positions: Vec<Vec3> = Vec::new();
+    let mut normals:   Vec<Vec3> = Vec::new();
+    let mut colors:    Vec<Srgba> = Vec::new();
+    let mut indices:   Vec<u32>  = Vec::new();
+
+    for tri in &slicer_mesh.triangles {
+        let lv0 = Vec3::new(tri.v0.x as f32, tri.v0.y as f32, tri.v0.z as f32);
+        let lv1 = Vec3::new(tri.v1.x as f32, tri.v1.y as f32, tri.v1.z as f32);
+        let lv2 = Vec3::new(tri.v2.x as f32, tri.v2.y as f32, tri.v2.z as f32);
+
+        let e1 = lv1 - lv0;
+        let e2 = lv2 - lv0;
+        let ln = {
+            let c = e1.cross(e2);
+            let len = (c.x*c.x + c.y*c.y + c.z*c.z).sqrt();
+            if len > 1e-9 { c / len } else { Vec3::new(0.0, 1.0, 0.0) }
+        };
+        let wn = machine_apply_rot(rot, ln).normalize();
+
+        let base = positions.len() as u32;
+        for lv in &[lv0, lv1, lv2] {
+            positions.push(machine_apply_rot(rot, *lv) + world_pivot);
+            normals.push(wn);
+            colors.push(color);
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2]);
+    }
+
+    CpuMesh {
+        positions: Positions::F32(positions),
+        normals: Some(normals),
+        colors: Some(colors),
+        indices: Indices::U32(indices),
+        ..Default::default()
+    }
+}
+
+/// Build rotation matrix Ry(b) * Rx(a) for machine simulation.
+fn machine_rot_xy(a: f32, b: f32) -> [[f32; 3]; 3] {
+    let (sa, ca) = (a.sin(), a.cos());
+    let (sb, cb) = (b.sin(), b.cos());
+    [
+        [cb,   sb * sa,  sb * ca],
+        [0.0,  ca,      -sa     ],
+        [-sb,  cb * sa,  cb * ca],
+    ]
+}
+
+/// Apply a 3×3 rotation matrix to a Vec3.
+fn machine_apply_rot(r: [[f32; 3]; 3], v: Vec3) -> Vec3 {
+    Vec3::new(
+        r[0][0] * v.x + r[0][1] * v.y + r[0][2] * v.z,
+        r[1][0] * v.x + r[1][1] * v.y + r[1][2] * v.z,
+        r[2][0] * v.x + r[2][1] * v.y + r[2][2] * v.z,
+    )
+}
+
+/// Append a flat-shaded axis-aligned box (in local space) to the geometry buffers.
+///
+/// `local_center` — centre of the box before rotation (in local frame)
+/// `world_pivot`  — world-space translation applied after rotation
+/// `rot`          — rotation matrix applied before translation
+fn machine_append_box(
+    positions: &mut Vec<Vec3>,
+    normals:   &mut Vec<Vec3>,
+    colors:    &mut Vec<Srgba>,
+    indices:   &mut Vec<u32>,
+    w: f32, d: f32, h: f32,
+    color: Srgba,
+    local_center: Vec3,
+    world_pivot: Vec3,
+    rot: [[f32; 3]; 3],
+) {
+    let hw = w / 2.0;
+    let hd = d / 2.0;
+    let hh = h / 2.0;
+    let cx = local_center.x;
+    let cy = local_center.y;
+    let cz = local_center.z;
+
+    // Each face: (local_normal, [4 corner positions in local space])
+    let face_data: [([f32; 3], [[f32; 3]; 4]); 6] = [
+        ([1.0, 0.0, 0.0], [[cx+hw, cy-hd, cz-hh], [cx+hw, cy+hd, cz-hh], [cx+hw, cy+hd, cz+hh], [cx+hw, cy-hd, cz+hh]]),
+        ([-1.0, 0.0, 0.0], [[cx-hw, cy+hd, cz-hh], [cx-hw, cy-hd, cz-hh], [cx-hw, cy-hd, cz+hh], [cx-hw, cy+hd, cz+hh]]),
+        ([0.0, 1.0, 0.0], [[cx+hw, cy+hd, cz-hh], [cx-hw, cy+hd, cz-hh], [cx-hw, cy+hd, cz+hh], [cx+hw, cy+hd, cz+hh]]),
+        ([0.0, -1.0, 0.0], [[cx-hw, cy-hd, cz-hh], [cx+hw, cy-hd, cz-hh], [cx+hw, cy-hd, cz+hh], [cx-hw, cy-hd, cz+hh]]),
+        ([0.0, 0.0, 1.0], [[cx-hw, cy-hd, cz+hh], [cx+hw, cy-hd, cz+hh], [cx+hw, cy+hd, cz+hh], [cx-hw, cy+hd, cz+hh]]),
+        ([0.0, 0.0, -1.0], [[cx+hw, cy-hd, cz-hh], [cx-hw, cy-hd, cz-hh], [cx-hw, cy+hd, cz-hh], [cx+hw, cy+hd, cz-hh]]),
+    ];
+
+    for (fn_local, verts) in &face_data {
+        let local_n = Vec3::new(fn_local[0], fn_local[1], fn_local[2]);
+        let world_n = machine_apply_rot(rot, local_n).normalize();
+        let base = positions.len() as u32;
+        for v in verts {
+            let local_p = Vec3::new(v[0], v[1], v[2]);
+            positions.push(machine_apply_rot(rot, local_p) + world_pivot);
+            normals.push(world_n);
+            colors.push(color);
+        }
+        indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
+    }
+}
+
+/// Append a flat-shaded cylinder along the local +Z axis to the geometry buffers.
+///
+/// `local_bottom` — local-space position of the cylinder's bottom centre
+/// `height`       — length of the cylinder along local Z
+/// `n`            — number of side segments
+fn machine_append_cylinder(
+    positions: &mut Vec<Vec3>,
+    normals:   &mut Vec<Vec3>,
+    colors:    &mut Vec<Srgba>,
+    indices:   &mut Vec<u32>,
+    radius: f32,
+    height: f32,
+    n: u32,
+    color: Srgba,
+    local_bottom: Vec3,
+    world_pivot: Vec3,
+    rot: [[f32; 3]; 3],
+) {
+    let cx = local_bottom.x;
+    let cy = local_bottom.y;
+    let bot_z = local_bottom.z;
+    let top_z = local_bottom.z + height;
+
+    // Side quads
+    for i in 0..n {
+        let a0 = (i as f32 / n as f32) * std::f32::consts::TAU;
+        let a1 = ((i + 1) as f32 / n as f32) * std::f32::consts::TAU;
+        let (s0, c0) = (a0.sin(), a0.cos());
+        let (s1, c1) = (a1.sin(), a1.cos());
+
+        let lverts = [
+            Vec3::new(cx + c0 * radius, cy + s0 * radius, bot_z),
+            Vec3::new(cx + c1 * radius, cy + s1 * radius, bot_z),
+            Vec3::new(cx + c1 * radius, cy + s1 * radius, top_z),
+            Vec3::new(cx + c0 * radius, cy + s0 * radius, top_z),
+        ];
+        let ln = Vec3::new((c0 + c1) * 0.5, (s0 + s1) * 0.5, 0.0).normalize();
+        let wn = machine_apply_rot(rot, ln).normalize();
+
+        let vi = positions.len() as u32;
+        for lv in &lverts {
+            positions.push(machine_apply_rot(rot, *lv) + world_pivot);
+            normals.push(wn);
+            colors.push(color);
+        }
+        indices.extend_from_slice(&[vi, vi+1, vi+2, vi, vi+2, vi+3]);
+    }
+
+    // Bottom cap
+    let bot_n = machine_apply_rot(rot, Vec3::new(0.0, 0.0, -1.0)).normalize();
+    let bc_idx = positions.len() as u32;
+    positions.push(machine_apply_rot(rot, Vec3::new(cx, cy, bot_z)) + world_pivot);
+    normals.push(bot_n); colors.push(color);
+    for i in 0..n {
+        let a = (i as f32 / n as f32) * std::f32::consts::TAU;
+        positions.push(machine_apply_rot(rot, Vec3::new(cx + a.cos() * radius, cy + a.sin() * radius, bot_z)) + world_pivot);
+        normals.push(bot_n); colors.push(color);
+    }
+    for i in 0..n {
+        let i0 = bc_idx + 1 + i;
+        let i1 = bc_idx + 1 + (i + 1) % n;
+        indices.extend_from_slice(&[bc_idx, i1, i0]);
+    }
+
+    // Top cap
+    let top_n = machine_apply_rot(rot, Vec3::new(0.0, 0.0, 1.0)).normalize();
+    let tc_idx = positions.len() as u32;
+    positions.push(machine_apply_rot(rot, Vec3::new(cx, cy, top_z)) + world_pivot);
+    normals.push(top_n); colors.push(color);
+    for i in 0..n {
+        let a = (i as f32 / n as f32) * std::f32::consts::TAU;
+        positions.push(machine_apply_rot(rot, Vec3::new(cx + a.cos() * radius, cy + a.sin() * radius, top_z)) + world_pivot);
+        normals.push(top_n); colors.push(color);
+    }
+    for i in 0..n {
+        let i0 = tc_idx + 1 + i;
+        let i1 = tc_idx + 1 + (i + 1) % n;
+        indices.extend_from_slice(&[tc_idx, i0, i1]);
+    }
+}
+
+/// Append a UV-sphere of given radius at a local-space centre point.
+///
+/// `rings`  — number of latitude rings (equator included); `2*rings` longitude segments used.
+fn machine_append_sphere(
+    positions: &mut Vec<Vec3>,
+    normals:   &mut Vec<Vec3>,
+    colors:    &mut Vec<Srgba>,
+    indices:   &mut Vec<u32>,
+    radius: f32,
+    rings: u32,
+    color: Srgba,
+    local_centre: Vec3,
+    world_pivot: Vec3,
+    rot: [[f32; 3]; 3],
+) {
+    let segs = rings * 2;
+    let base = positions.len() as u32;
+
+    for ring in 0..=rings {
+        let phi = std::f32::consts::PI * ring as f32 / rings as f32; // 0 = top, π = bottom
+        let (sp, cp) = (phi.sin(), phi.cos());
+        for seg in 0..=segs {
+            let theta = std::f32::consts::TAU * seg as f32 / segs as f32;
+            let (st, ct) = (theta.sin(), theta.cos());
+            let lv = Vec3::new(
+                local_centre.x + radius * sp * ct,
+                local_centre.y + radius * sp * st,
+                local_centre.z + radius * cp,
+            );
+            let ln = Vec3::new(sp * ct, sp * st, cp);
+            positions.push(machine_apply_rot(rot, lv) + world_pivot);
+            normals.push(machine_apply_rot(rot, ln).normalize());
+            colors.push(color);
+        }
+    }
+
+    let stride = segs + 1;
+    for ring in 0..rings {
+        for seg in 0..segs {
+            let i0 = base + ring * stride + seg;
+            let i1 = i0 + 1;
+            let i2 = i0 + stride;
+            let i3 = i2 + 1;
+            indices.extend_from_slice(&[i0, i2, i1, i1, i2, i3]);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Convert HSL color to RGB (h: 0-360, s: 0-1, l: 0-1)
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {

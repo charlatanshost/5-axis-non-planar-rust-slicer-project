@@ -68,14 +68,17 @@ pub struct S4RotationField {
 }
 
 impl S4RotationField {
-    /// Compute S4 rotation field from Dijkstra gradients.
+    /// Compute S4 rotation field from overhang analysis and Dijkstra ordering.
     ///
     /// Algorithm:
-    /// 1. For each tet with a surface face, compute overhang angle
-    /// 2. Compute rotation axis from Dijkstra gradient (perpendicular to gradient and build dir)
-    /// 3. Compute rotation magnitude from overhang severity
-    /// 4. Propagate to interior tets using neighbor averaging
-    /// 5. Smooth via iterative SLERP with face-adjacent neighbors
+    /// 1. Surface overhang tets get quaternion via normal × Z (Phase 1).
+    /// 2. All Phase 1 quaternions are re-expressed on the **dominant axis** (the axis of
+    ///    the largest-magnitude Phase 1 tet).  This eliminates conflicting axes:  when
+    ///    multiple overhangs face different directions, SLERP-averaging conflicting axes
+    ///    in `deform_tet_mesh_direct` produces degenerate rotations → mesh collapse.
+    ///    With one consistent axis, propagation and averaging are stable.
+    /// 3. Propagate full quaternions upward through Dijkstra ordering (Phase 2).
+    /// 4. Smooth via iterative SLERP with face-adjacent neighbors (softens boundaries).
     pub fn compute(
         tet_mesh: &TetMesh,
         dijkstra_field: &TetDijkstraField,
@@ -86,31 +89,43 @@ impl S4RotationField {
         log::info!("  Overhang threshold: {:.1} deg, max rotation: {:.1} deg",
             config.overhang_threshold, config.max_rotation_degrees);
 
-        // Step 1: Compute initial rotations from overhang analysis
+        // Step 1–2: surface normal detection + dominant-axis normalization.
+        // Phase 2 (upward propagation) is intentionally omitted — it created a sharp
+        // rotation cliff at the belly/legs boundary, which combined with the global
+        // anchor in deform_tet_mesh_direct caused a visible shear tear in the mesh.
+        // Instead, diffusion (Step 3 below) spreads the Phase 1 rotations smoothly.
         let (mut rotations, magnitudes) =
             compute_initial_rotations(tet_mesh, dijkstra_field, config);
 
         let non_identity = rotations.iter().filter(|q| q.angle() > 0.01).count();
-        log::info!("  Initial rotations: {} non-identity ({:.1}%)",
-            non_identity, 100.0 * non_identity as f64 / num_tets as f64);
+        let max_angle = rotations.iter().map(|q| q.angle()).fold(0.0f64, f64::max);
+        log::info!("  After Phase 1 + normalization: {} non-identity ({:.1}%), max: {:.2}°",
+            non_identity, 100.0 * non_identity as f64 / num_tets as f64,
+            max_angle.to_degrees());
 
-        // Step 2: Smooth rotation field
+        // Step 3: Diffusion smoothing — spreads Phase 1 surface rotations into the
+        // interior while keeping base tets (build plate) pinned to identity.
+        // This replaces the old Phase 2 upward propagation:  instead of a discrete
+        // "cliff" at the belly/legs boundary, we get a smooth gradient from the
+        // overhang surface tets (full rotation) decaying toward the build plate (zero).
+        let base_tets: std::collections::HashSet<usize> =
+            dijkstra_field.base_tets.iter().cloned().collect();
+
         for iter in 0..config.smoothing_iterations {
             let new_rotations: Vec<UnitQuaternion<f64>> = (0..num_tets)
                 .into_par_iter()
                 .map(|ti| {
-                    smooth_single_tet(
-                        ti,
-                        &rotations,
-                        tet_mesh,
-                        config.smoothness_weight,
-                    )
+                    if base_tets.contains(&ti) {
+                        UnitQuaternion::identity() // pin build-plate tets to zero
+                    } else {
+                        smooth_single_tet(ti, &rotations, tet_mesh, config.smoothness_weight)
+                    }
                 })
                 .collect();
             rotations = new_rotations;
 
             if iter % 10 == 0 {
-                log::debug!("  Smoothing iteration {}/{}", iter, config.smoothing_iterations);
+                log::debug!("  Diffusion iter {}/{}", iter, config.smoothing_iterations);
             }
         }
 
@@ -157,14 +172,23 @@ impl S4RotationField {
     }
 }
 
-/// Compute initial per-tet rotations from overhang analysis and Dijkstra gradients.
+/// Compute per-tet rotations from surface overhang analysis with dominant-axis normalization.
 ///
-/// For each tet:
-/// - If it has a surface face (boundary), compute the overhang angle
-/// - If overhang exceeds threshold, compute rotation to fix it
-/// - Rotation axis: perpendicular to surface normal projected onto horizontal plane
-/// - Rotation magnitude: proportional to how much the overhang exceeds the threshold
-/// - Interior tets: interpolate from distance field (gradient direction)
+/// Two-phase algorithm (Phase 2 / upward propagation intentionally removed):
+///
+/// **Phase 1 — Surface quaternions**: For each surface tet with a downward-facing
+/// boundary face, compute rotation quaternion: axis = `normal × build_dir`, magnitude =
+/// how much the face exceeds the overhang threshold (clamped to max_rotation).
+/// Interior tets remain identity.
+///
+/// **Dominant axis normalization**: Multiple overhang regions face different directions,
+/// so Phase 1 produces conflicting axes.  SLERP-averaging conflicting axes at shared
+/// vertices produces degenerate rotations.  Fix: find the most severe Phase 1 tet
+/// and re-express ALL Phase 1 quaternions on that same dominant axis.
+///
+/// Diffusion (controlled by `smoothing_iterations` in `S4RotationField::compute`)
+/// then spreads these surface rotations smoothly into the interior, with base tets
+/// pinned to identity so the build plate never moves.
 fn compute_initial_rotations(
     tet_mesh: &TetMesh,
     dijkstra_field: &TetDijkstraField,
@@ -173,18 +197,17 @@ fn compute_initial_rotations(
     let num_tets = tet_mesh.tets.len();
     let overhang_rad = config.overhang_threshold.to_radians();
     let max_rad = config.max_rotation_degrees.to_radians();
-    let min_z = -overhang_rad.sin(); // Normal Z below this = overhang
+    let min_z = -overhang_rad.sin(); // Normal Z below this threshold = overhang
 
+    // ── Phase 1: surface overhang tets → per-tet quaternion via normal × Z ────
     let mut rotations = vec![UnitQuaternion::identity(); num_tets];
-    let mut magnitudes = vec![0.0f64; num_tets];
 
     for ti in 0..num_tets {
         let neighbors = &tet_mesh.tet_neighbors[ti];
 
-        // Find surface face normals (boundary faces where neighbor is None)
+        // Accumulate area-weighted normals from boundary (surface) faces
         let mut surface_normal = Vector3D::zeros();
         let mut has_surface = false;
-
         let face_normals = tet_mesh.tets[ti].face_normals(&tet_mesh.vertices);
 
         for fi in 0..4 {
@@ -192,100 +215,80 @@ fn compute_initial_rotations(
                 let n = face_normals[fi];
                 let area = n.norm();
                 if area > 1e-10 {
-                    surface_normal += n; // area-weighted
+                    surface_normal += n;
                     has_surface = true;
                 }
             }
         }
 
-        if has_surface {
-            let norm = surface_normal.norm();
-            if norm > 1e-10 {
-                let unit_normal = surface_normal / norm;
+        if !has_surface { continue; }
+        let norm = surface_normal.norm();
+        if norm < 1e-10 { continue; }
+        let unit_normal = surface_normal / norm;
+        if unit_normal.z >= min_z { continue; } // not an overhang
 
-                // Check overhang: normal.z < min_z means overhang
-                if unit_normal.z < min_z {
-                    // Compute rotation to fix overhang
-                    let horiz_len = (unit_normal.x * unit_normal.x + unit_normal.y * unit_normal.y).sqrt();
+        let current_angle = (-unit_normal.z).asin().clamp(0.0, std::f64::consts::FRAC_PI_2);
+        let rotation_amount = (current_angle - overhang_rad).clamp(0.0, max_rad);
+        if rotation_amount < 1e-6 { continue; }
 
-                    // Rotation axis: perpendicular to the normal's horizontal projection,
-                    // oriented so that a POSITIVE rotation lifts the overhanging side UP.
-                    // For normal (nx, ny, nz_neg): axis = (ny, -nx, 0) / ||horiz||
-                    // This ensures cross(axis, outward_dir) points upward (+Z).
-                    let rotation_axis = if horiz_len > 1e-6 {
-                        Vector3D::new(unit_normal.y / horiz_len, -unit_normal.x / horiz_len, 0.0)
-                    } else {
-                        // Normal pointing straight down — use Dijkstra gradient for direction
-                        let grad = dijkstra_field.gradient_at(ti);
-                        let horiz = Vector3D::new(grad.x, grad.y, 0.0);
-                        let h_len = horiz.norm();
-                        if h_len > 1e-6 {
-                            Vector3D::new(horiz.y / h_len, -horiz.x / h_len, 0.0)
-                        } else {
-                            Vector3D::new(1.0, 0.0, 0.0)
-                        }
-                    };
-
-                    // Rotation amount: how much to rotate to reach threshold
-                    let current_angle = (-unit_normal.z).asin(); // angle below horizontal
-                    let target_angle = overhang_rad;
-                    let rotation_amount = (current_angle - target_angle).clamp(0.0, max_rad);
-
-                    if rotation_amount > 1e-6 {
-                        let q = UnitQuaternion::from_axis_angle(
-                            &nalgebra::Unit::new_normalize(rotation_axis),
-                            rotation_amount,
-                        );
-                        if q.coords.iter().all(|c| c.is_finite()) {
-                            rotations[ti] = q;
-                            magnitudes[ti] = rotation_amount;
-                        }
-                    }
-                }
-            }
+        // Axis = normal × build_dir = (ny, -nx, 0) — the horizontal axis that
+        // lifts this overhang toward +Z.
+        let horiz_len = (unit_normal.x * unit_normal.x + unit_normal.y * unit_normal.y).sqrt();
+        let rotation_axis = if horiz_len > 1e-6 {
+            Vector3D::new(unit_normal.y / horiz_len, -unit_normal.x / horiz_len, 0.0)
         } else {
-            // Interior tet: use Dijkstra gradient to determine rotation direction
-            // Scale rotation by how far from base (tets near base need less rotation)
-            let normalized_dist = dijkstra_field.normalized_distance(ti);
+            Vector3D::new(1.0, 0.0, 0.0)
+        };
 
-            // Only rotate interior tets that are "high up" (past the first 20%)
-            if normalized_dist > 0.2 {
-                // Look at neighbor rotations to estimate what interior should have
-                let mut neighbor_count = 0;
-                let mut neighbor_mag_sum = 0.0;
-                let mut neighbor_axis_sum = Vector3D::zeros();
-
-                for fi in 0..4 {
-                    if let Some(ni) = neighbors[fi] {
-                        if magnitudes[ni] > 1e-6 {
-                            neighbor_count += 1;
-                            neighbor_mag_sum += magnitudes[ni];
-                            if let Some(axis) = rotations[ni].axis() {
-                                neighbor_axis_sum += axis.into_inner() * magnitudes[ni];
-                            }
-                        }
-                    }
-                }
-
-                if neighbor_count > 0 {
-                    let avg_mag = neighbor_mag_sum / neighbor_count as f64;
-                    let axis_norm = neighbor_axis_sum.norm();
-                    if axis_norm > 1e-10 && avg_mag > 1e-6 {
-                        let axis = neighbor_axis_sum / axis_norm;
-                        let q = UnitQuaternion::from_axis_angle(
-                            &nalgebra::Unit::new_normalize(axis),
-                            avg_mag * 0.5, // Dampen interior rotations
-                        );
-                        if q.coords.iter().all(|c| c.is_finite()) {
-                            rotations[ti] = q;
-                            magnitudes[ti] = avg_mag * 0.5;
-                        }
-                    }
-                }
-            }
+        let q = UnitQuaternion::from_axis_angle(
+            &nalgebra::Unit::new_normalize(rotation_axis),
+            rotation_amount,
+        );
+        if q.coords.iter().all(|c| c.is_finite()) {
+            rotations[ti] = q;
         }
     }
 
+    let phase1_count = rotations.iter().filter(|q| q.angle() > 1e-6).count();
+    let phase1_max   = rotations.iter().map(|q| q.angle()).fold(0.0f64, f64::max);
+    log::info!("  Phase 1: {} surface overhang tets, max: {:.2}°",
+        phase1_count, phase1_max.to_degrees());
+
+    // ── Dominant axis normalization ───────────────────────────────────────────
+    // Find the most-severe Phase 1 tet and use its axis for ALL Phase 1 tets.
+    // This guarantees that every rotation in the field shares the same axis →
+    // SLERP averages and upward propagation are numerically stable (no collapse).
+    let dominant_axis: Option<Vector3D> = (0..num_tets)
+        .filter(|&ti| rotations[ti].angle() > 1e-6)
+        .max_by(|&a, &b| {
+            rotations[a].angle().partial_cmp(&rotations[b].angle())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .and_then(|dom| rotations[dom].axis())
+        .map(|ax| ax.into_inner());
+
+    if let Some(dom_ax) = dominant_axis {
+        let dom_unit = nalgebra::Unit::new_normalize(dom_ax);
+        let mut normalized = 0usize;
+        for ti in 0..num_tets {
+            let mag = rotations[ti].angle();
+            if mag > 1e-6 {
+                rotations[ti] = UnitQuaternion::from_axis_angle(&dom_unit, mag);
+                normalized += 1;
+            }
+        }
+        log::info!("  Dominant axis: ({:.3},{:.3},{:.3}), normalized {} tets",
+            dom_ax.x, dom_ax.y, dom_ax.z, normalized);
+    } else {
+        log::info!("  No overhang tets found in Phase 1 — field will be identity.");
+    }
+
+    // Phase 2 (upward propagation) removed — it caused a sharp rotation cliff at
+    // the boundary between propagated and non-propagated tets, which combined with
+    // the global anchor in deform_tet_mesh_direct to create a shear tear.
+    // Diffusion in S4RotationField::compute() spreads the Phase 1 values smoothly.
+
+    let magnitudes: Vec<f64> = rotations.iter().map(|q| q.angle()).collect();
     (rotations, magnitudes)
 }
 

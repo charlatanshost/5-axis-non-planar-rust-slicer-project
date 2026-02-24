@@ -1,18 +1,19 @@
-// G-code generation module
+// G-code generation module — supports up to N rotary axes driven by printer profile.
 
 use crate::toolpath::{Toolpath, ToolpathSegment};
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 
-/// Which rotary-axis letters to emit in G-code moves.
-#[derive(Debug, Clone, Copy, PartialEq)]
+// ─── Axis types ───────────────────────────────────────────────────────────────
+
+/// Which rotary-axis labels to emit in G-code moves (legacy 2-axis enum, kept for
+/// profile serialization and UI dropdowns).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RotaryAxisMode {
     /// A = pitch (rotation around X), B = roll (rotation around Y).
-    /// This is the default for most 5-axis head machines.
     AB,
     /// B = tilt, C = rotate.
-    /// Common on table-tilt / table-rotate machine configurations.
     BC,
 }
 
@@ -20,21 +21,53 @@ impl Default for RotaryAxisMode {
     fn default() -> Self { Self::AB }
 }
 
-/// Machine kinematics parameters for 5-axis TCP compensation.
+/// A single rotary axis as seen by the G-code generator.
+///
+/// The slicer converts `AxisConfig` entries from the active `PrinterProfile` into
+/// this leaner form before constructing the generator.
+#[derive(Debug, Clone)]
+pub struct GCodeAxis {
+    /// G-code letter: "A", "B", "C", "U", "V", "W", etc.
+    pub name: String,
+    /// `true`  → this axis tilts/rotates the head (nozzle).
+    /// `false` → this axis tilts/rotates the bed/table (part).
+    pub is_head: bool,
+    /// Allowed range in degrees (inclusive). Used for clamping only — the
+    /// controller will fault if these are exceeded, so we clamp pre-emptively.
+    pub min_deg: f64,
+    pub max_deg: f64,
+}
+
+// ─── Kinematics ──────────────────────────────────────────────────────────────
+
+/// Machine kinematics parameters — passed to `GCodeGenerator` at construction.
 #[derive(Debug, Clone)]
 pub struct MachineKinematics {
     /// Pivot-to-nozzle-tip distance in mm.
-    /// Set to 0.0 to disable TCP compensation (default).
+    /// Set to 0.0 to disable TCP compensation entirely.
     pub tcp_offset: f64,
-    /// Which axis labels to use when writing rotary moves.
-    pub rotary_axes: RotaryAxisMode,
+
+    /// All configured rotary axes, in the order they should appear in G-code.
+    ///
+    /// Default: two head axes ["A", "B"] for a standard 5-axis machine.
+    /// For a 7-axis trunnion+head machine you might have:
+    ///   ["A"(bed), "B"(bed), "C"(head), …]
+    pub axes: Vec<GCodeAxis>,
 }
 
 impl Default for MachineKinematics {
     fn default() -> Self {
-        Self { tcp_offset: 0.0, rotary_axes: RotaryAxisMode::AB }
+        Self {
+            tcp_offset: 0.0,
+            axes: vec![
+                GCodeAxis { name: "A".to_string(), is_head: true,  min_deg: -180.0, max_deg: 180.0 },
+                GCodeAxis { name: "B".to_string(), is_head: true,  min_deg: -180.0, max_deg: 180.0 },
+            ],
+        }
     }
 }
+
+// ─── Generator ───────────────────────────────────────────────────────────────
 
 pub struct GCodeGenerator {
     pub filament_diameter: f64,
@@ -42,7 +75,6 @@ pub struct GCodeGenerator {
     pub bed_temp: f64,
     pub retraction_distance: f64,
     pub retraction_speed: f64,
-    /// 5-axis machine kinematics (TCP offset + rotary axis labels).
     pub kinematics: MachineKinematics,
 }
 
@@ -60,22 +92,19 @@ impl Default for GCodeGenerator {
 }
 
 impl GCodeGenerator {
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self::default() }
 
-    /// Generate G-code from toolpaths and write to file
+    // ── Public generation methods ─────────────────────────────────────────
+
+    /// Generate G-code from toolpaths and write to file.
     pub fn generate<P: AsRef<Path>>(
         &self,
         toolpaths: &[Toolpath],
         output_path: P,
     ) -> io::Result<()> {
         let mut file = File::create(output_path)?;
-
-        // Write header
         self.write_header(&mut file)?;
 
-        // Write toolpaths
         let mut total_extrusion = 0.0;
         for toolpath in toolpaths {
             for segment in &toolpath.paths {
@@ -83,89 +112,95 @@ impl GCodeGenerator {
             }
         }
 
-        // Write footer
         self.write_footer(&mut file)?;
-
         Ok(())
     }
 
-    /// Generate G-code from toolpaths and return as vector of strings
+    /// Generate G-code from toolpaths and return as a vector of strings.
     pub fn generate_to_string(&self, toolpaths: &[Toolpath]) -> Vec<String> {
         let total_layers = toolpaths.len();
         let total_segments: usize = toolpaths.iter().map(|tp| tp.paths.len()).sum();
 
         log::info!("G-code generation started:");
-        log::info!("  Layers: {}", total_layers);
-        log::info!("  Total segments: {}", total_segments);
-        log::info!("  Estimated G-code lines: ~{}", total_segments + 30);
+        log::info!("  Layers:           {}", total_layers);
+        log::info!("  Total segments:   {}", total_segments);
+        log::info!("  Rotary axes:      {}", self.kinematics.axes.iter()
+            .map(|a| a.name.as_str()).collect::<Vec<_>>().join(", "));
 
-        let mut lines = Vec::with_capacity(total_segments + 30);
+        let mut lines = Vec::with_capacity(total_segments + 40);
 
-        // Header
+        // ── Header ─────────────────────────────────────────────────────
         lines.push("; Generated by multiaxis_slicer".to_string());
         lines.push(format!("; Filament diameter: {} mm", self.filament_diameter));
+        let axis_desc = self.kinematics.axes.iter()
+            .map(|a| format!("{} ({})", a.name, if a.is_head { "head" } else { "bed" }))
+            .collect::<Vec<_>>().join(", ");
+        lines.push(format!("; Rotary axes: {}", axis_desc));
+        if self.kinematics.tcp_offset.abs() > 1e-6 {
+            lines.push(format!("; TCP offset: {:.2} mm", self.kinematics.tcp_offset));
+        }
         lines.push(String::new());
         lines.push("G21 ; Set units to millimeters".to_string());
         lines.push("G90 ; Use absolute coordinates".to_string());
         lines.push("M82 ; Use absolute extrusion".to_string());
         lines.push(String::new());
         lines.push(format!("M104 S{} ; Set nozzle temp", self.nozzle_temp));
-        lines.push(format!("M140 S{} ; Set bed temp", self.bed_temp));
+        lines.push(format!("M140 S{} ; Set bed temp",   self.bed_temp));
         lines.push(format!("M109 S{} ; Wait for nozzle temp", self.nozzle_temp));
-        lines.push(format!("M190 S{} ; Wait for bed temp", self.bed_temp));
+        lines.push(format!("M190 S{} ; Wait for bed temp",    self.bed_temp));
         lines.push(String::new());
         lines.push("G28 ; Home all axes".to_string());
         lines.push("G92 E0 ; Reset extruder".to_string());
         lines.push(String::new());
 
-        // Toolpaths
-        let mut total_extrusion = 0.0;
-        let mut processed_segments = 0;
-        let report_interval = (total_segments / 10).max(1000); // Report every 10% or 1000 segments
+        // ── Toolpaths ──────────────────────────────────────────────────
+        let mut total_extrusion = 0.0_f64;
+        let mut processed = 0usize;
+        let report_every = (total_segments / 10).max(1000);
 
         for (layer_idx, toolpath) in toolpaths.iter().enumerate() {
             lines.push(format!("; LAYER:{}", layer_idx));
             lines.push(format!("; Z:{:.3}", toolpath.z));
 
             for segment in &toolpath.paths {
-                let (a_angle, b_angle) = self.orientation_to_angles(&segment.orientation);
-                let pos = self.tcp_compensate(segment.position, a_angle, b_angle);
-                let (rot1, rot2) = self.format_rotary(a_angle, b_angle);
+                let axis_angles = self.compute_axis_angles(&segment.orientation);
+                let pos = self.tcp_compensate(&segment.position, &axis_angles);
+                let rot_str = self.format_all_axes(&axis_angles);
 
                 if segment.extrusion < 1e-8 {
-                    // Travel move: retract, rapid move, prime
+                    // Travel: retract → rapid → re-prime
                     lines.push(format!("G1 E{:.5} F{:.0} ; Retract",
                         total_extrusion - self.retraction_distance,
                         self.retraction_speed * 60.0));
-                    lines.push(format!("G0 X{:.3} Y{:.3} Z{:.3} {} {} F6000 ; Travel",
-                        pos.x, pos.y, pos.z, rot1, rot2));
+                    lines.push(format!("G0 X{:.3} Y{:.3} Z{:.3} {} F6000 ; Travel",
+                        pos.x, pos.y, pos.z, rot_str));
                     lines.push(format!("G1 E{:.5} F{:.0} ; Prime",
                         total_extrusion,
                         self.retraction_speed * 60.0));
                 } else {
                     // Extrusion move
                     total_extrusion += segment.extrusion;
-                    lines.push(format!(
-                        "G1 X{:.3} Y{:.3} Z{:.3} {} {} E{:.5} F{:.0}",
-                        pos.x, pos.y, pos.z, rot1, rot2, total_extrusion,
+                    lines.push(format!("G1 X{:.3} Y{:.3} Z{:.3} {} E{:.5} F{:.0}",
+                        pos.x, pos.y, pos.z, rot_str, total_extrusion,
                         segment.feedrate * 60.0));
                 }
 
-                processed_segments += 1;
-                if processed_segments % report_interval == 0 {
-                    let percent = (processed_segments as f32 / total_segments as f32 * 100.0) as u32;
-                    log::info!("  G-code progress: {}% ({}/{} segments, layer {}/{})",
-                        percent, processed_segments, total_segments, layer_idx + 1, total_layers);
+                processed += 1;
+                if processed % report_every == 0 {
+                    let pct = (processed as f32 / total_segments as f32 * 100.0) as u32;
+                    log::info!("  G-code: {}% ({}/{} segs, layer {}/{})",
+                        pct, processed, total_segments, layer_idx + 1, total_layers);
                 }
             }
         }
 
-        log::info!("✓ G-code generation complete: {} lines", lines.len());
+        log::info!("✓ G-code complete: {} lines", lines.len());
 
-        // Footer
+        // ── Footer ─────────────────────────────────────────────────────
         lines.push(String::new());
         lines.push("; End G-code".to_string());
-        lines.push(format!("G1 E-{:.1} F{:.0} ; Retract", self.retraction_distance, self.retraction_speed * 60.0));
+        lines.push(format!("G1 E-{:.1} F{:.0} ; Retract",
+            self.retraction_distance, self.retraction_speed * 60.0));
         lines.push("M104 S0 ; Turn off nozzle".to_string());
         lines.push("M140 S0 ; Turn off bed".to_string());
         lines.push("G28 X Y ; Home X and Y".to_string());
@@ -174,29 +209,31 @@ impl GCodeGenerator {
         lines
     }
 
+    // ── Private I/O helpers ───────────────────────────────────────────────
+
     fn write_header(&self, file: &mut File) -> io::Result<()> {
         writeln!(file, "; Generated by multiaxis_slicer")?;
         writeln!(file, "; Filament diameter: {} mm", self.filament_diameter)?;
+        let axis_desc = self.kinematics.axes.iter()
+            .map(|a| format!("{} ({})", a.name, if a.is_head { "head" } else { "bed" }))
+            .collect::<Vec<_>>().join(", ");
+        writeln!(file, "; Rotary axes: {}", axis_desc)?;
+        if self.kinematics.tcp_offset.abs() > 1e-6 {
+            writeln!(file, "; TCP offset: {:.2} mm", self.kinematics.tcp_offset)?;
+        }
         writeln!(file)?;
-        
-        // Start G-code
         writeln!(file, "G21 ; Set units to millimeters")?;
         writeln!(file, "G90 ; Use absolute coordinates")?;
         writeln!(file, "M82 ; Use absolute extrusion")?;
         writeln!(file)?;
-        
-        // Heat up
         writeln!(file, "M104 S{} ; Set nozzle temp", self.nozzle_temp)?;
-        writeln!(file, "M140 S{} ; Set bed temp", self.bed_temp)?;
+        writeln!(file, "M140 S{} ; Set bed temp",   self.bed_temp)?;
         writeln!(file, "M109 S{} ; Wait for nozzle temp", self.nozzle_temp)?;
-        writeln!(file, "M190 S{} ; Wait for bed temp", self.bed_temp)?;
+        writeln!(file, "M190 S{} ; Wait for bed temp",    self.bed_temp)?;
         writeln!(file)?;
-        
-        // Homing and setup
         writeln!(file, "G28 ; Home all axes")?;
         writeln!(file, "G92 E0 ; Reset extruder")?;
         writeln!(file)?;
-
         Ok(())
     }
 
@@ -206,72 +243,150 @@ impl GCodeGenerator {
         segment: &ToolpathSegment,
         total_extrusion: &mut f64,
     ) -> io::Result<()> {
-        let (a_angle, b_angle) = self.orientation_to_angles(&segment.orientation);
-        let pos = self.tcp_compensate(segment.position, a_angle, b_angle);
-        let (rot1, rot2) = self.format_rotary(a_angle, b_angle);
+        let axis_angles = self.compute_axis_angles(&segment.orientation);
+        let pos = self.tcp_compensate(&segment.position, &axis_angles);
+        let rot_str = self.format_all_axes(&axis_angles);
 
         if segment.extrusion < 1e-8 {
-            // Travel move: retract, rapid move, prime
             writeln!(file, "G1 E{:.5} F{:.0} ; Retract",
                 *total_extrusion - self.retraction_distance,
                 self.retraction_speed * 60.0)?;
-            writeln!(file, "G0 X{:.3} Y{:.3} Z{:.3} {} {} F6000 ; Travel",
-                pos.x, pos.y, pos.z, rot1, rot2)?;
+            writeln!(file, "G0 X{:.3} Y{:.3} Z{:.3} {} F6000 ; Travel",
+                pos.x, pos.y, pos.z, rot_str)?;
             writeln!(file, "G1 E{:.5} F{:.0} ; Prime",
                 *total_extrusion,
                 self.retraction_speed * 60.0)?;
         } else {
-            // Extrusion move
             *total_extrusion += segment.extrusion;
-            writeln!(file, "G1 X{:.3} Y{:.3} Z{:.3} {} {} E{:.5} F{:.0}",
-                pos.x, pos.y, pos.z, rot1, rot2, *total_extrusion,
+            writeln!(file, "G1 X{:.3} Y{:.3} Z{:.3} {} E{:.5} F{:.0}",
+                pos.x, pos.y, pos.z, rot_str, *total_extrusion,
                 segment.feedrate * 60.0)?;
         }
-
         Ok(())
     }
 
     fn write_footer(&self, file: &mut File) -> io::Result<()> {
         writeln!(file)?;
         writeln!(file, "; End G-code")?;
-        writeln!(
-            file,
-            "G1 E-{:.1} F{:.0} ; Retract",
-            self.retraction_distance,
-            self.retraction_speed * 60.0
-        )?;
+        writeln!(file, "G1 E-{:.1} F{:.0} ; Retract",
+            self.retraction_distance, self.retraction_speed * 60.0)?;
         writeln!(file, "M104 S0 ; Turn off nozzle")?;
         writeln!(file, "M140 S0 ; Turn off bed")?;
         writeln!(file, "G28 X Y ; Home X and Y")?;
         writeln!(file, "M84 ; Disable motors")?;
-
         Ok(())
     }
 
-    /// Convert tool orientation vector to two rotation angles (in degrees).
+    // ── Kinematics ────────────────────────────────────────────────────────
+
+    /// Compute a rotation angle (degrees) for every configured rotary axis,
+    /// given the desired tool orientation vector.
     ///
-    /// Returns `(axis1_deg, axis2_deg)` where the meaning of axis1 and axis2
-    /// depends on `self.kinematics.rotary_axes`:
-    /// - `AB`: axis1 = A (pitch around X), axis2 = B (roll around Y)
-    /// - `BC`: axis1 = B (tilt), axis2 = C (rotate) — same math, different labels
-    fn orientation_to_angles(&self, orientation: &crate::geometry::Vector3D) -> (f64, f64) {
-        let a_angle = orientation.y.atan2(orientation.z).to_degrees();
-        let b_angle = (-orientation.x).atan2(orientation.z).to_degrees();
-        (a_angle, b_angle)
+    /// ## Assignment rules
+    ///
+    /// The tool orientation `(ox, oy, oz)` encodes a 2-DOF direction on the unit
+    /// sphere.  We decompose it into a **pitch** angle and a **roll** angle, then
+    /// assign those to the head / bed axes in order:
+    ///
+    /// | Axis slot | Head axis      | Bed axis (counter-rotation)  |
+    /// |-----------|----------------|------------------------------|
+    /// | 1st       | pitch          | −pitch                       |
+    /// | 2nd       | roll           | −roll                        |
+    /// | 3rd+      | 0° (no extra DOF without full IK) | 0°       |
+    ///
+    /// **Pitch** = tilt of the tool toward/away from +Y relative to vertical Z:
+    ///   `atan2(oy, oz)`
+    ///
+    /// **Roll** = tilt of the tool toward/away from +X relative to vertical Z:
+    ///   `atan2(−ox, oz)`
+    ///
+    /// Bed axes receive the negated values because it is the *part* moving, not
+    /// the head — tilting the bed by −α has the same effect on print geometry as
+    /// tilting the head by +α.
+    ///
+    /// All computed angles are clamped to each axis's `[min_deg, max_deg]` range
+    /// before output.  Out-of-range orientations should be caught at the motion-
+    /// planning stage; clamping here is a safety net only.
+    pub fn compute_axis_angles(
+        &self,
+        orientation: &crate::geometry::Vector3D,
+    ) -> Vec<(String, f64)> {
+        // Decompose orientation vector into pitch + roll angles
+        let pitch_deg = orientation.y.atan2(orientation.z).to_degrees();
+        let roll_deg  = (-orientation.x).atan2(orientation.z).to_degrees();
+
+        // Count head and bed rotary axes
+        let head_indices: Vec<usize> = self.kinematics.axes.iter()
+            .enumerate()
+            .filter(|(_, ax)| ax.is_head)
+            .map(|(i, _)| i)
+            .collect();
+
+        let bed_indices: Vec<usize> = self.kinematics.axes.iter()
+            .enumerate()
+            .filter(|(_, ax)| !ax.is_head)
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut raw = vec![0.0_f64; self.kinematics.axes.len()];
+
+        // Assign pitch + roll to head axes (1st and 2nd)
+        if let Some(&i) = head_indices.get(0) { raw[i] = pitch_deg; }
+        if let Some(&i) = head_indices.get(1) { raw[i] = roll_deg; }
+        // head_indices[2+] stay 0 — no simple rule beyond 2-DOF orientation
+
+        // Bed axes counter-rotate so the geometry relative to the nozzle is the same
+        if let Some(&i) = bed_indices.get(0) { raw[i] = -pitch_deg; }
+        if let Some(&i) = bed_indices.get(1) { raw[i] = -roll_deg; }
+        // bed_indices[2+] stay 0
+
+        // Clamp each axis to its configured range, then produce (name, angle) pairs
+        self.kinematics.axes.iter()
+            .enumerate()
+            .map(|(i, ax)| {
+                let clamped = raw[i].clamp(ax.min_deg, ax.max_deg);
+                (ax.name.clone(), clamped)
+            })
+            .collect()
     }
 
-    /// Apply TCP (tool center point) compensation.
+    /// Apply TCP (tool-centre-point) compensation for multi-axis moves.
     ///
-    /// Shifts `position` so that the nozzle tip (which is `tcp_offset` mm below the
-    /// pivot) lands at `position` when the head is tilted by `(a_deg, b_deg)`.
-    /// Returns `position` unchanged when `tcp_offset ≈ 0`.
-    fn tcp_compensate(&self, position: crate::geometry::Point3D, a_deg: f64, b_deg: f64)
-        -> crate::geometry::Point3D
-    {
+    /// The standard TCP formula assumes the nozzle tip is `tcp_offset` mm below
+    /// the head's pivot point.  When the head tilts, the pivot must shift so that
+    /// the nozzle tip still lands at `position`.
+    ///
+    /// Only **head** axes contribute to TCP compensation (bed axes move the part,
+    /// not the nozzle tip).  The first two head axes supply the pitch (a) and
+    /// roll (b) angles used in the standard 5-axis TCP formula:
+    ///
+    /// ```text
+    ///   Δx =  L · sin(a) · cos(b)
+    ///   Δy =  L · sin(a) · sin(b)
+    ///   Δz =  L · (1 − cos(a))
+    /// ```
+    ///
+    /// where L = `tcp_offset`.  If `tcp_offset ≈ 0`, the position is returned
+    /// unchanged.
+    pub fn tcp_compensate(
+        &self,
+        position: &crate::geometry::Point3D,
+        axis_angles: &[(String, f64)],
+    ) -> crate::geometry::Point3D {
         let offset = self.kinematics.tcp_offset;
-        if offset.abs() < 1e-6 { return position; }
-        let a = a_deg.to_radians();
-        let b = b_deg.to_radians();
+        if offset.abs() < 1e-6 { return *position; }
+
+        // Collect angles for the first two head axes
+        let head_angles: Vec<f64> = self.kinematics.axes.iter()
+            .zip(axis_angles.iter())
+            .filter(|(ax, _)| ax.is_head)
+            .take(2)
+            .map(|(_, (_, deg))| deg.to_radians())
+            .collect();
+
+        let a = head_angles.first().copied().unwrap_or(0.0);
+        let b = head_angles.get(1).copied().unwrap_or(0.0);
+
         crate::geometry::Point3D::new(
             position.x + offset * a.sin() * b.cos(),
             position.y + offset * a.sin() * b.sin(),
@@ -279,14 +394,21 @@ impl GCodeGenerator {
         )
     }
 
-    /// Format a rotary-axis pair for a G-code move according to the configured axis mode.
-    fn format_rotary(&self, axis1_deg: f64, axis2_deg: f64) -> (String, String) {
-        match self.kinematics.rotary_axes {
-            RotaryAxisMode::AB => (format!("A{:.3}", axis1_deg), format!("B{:.3}", axis2_deg)),
-            RotaryAxisMode::BC => (format!("B{:.3}", axis1_deg), format!("C{:.3}", axis2_deg)),
-        }
+    /// Format all rotary axis angles as a single space-separated G-code fragment.
+    ///
+    /// Example output for a 3-axis machine:  `"A12.345 B-3.500 C0.000"`
+    ///
+    /// All configured axes are always emitted so the controller can synchronise
+    /// them in one interpolated move.
+    fn format_all_axes(&self, axis_angles: &[(String, f64)]) -> String {
+        axis_angles.iter()
+            .map(|(name, deg)| format!("{}{:.3}", name, deg))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -294,30 +416,114 @@ mod tests {
     use crate::geometry::{Point3D, Vector3D};
     use crate::toolpath::ToolpathSegment;
 
+    fn default_toolpath_segment(pos: Point3D, orientation: Vector3D, extrusion: f64) -> ToolpathSegment {
+        ToolpathSegment { position: pos, orientation, extrusion, feedrate: 50.0 }
+    }
+
     #[test]
-    fn test_gcode_generation() {
-        let generator = GCodeGenerator::new();
-        
+    fn test_vertical_orientation_gives_zero_angles() {
+        let gen = GCodeGenerator::new(); // default: A(head) + B(head)
+        let angles = gen.compute_axis_angles(&Vector3D::new(0.0, 0.0, 1.0));
+        let a = angles.iter().find(|(n, _)| n == "A").map(|(_, v)| *v).unwrap();
+        let b = angles.iter().find(|(n, _)| n == "B").map(|(_, v)| *v).unwrap();
+        assert!(a.abs() < 1e-9, "A should be 0° for vertical orientation");
+        assert!(b.abs() < 1e-9, "B should be 0° for vertical orientation");
+    }
+
+    #[test]
+    fn test_tilted_orientation_angles() {
+        let gen = GCodeGenerator::new();
+        // Tilt 45° toward +Y: oy = sin(45°), oz = cos(45°)
+        let angle = 45_f64.to_radians();
+        let orientation = Vector3D::new(0.0, angle.sin(), angle.cos());
+        let angles = gen.compute_axis_angles(&orientation);
+        let a = angles.iter().find(|(n, _)| n == "A").map(|(_, v)| *v).unwrap();
+        assert!((a - 45.0).abs() < 0.1, "A should be ~45° for 45° tilt toward Y, got {}", a);
+    }
+
+    #[test]
+    fn test_seven_axis_all_appear_in_output() {
+        let gen = GCodeGenerator {
+            kinematics: MachineKinematics {
+                tcp_offset: 0.0,
+                axes: vec![
+                    GCodeAxis { name: "A".to_string(), is_head: false, min_deg: -90.0, max_deg: 90.0 },
+                    GCodeAxis { name: "B".to_string(), is_head: false, min_deg: -90.0, max_deg: 90.0 },
+                    GCodeAxis { name: "C".to_string(), is_head: true,  min_deg: -180.0, max_deg: 180.0 },
+                    GCodeAxis { name: "U".to_string(), is_head: true,  min_deg: -180.0, max_deg: 180.0 },
+                    GCodeAxis { name: "V".to_string(), is_head: false, min_deg: -45.0, max_deg: 45.0 },
+                    GCodeAxis { name: "W".to_string(), is_head: false, min_deg: -45.0, max_deg: 45.0 },
+                    GCodeAxis { name: "Q".to_string(), is_head: true,  min_deg: -180.0, max_deg: 180.0 },
+                ],
+            },
+            ..GCodeGenerator::default()
+        };
+        let angles = gen.compute_axis_angles(&Vector3D::new(0.0, 0.0, 1.0));
+        assert_eq!(angles.len(), 7, "All 7 axes must appear in output");
+        let formatted = gen.format_all_axes(&angles);
+        for letter in &["A", "B", "C", "U", "V", "W", "Q"] {
+            assert!(formatted.contains(letter), "Expected {} in '{}'", letter, formatted);
+        }
+    }
+
+    #[test]
+    fn test_bed_axes_counter_rotate() {
+        // Machine with one bed axis (A) and one head axis (B).
+        // Tilting 30° toward +Y produces pitch = 30°.
+        // A (bed, 1st bed slot)  → receives −pitch = −30° (counter-rotation).
+        // B (head, 1st head slot) → receives +pitch = +30°.
+        let gen = GCodeGenerator {
+            kinematics: MachineKinematics {
+                tcp_offset: 0.0,
+                axes: vec![
+                    GCodeAxis { name: "A".to_string(), is_head: false, min_deg: -90.0, max_deg: 90.0 },
+                    GCodeAxis { name: "B".to_string(), is_head: true,  min_deg: -90.0, max_deg: 90.0 },
+                ],
+            },
+            ..GCodeGenerator::default()
+        };
+        let angle = 30_f64.to_radians();
+        let orientation = Vector3D::new(0.0, angle.sin(), angle.cos());
+        let angles = gen.compute_axis_angles(&orientation);
+        let a = angles.iter().find(|(n, _)| n == "A").map(|(_, v)| *v).unwrap();
+        let b = angles.iter().find(|(n, _)| n == "B").map(|(_, v)| *v).unwrap();
+        assert!(a < 0.0,  "Bed axis A should be negative (−pitch counter-rotation), got {}", a);
+        assert!(b > 0.0,  "Head axis B is 1st head slot, should be +pitch (+30°), got {}", b);
+        assert!((a + b).abs() < 0.01, "Bed and head angles should cancel: a={} b={}", a, b);
+    }
+
+    #[test]
+    fn test_tcp_compensation_disabled_at_zero_offset() {
+        let gen = GCodeGenerator::new();
+        let pos = Point3D::new(10.0, 20.0, 5.0);
+        let angles = gen.compute_axis_angles(&Vector3D::new(0.0, 0.0, 1.0));
+        let compensated = gen.tcp_compensate(&pos, &angles);
+        assert!((compensated.x - pos.x).abs() < 1e-9);
+        assert!((compensated.y - pos.y).abs() < 1e-9);
+        assert!((compensated.z - pos.z).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_gcode_file_generation() {
+        use crate::toolpath::Toolpath;
+        let gen = GCodeGenerator::new();
         let toolpath = Toolpath {
             z: 0.2,
             layer_height: 0.2,
             paths: vec![
-                ToolpathSegment {
-                    position: Point3D::new(0.0, 0.0, 0.2),
-                    orientation: Vector3D::new(0.0, 0.0, 1.0),
-                    extrusion: 0.1,
-                    feedrate: 50.0,
-                },
-                ToolpathSegment {
-                    position: Point3D::new(10.0, 0.0, 0.2),
-                    orientation: Vector3D::new(0.0, 0.0, 1.0),
-                    extrusion: 0.2,
-                    feedrate: 50.0,
-                },
+                default_toolpath_segment(
+                    Point3D::new(0.0, 0.0, 0.2),
+                    Vector3D::new(0.0, 0.0, 1.0),
+                    0.0,
+                ),
+                default_toolpath_segment(
+                    Point3D::new(10.0, 0.0, 0.2),
+                    Vector3D::new(0.0, 0.0, 1.0),
+                    0.2,
+                ),
             ],
         };
-
-        let result = generator.generate(&[toolpath], "/tmp/test.gcode");
+        let result = gen.generate(&[toolpath], "/tmp/test_multiaxis.gcode");
         assert!(result.is_ok());
     }
 }

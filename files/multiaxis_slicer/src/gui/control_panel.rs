@@ -75,8 +75,33 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                 ui.label(egui::RichText::new("Machine Profile").strong());
                 ui.separator();
 
+                // Profile selector — pick from saved profiles and jump to editor
                 ui.horizontal(|ui| {
                     ui.label("Profile:");
+                    let active_name = app.profiles
+                        .get(app.active_profile_index)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_default();
+                    egui::ComboBox::from_id_source("active_profile_selector")
+                        .selected_text(&active_name)
+                        .show_ui(ui, |ui| {
+                            for i in 0..app.profiles.len() {
+                                let name = app.profiles[i].name.clone();
+                                if ui.selectable_label(app.active_profile_index == i, &name).clicked() {
+                                    app.active_profile_index = i;
+                                    app.apply_active_profile();
+                                }
+                            }
+                        });
+                    if ui.small_button("Manage...").clicked() {
+                        app.editing_profile_index = app.active_profile_index;
+                        app.active_tab = crate::gui::app::AppTab::PrinterProfiles;
+                    }
+                });
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
                     ui.text_edit_singleline(&mut app.machine.name);
                 });
 
@@ -246,6 +271,49 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                                 .custom_formatter(|n, _| format!("{:.1e}", n)))
                                 .on_hover_text("ASAP solver convergence threshold (lower = more precise)");
                         });
+
+                        ui.separator();
+                        ui.label(egui::RichText::new("Step-by-Step Controls").weak());
+
+                        // Stage indicator
+                        let stage_text = match app.s4_stage {
+                            crate::gui::app::S4Stage::Idle     => "Stage: Idle",
+                            crate::gui::app::S4Stage::Deformed => "Stage: 1-Deformed",
+                            crate::gui::app::S4Stage::Sliced   => "Stage: 2-Sliced (deformed)",
+                            crate::gui::app::S4Stage::Final    => "Stage: 3-Final",
+                        };
+                        ui.label(egui::RichText::new(stage_text).color(egui::Color32::LIGHT_BLUE));
+
+                        ui.horizontal(|ui| {
+                            if ui.button("1: Deform").clicked() {
+                                app.s4_stage = crate::gui::app::S4Stage::Idle;
+                                app.s4_deform_data = None;
+                                app.s4_deformed_layers.clear();
+                                app.deform_mesh_preview();
+                            }
+                            let can_slice = app.s4_stage >= crate::gui::app::S4Stage::Deformed;
+                            ui.add_enabled_ui(can_slice, |ui| {
+                                if ui.button("2: Slice Deformed").clicked() {
+                                    app.start_s4_slice_deformed();
+                                }
+                            });
+                            let can_untransform = app.s4_stage >= crate::gui::app::S4Stage::Sliced;
+                            ui.add_enabled_ui(can_untransform, |ui| {
+                                if ui.button("3: Untransform").clicked() {
+                                    app.start_s4_untransform();
+                                }
+                            });
+                        });
+
+                        if app.s4_stage != crate::gui::app::S4Stage::Idle {
+                            if ui.small_button("Reset Steps").clicked() {
+                                app.s4_stage = crate::gui::app::S4Stage::Idle;
+                                app.s4_deform_data = None;
+                                app.s4_deformed_layers.clear();
+                                app.show_deformed_mesh = false;
+                                app.deformed_mesh = None;
+                            }
+                        }
                     });
 
                     ui.add_space(5.0);
@@ -919,6 +987,19 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                             "✓ Quaternion field ready"
                         };
                         ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(100, 200, 100)));
+
+                        // Toggle between original and deformed mesh views
+                        let toggle_label = if app.show_deformed_mesh {
+                            "👁 Viewing: Deformed  [click for Original]"
+                        } else {
+                            "👁 Viewing: Original  [click for Deformed]"
+                        };
+                        if ui.button(toggle_label).clicked() {
+                            app.show_deformed_mesh = !app.show_deformed_mesh;
+                            if let Some(viewport) = &mut app.viewport_3d {
+                                viewport.clear_mesh();
+                            }
+                        }
                     }
 
                     ui.add_space(5.0);
@@ -931,6 +1012,46 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                 if app.is_slicing {
                     ui.label(egui::RichText::new("⏳ Slicing in progress...").italics());
                 }
+
+                ui.add_space(5.0);
+
+                // ── Rotary-axis & collision-avoidance options ─────────────
+                ui.collapsing("Rotary Axes & Collision Avoidance", |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Surface normals tilt the tool perpendicular to the surface at \
+                             every point, making full use of rotary axes and reducing overhangs.\n\
+                             Travel lift clears already-printed material during non-extrusion moves."
+                        ).weak().small()
+                    );
+                    ui.add_space(4.0);
+
+                    ui.checkbox(&mut app.use_surface_normals, "Apply surface normals to all modes")
+                        .on_hover_text(
+                            "For each toolpath segment the mesh surface normal is computed \
+                             and used as the tool orientation.  Tilt is clamped to the rotary \
+                             axis limits set in the active printer profile.\n\
+                             (Conical mode uses its own analytical normal and is unaffected.)"
+                        );
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Travel Z-lift:")
+                            .on_hover_text(
+                                "Height (mm) added to non-extruding travel moves so the nozzle \
+                                 clears already-printed material.  Set to 0 to disable."
+                            );
+                        ui.add(
+                            egui::DragValue::new(&mut app.travel_z_lift)
+                                .range(0.0..=20.0)
+                                .speed(0.1)
+                                .suffix(" mm"),
+                        );
+                        if app.travel_z_lift < 0.01 {
+                            ui.label(egui::RichText::new("(disabled)").weak());
+                        }
+                    });
+                });
 
                 ui.add_space(5.0);
 

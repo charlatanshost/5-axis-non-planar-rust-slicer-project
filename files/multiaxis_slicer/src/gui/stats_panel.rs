@@ -79,6 +79,22 @@ pub fn render(app: &SlicerApp, ctx: &egui::Context) {
                             ui.label(format!("{:.1} min", estimated_time));
                         });
                     }
+
+                    // Collision count (machine simulation)
+                    if !app.collision_segments.is_empty() {
+                        let count = app.collision_segments.iter().filter(|&&c| c).count();
+                        ui.horizontal(|ui| {
+                            ui.label("Collisions:");
+                            if count > 0 {
+                                ui.colored_label(
+                                    egui::Color32::RED,
+                                    format!("{} segments", count),
+                                );
+                            } else {
+                                ui.colored_label(egui::Color32::GREEN, "None");
+                            }
+                        });
+                    }
                 });
 
                 ui.separator();

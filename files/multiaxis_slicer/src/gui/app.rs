@@ -8,6 +8,7 @@ use crate::gui::{viewport_3d::Viewport3D, theme};
 use crate::support_generation::{SupportGenerator, SupportResult, OverhangConfig};
 use crate::s3_slicer::{
     execute_s3_pipeline, execute_s4_pipeline, S3PipelineConfig, FabricationObjective,
+    S4DeformData, execute_s4_deform, execute_s4_slice, execute_s4_untransform,
     quaternion_field::{QuaternionField, QuaternionFieldConfig},
     deformation_v2::S3SlicerDeformation,
 };
@@ -84,6 +85,192 @@ pub enum SlicingMode {
     CoordTransformSpherical,
 }
 
+/// Tracks the current stage of the S4 interactive step-by-step workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum S4Stage {
+    #[default]
+    Idle,      // No deformation stored
+    Deformed,  // S4DeformData stored, deformed mesh visible in viewport
+    Sliced,    // Deformed layers computed (flat layers on deformed mesh)
+    Final,     // Layers untransformed back to original space
+}
+
+// ─── Printer Profile Data Model ──────────────────────────────────────────────
+
+/// Whether a rotary axis moves the head or the bed
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum MovingPart { Head, Bed }
+
+impl MovingPart {
+    pub fn label(&self) -> &'static str { match self { Self::Head => "Head", Self::Bed => "Bed" } }
+    pub fn all() -> &'static [Self] { &[Self::Head, Self::Bed] }
+}
+
+/// Whether an axis is linear or rotary
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum AxisType { Linear, Rotary }
+
+impl AxisType {
+    pub fn label(&self) -> &'static str { match self { Self::Linear => "Linear", Self::Rotary => "Rotary" } }
+    pub fn all() -> &'static [Self] { &[Self::Linear, Self::Rotary] }
+}
+
+/// Configuration for a single machine axis
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AxisConfig {
+    pub name: String,           // "A", "B", "C", "U", "V", "W", …
+    pub axis_type: AxisType,
+    pub moving_part: MovingPart,
+    pub min: f64,
+    pub max: f64,
+}
+
+impl Default for AxisConfig {
+    fn default() -> Self {
+        Self { name: "A".to_string(), axis_type: AxisType::Rotary, moving_part: MovingPart::Head, min: -180.0, max: 180.0 }
+    }
+}
+
+/// High-level kinematics category
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum KinematicsType {
+    Cartesian,
+    CoreXY,
+    Delta,
+    FiveAxis,
+    SixAxis,
+    SevenAxis,
+    RoboticArm,
+}
+
+impl KinematicsType {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Cartesian  => "Cartesian (3-axis)",
+            Self::CoreXY     => "CoreXY",
+            Self::Delta      => "Delta",
+            Self::FiveAxis   => "5-Axis CNC",
+            Self::SixAxis    => "6-Axis Robotic Arm",
+            Self::SevenAxis  => "7-Axis (Trunnion + Rotary Head)",
+            Self::RoboticArm => "Robotic Arm (custom)",
+        }
+    }
+    pub fn all() -> &'static [Self] {
+        use KinematicsType::*;
+        &[Cartesian, CoreXY, Delta, FiveAxis, SixAxis, SevenAxis, RoboticArm]
+    }
+}
+
+/// A complete printer hardware profile that can be saved/loaded as JSON
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PrinterProfile {
+    pub name: String,
+    // Build volume
+    pub workspace_x: (f64, f64),
+    pub workspace_y: (f64, f64),
+    pub workspace_z: (f64, f64),
+    // Kinematics
+    pub kinematics_type: KinematicsType,
+    /// Flexible rotary axis list — up to 7 axes
+    pub rotary_axes: Vec<AxisConfig>,
+    // 5-axis G-code output
+    pub tcp_offset: f64,
+    pub rotary_axis_mode: crate::gcode::RotaryAxisMode,
+    // Toolhead
+    pub nozzle_diameter: f64,
+    pub max_feedrate: f64,
+    pub has_heated_bed: bool,
+    // Machine simulation geometry  (all have serde defaults for backward compatibility)
+    #[serde(default = "profile_default_show_machine")]
+    pub show_machine: bool,
+    /// Bed bounding box [width_mm, depth_mm, height_mm]
+    #[serde(default = "profile_default_bed_dims")]
+    pub bed_dims: [f64; 3],
+    /// World-space pivot point the bed axes rotate around (usually origin)
+    #[serde(default)]
+    pub bed_pivot: [f64; 3],
+    /// Optional path to an STL file that replaces the parametric bed box
+    #[serde(default)]
+    pub bed_stl_path: Option<String>,
+    /// Printhead carriage bounding box [width_mm, depth_mm, height_mm]
+    #[serde(default = "profile_default_head_dims")]
+    pub head_dims: [f64; 3],
+    /// Optional path to an STL file that replaces the parametric head box
+    #[serde(default)]
+    pub head_stl_path: Option<String>,
+    /// The point inside the head STL file that corresponds to the nozzle tip [x, y, z] in mm.
+    /// When the STL is placed in the simulation, this local point is pinned to the actual
+    /// nozzle-tip world position.  Default (0,0,0) means the STL origin IS the nozzle tip.
+    #[serde(default)]
+    pub head_stl_tip_offset: [f64; 3],
+    /// Radius of the nozzle cylinder that hangs below the head pivot (mm)
+    #[serde(default = "profile_default_nozzle_radius")]
+    pub nozzle_radius: f64,
+    /// Visual length of the nozzle cylinder hanging below the head body pivot (mm).
+    /// Independent of tcp_offset; set this to match the real nozzle-tip distance from
+    /// the carriage so the machine simulation looks correct.
+    #[serde(default = "profile_default_nozzle_length")]
+    pub nozzle_length: f64,
+    /// Bed surface shape for machine simulation
+    #[serde(default)]
+    pub bed_shape: BedShape,
+}
+
+fn profile_default_show_machine() -> bool { true }
+fn profile_default_bed_dims() -> [f64; 3] { [200.0, 200.0, 10.0] }
+fn profile_default_head_dims() -> [f64; 3] { [60.0, 60.0, 80.0] }
+fn profile_default_nozzle_radius() -> f64 { 5.0 }
+fn profile_default_nozzle_length() -> f64 { 20.0 }
+
+/// Bed surface shape used in machine simulation
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub enum BedShape {
+    #[default]
+    Rectangle,
+    Circle,
+}
+
+impl Default for PrinterProfile {
+    fn default() -> Self {
+        Self {
+            name: "Generic 5-Axis".to_string(),
+            workspace_x: (0.0, 200.0),
+            workspace_y: (0.0, 200.0),
+            workspace_z: (0.0, 200.0),
+            kinematics_type: KinematicsType::FiveAxis,
+            rotary_axes: vec![
+                AxisConfig { name: "A".to_string(), axis_type: AxisType::Rotary, moving_part: MovingPart::Head, min: -180.0, max: 180.0 },
+                AxisConfig { name: "B".to_string(), axis_type: AxisType::Rotary, moving_part: MovingPart::Bed,  min: -180.0, max: 180.0 },
+            ],
+            tcp_offset: 0.0,
+            rotary_axis_mode: crate::gcode::RotaryAxisMode::AB,
+            nozzle_diameter: 0.4,
+            max_feedrate: 150.0,
+            has_heated_bed: true,
+            show_machine: true,
+            bed_dims: [200.0, 200.0, 10.0],
+            bed_pivot: [0.0, 0.0, 0.0],
+            bed_stl_path: None,
+            head_dims: [60.0, 60.0, 80.0],
+            head_stl_path: None,
+            head_stl_tip_offset: [0.0, 0.0, 0.0],
+            bed_shape: BedShape::Rectangle,
+            nozzle_radius: 5.0,
+            nozzle_length: 20.0,
+        }
+    }
+}
+
+/// Top-level tab navigation (browser-tab style)
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum AppTab {
+    #[default]
+    Main,
+    PrinterProfiles,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Main application state
 pub struct SlicerApp {
     // Model data
@@ -157,6 +344,13 @@ pub struct SlicerApp {
     // Channel for receiving deformed mesh from background thread
     deformed_mesh_receiver: Option<mpsc::Receiver<Mesh>>,
 
+    // S4 interactive step-by-step workflow state
+    pub s4_stage: S4Stage,
+    pub s4_deform_data: Option<Box<S4DeformData>>,
+    pub s4_deformed_layers: Vec<Layer>,
+    s4_deform_result_receiver: Option<mpsc::Receiver<S4DeformData>>,
+    s4_deformed_layers_receiver: Option<mpsc::Receiver<Vec<Layer>>>,
+
     // 3D viewport
     pub viewport_3d: Option<Viewport3D>,
 
@@ -219,6 +413,31 @@ pub struct SlicerApp {
 
     // Logs
     pub log_messages: Vec<String>,
+
+    // Toolpath post-processing
+    /// Apply mesh surface normals as tool orientation for all non-conical slicing modes.
+    /// Makes the tool tilt perpendicular to the printed surface, maximising rotary-axis use.
+    pub use_surface_normals: bool,
+    /// Z clearance (mm) added to non-extruding travel moves so the nozzle clears the print.
+    pub travel_z_lift: f64,
+
+    // Machine simulation
+    /// Whether to show the machine bed + head in the viewport (mirrors active profile flag)
+    pub show_machine_simulation: bool,
+    /// One entry per flat toolpath segment (layer0_seg0, layer0_seg1, …, layer1_seg0, …).
+    /// `true` = the head would physically collide with the bed at that move.
+    pub collision_segments: Vec<bool>,
+
+    // Tab navigation
+    pub active_tab: AppTab,
+
+    // Profile page I/O status
+    pub profile_io_error: Option<String>,   // last load/save error to show inline
+
+    // Printer profiles
+    pub profiles: Vec<PrinterProfile>,
+    pub active_profile_index: usize,   // which profile is loaded into the main session
+    pub editing_profile_index: usize,  // which profile is open in the profiles page
 }
 
 impl Default for SlicerApp {
@@ -283,6 +502,12 @@ impl Default for SlicerApp {
             layers_receiver: None,
             deformed_mesh_receiver: None,
 
+            s4_stage: S4Stage::Idle,
+            s4_deform_data: None,
+            s4_deformed_layers: Vec::new(),
+            s4_deform_result_receiver: None,
+            s4_deformed_layers_receiver: None,
+
             viewport_3d: None,
 
             // S3-Slicer defaults
@@ -342,6 +567,24 @@ impl Default for SlicerApp {
             selected_face_index: None,
 
             log_messages: vec!["Welcome to MultiAxis Slicer!".to_string()],
+
+            // Toolpath post-processing
+            use_surface_normals: true,
+            travel_z_lift: 2.0,
+
+            // Machine simulation
+            show_machine_simulation: false,
+            collision_segments: Vec::new(),
+
+            // Tab navigation
+            active_tab: AppTab::Main,
+
+            profile_io_error: None,
+
+            // Printer profiles — start with one default profile
+            profiles: vec![PrinterProfile::default()],
+            active_profile_index: 0,
+            editing_profile_index: 0,
         }
     }
 }
@@ -353,6 +596,26 @@ impl SlicerApp {
         theme::apply_theme(&cc.egui_ctx);
 
         let mut app = Self::default();
+
+        // Restore persisted printer profiles and active index
+        if let Some(storage) = cc.storage {
+            if let Some(json) = storage.get_string("printer_profiles") {
+                if let Ok(profiles) = serde_json::from_str::<Vec<PrinterProfile>>(&json) {
+                    if !profiles.is_empty() {
+                        app.profiles = profiles;
+                    }
+                }
+            }
+            if let Some(idx_str) = storage.get_string("active_profile_index") {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    app.active_profile_index = idx.min(app.profiles.len().saturating_sub(1));
+                    app.editing_profile_index = app.active_profile_index;
+                }
+            }
+        }
+
+        // Apply the loaded profile so machine simulation and settings are live from the start
+        app.apply_active_profile();
 
         // Initialize 3D viewport
         app.viewport_3d = Some(Viewport3D::new(cc));
@@ -369,6 +632,417 @@ impl SlicerApp {
         if self.log_messages.len() > 100 {
             self.log_messages.remove(0);
         }
+    }
+
+    /// Apply the active profile's settings to the current session
+    pub fn apply_active_profile(&mut self) {
+        if let Some(p) = self.profiles.get(self.active_profile_index).cloned() {
+            self.machine.name = p.name.clone();
+            self.machine.workspace_x = p.workspace_x;
+            self.machine.workspace_y = p.workspace_y;
+            self.machine.workspace_z = p.workspace_z;
+            // Map first two rotary axes to legacy a/b ranges for machine config
+            if let Some(ax) = p.rotary_axes.get(0) { self.machine.a_axis_range = (ax.min, ax.max); }
+            if let Some(ax) = p.rotary_axes.get(1) { self.machine.b_axis_range = (ax.min, ax.max); }
+            self.machine.max_feedrate = p.max_feedrate;
+            self.machine.has_heated_bed = p.has_heated_bed;
+            self.tcp_offset = p.tcp_offset;
+            self.rotary_axis_mode = p.rotary_axis_mode.clone();
+            self.nozzle_diameter = p.nozzle_diameter;
+            self.feedrate = p.max_feedrate;
+            self.show_machine_simulation = p.show_machine;
+        }
+    }
+
+    /// Compute axis angles for a single tool orientation using the active profile's axis list.
+    pub fn compute_segment_axis_angles(
+        &self,
+        orientation: &crate::geometry::Vector3D,
+    ) -> Vec<(String, f64)> {
+        let mut gen = crate::gcode::GCodeGenerator::new();
+        gen.kinematics.axes = self.build_gcode_axes();
+        gen.compute_axis_angles(orientation)
+    }
+
+    /// Assign mesh surface normals as tool orientation for every toolpath segment.
+    ///
+    /// Builds a fast 2-D XY bin grid over all triangles.  For each segment the nearest
+    /// triangle centroid is found and its face normal used as the orientation vector.
+    /// The normal is always flipped to the upper hemisphere (Z ≥ 0) and clamped to the
+    /// maximum tilt angle of the head rotary axes defined in the active printer profile.
+    ///
+    /// Skipped for `Conical` mode (which has its own analytical normal formula).
+    pub fn apply_surface_normal_orientations(&mut self) {
+        if matches!(self.slicing_mode, SlicingMode::Conical) { return; }
+        if !self.use_surface_normals { return; }
+
+        let mesh = match &self.mesh { Some(m) => m, None => return };
+        if self.toolpaths.is_empty() { return; }
+
+        // ── Build 2-D XY bin grid ─────────────────────────────────────────
+        let n_tris = mesh.triangles.len();
+        let mut centroids: Vec<[f64; 3]> = Vec::with_capacity(n_tris);
+        let mut face_normals: Vec<crate::geometry::Vector3D> = Vec::with_capacity(n_tris);
+
+        for tri in &mesh.triangles {
+            let cx = (tri.v0.x + tri.v1.x + tri.v2.x) / 3.0;
+            let cy = (tri.v0.y + tri.v1.y + tri.v2.y) / 3.0;
+            let cz = (tri.v0.z + tri.v1.z + tri.v2.z) / 3.0;
+            centroids.push([cx, cy, cz]);
+
+            let mut n = tri.normal();
+            if n.z < 0.0 { n = -n; } // always upper hemisphere
+            face_normals.push(n);
+        }
+
+        let x_min = mesh.bounds_min.x;
+        let y_min = mesh.bounds_min.y;
+        let x_range = (mesh.bounds_max.x - x_min).max(1.0);
+        let y_range = (mesh.bounds_max.y - y_min).max(1.0);
+        let nx: usize = 48;
+        let ny: usize = 48;
+        let bsx = x_range / nx as f64;
+        let bsy = y_range / ny as f64;
+
+        let mut bins: Vec<Vec<usize>> = vec![Vec::new(); nx * ny];
+        for (i, c) in centroids.iter().enumerate() {
+            let bx = ((c[0] - x_min) / bsx).floor() as isize;
+            let by = ((c[1] - y_min) / bsy).floor() as isize;
+            let bx = bx.clamp(0, nx as isize - 1) as usize;
+            let by = by.clamp(0, ny as isize - 1) as usize;
+            bins[by * nx + bx].push(i);
+        }
+
+        // Helper: find nearest-triangle normal for a query point
+        let nearest_normal = |qx: f64, qy: f64, qz: f64| -> crate::geometry::Vector3D {
+            let bx0 = ((qx - x_min) / bsx).floor() as isize;
+            let by0 = ((qy - y_min) / bsy).floor() as isize;
+            let mut best_d2 = f64::MAX;
+            let mut best_n = crate::geometry::Vector3D::new(0.0, 0.0, 1.0);
+            // Expand search ring until we find at least one candidate
+            for radius in 0..=4isize {
+                for dy in -radius..=radius {
+                    for dx in -radius..=radius {
+                        if radius > 0 && dx.abs() != radius && dy.abs() != radius { continue; }
+                        let bx = (bx0 + dx).clamp(0, nx as isize - 1) as usize;
+                        let by = (by0 + dy).clamp(0, ny as isize - 1) as usize;
+                        for &ti in &bins[by * nx + bx] {
+                            let c = centroids[ti];
+                            let d2 = (c[0]-qx)*(c[0]-qx) + (c[1]-qy)*(c[1]-qy) + (c[2]-qz)*(c[2]-qz);
+                            if d2 < best_d2 { best_d2 = d2; best_n = face_normals[ti]; }
+                        }
+                    }
+                }
+                if best_d2 < f64::MAX { break; }
+            }
+            best_n
+        };
+
+        // ── Max tilt from active profile head axes ────────────────────────
+        let max_tilt_deg = self.profiles.get(self.active_profile_index)
+            .map(|p| {
+                p.rotary_axes.iter()
+                    .filter(|ax| ax.moving_part == MovingPart::Head && ax.axis_type == AxisType::Rotary)
+                    .map(|ax| ax.max.abs().max(ax.min.abs()))
+                    .fold(0.0f64, f64::max)
+            })
+            .unwrap_or(0.0);
+        // Fall back to 45° if no head axes defined
+        let max_tilt_deg = if max_tilt_deg < 1.0 { 45.0 } else { max_tilt_deg };
+        let max_tilt_rad = max_tilt_deg.to_radians();
+
+        // ── Assign orientations ───────────────────────────────────────────
+        let mut count = 0usize;
+        for toolpath in &mut self.toolpaths {
+            for segment in &mut toolpath.paths {
+                let mut n = nearest_normal(
+                    segment.position.x,
+                    segment.position.y,
+                    segment.position.z,
+                );
+
+                // Normalise (already unit from Triangle::normal, but be safe)
+                let len = n.norm();
+                if len < 1e-6 { continue; }
+                n /= len;
+
+                // Clamp tilt to max rotary axis range
+                let tilt = n.z.clamp(-1.0, 1.0).acos(); // radians from vertical
+                let orientation = if tilt > max_tilt_rad {
+                    let xy = (n.x * n.x + n.y * n.y).sqrt();
+                    if xy > 1e-6 {
+                        let s = max_tilt_rad.sin() / xy;
+                        crate::geometry::Vector3D::new(n.x * s, n.y * s, max_tilt_rad.cos())
+                    } else {
+                        crate::geometry::Vector3D::new(0.0, 0.0, 1.0)
+                    }
+                } else {
+                    n
+                };
+
+                segment.orientation = orientation;
+                count += 1;
+            }
+        }
+
+        self.log(format!(
+            "Applied surface normals to {} segments (max tilt {:.0}°, {} triangles)",
+            count, max_tilt_deg, n_tris
+        ));
+    }
+
+    /// Lift non-extruding (travel) moves by `travel_z_lift` mm above the last extrusion Z.
+    ///
+    /// This ensures the nozzle clears already-printed material when traversing between
+    /// islands, preventing collisions and surface scarring.
+    ///
+    /// Only travels with XY displacement ≥ 1 mm are lifted (short hops are left as-is
+    /// to avoid excessive Z oscillation within a dense infill region).
+    pub fn apply_travel_lifts(&mut self) {
+        let lift = self.travel_z_lift;
+        if lift < 0.01 { return; }
+
+        const MIN_XY: f64 = 1.0; // mm — ignore micro-travels within a region
+
+        for toolpath in &mut self.toolpaths {
+            let mut last_extrude_z = toolpath.z;
+            let mut last_extrude_x = 0.0_f64;
+            let mut last_extrude_y = 0.0_f64;
+
+            for seg in &mut toolpath.paths {
+                if seg.extrusion > 1e-8 {
+                    last_extrude_z = seg.position.z;
+                    last_extrude_x = seg.position.x;
+                    last_extrude_y = seg.position.y;
+                } else {
+                    // Travel move: lift Z if far enough from last extrusion point
+                    let dx = seg.position.x - last_extrude_x;
+                    let dy = seg.position.y - last_extrude_y;
+                    if (dx * dx + dy * dy).sqrt() >= MIN_XY {
+                        seg.position.z = seg.position.z.max(last_extrude_z + lift);
+                    }
+                }
+            }
+        }
+
+        self.log(format!("Applied {:.1} mm travel lift to all toolpaths", lift));
+    }
+
+    /// Post-process toolpath segments generated by conical slicing to assign the correct
+    /// cone-surface normal as each segment's orientation.  This drives the rotary axes so
+    /// the tool tilts perpendicular to the cone, avoiding collisions with the print surface.
+    ///
+    /// Formula derivation:
+    ///   Outward (sign = -1 in conical.rs): world-space z = z_slice + r·tan α
+    ///     ∂z/∂r = +tan α  →  unnorm normal = (−sin α·dx/r, −sin α·dy/r, cos α)
+    ///   Inward  (sign = +1 in conical.rs): world-space z = z_slice − r·tan α
+    ///     ∂z/∂r = −tan α  →  unnorm normal = (+sin α·dx/r, +sin α·dy/r, cos α)
+    pub fn apply_conical_orientations(&mut self) {
+        if !matches!(self.slicing_mode, SlicingMode::Conical) {
+            return;
+        }
+
+        let alpha_rad = self.conical_angle_degrees.to_radians();
+        let sin_a = alpha_rad.sin();
+        let cos_a = alpha_rad.cos();
+
+        // Outward: world z increases with r → radial normal component points inward (−)
+        // Inward:  world z decreases with r → radial normal component points outward (+)
+        let radial_sign = match self.conical_direction {
+            crate::conical::ConicalDirection::Outward => -1.0_f64,
+            crate::conical::ConicalDirection::Inward  =>  1.0_f64,
+        };
+
+        let cx = if self.conical_auto_center {
+            self.mesh.as_ref()
+                .map(|m| (m.bounds_min.x + m.bounds_max.x) / 2.0)
+                .unwrap_or(0.0)
+        } else {
+            self.conical_center_x
+        };
+        let cy = if self.conical_auto_center {
+            self.mesh.as_ref()
+                .map(|m| (m.bounds_min.y + m.bounds_max.y) / 2.0)
+                .unwrap_or(0.0)
+        } else {
+            self.conical_center_y
+        };
+
+        let mut count = 0usize;
+        for toolpath in &mut self.toolpaths {
+            for segment in &mut toolpath.paths {
+                let dx = segment.position.x - cx;
+                let dy = segment.position.y - cy;
+                let r = (dx * dx + dy * dy).sqrt();
+
+                if r < 0.5 {
+                    // Near the axis: keep vertical to avoid numerical instability
+                    segment.orientation = crate::geometry::Vector3D::new(0.0, 0.0, 1.0);
+                } else {
+                    let nx = radial_sign * sin_a * dx / r;
+                    let ny = radial_sign * sin_a * dy / r;
+                    // Normal is already unit-length: |n|² = sin²α + cos²α = 1
+                    segment.orientation = crate::geometry::Vector3D::new(nx, ny, cos_a);
+                }
+                count += 1;
+            }
+        }
+
+        self.log(format!(
+            "Applied conical orientations: {:.1}° half-angle, {} total segments",
+            self.conical_angle_degrees, count
+        ));
+    }
+
+    /// Compute head↔bed AABB collision for every toolpath segment and store the result.
+    ///
+    /// Uses the AABB-of-OBB formula so each box's axis-aligned bounding box is computed
+    /// after applying the kinematic rotation, then the two AABBs are checked for overlap.
+    pub fn compute_all_collisions(&mut self) {
+        let profile = match self.profiles.get(self.active_profile_index) {
+            Some(p) => p.clone(),
+            None => { self.collision_segments.clear(); return; }
+        };
+
+        if !profile.show_machine {
+            self.collision_segments.clear();
+            return;
+        }
+
+        // Half-extents of bed box
+        let bh = [
+            profile.bed_dims[0] as f32 / 2.0,
+            profile.bed_dims[1] as f32 / 2.0,
+            profile.bed_dims[2] as f32 / 2.0,
+        ];
+        // Half-extents of head box (centred at head_h/2 above pivot)
+        // We treat the head as a box with half-extents covering the full carriage + nozzle below
+        let total_head_h = profile.head_dims[2] as f32 + self.tcp_offset as f32;
+        let hh = [
+            profile.head_dims[0] as f32 / 2.0,
+            profile.head_dims[1] as f32 / 2.0,
+            total_head_h / 2.0,
+        ];
+        // Bed pivot in world space
+        let bed_pivot = [
+            profile.bed_pivot[0] as f32,
+            profile.bed_pivot[1] as f32,
+            profile.bed_pivot[2] as f32,
+        ];
+
+        let tcp = self.tcp_offset as f32;
+
+        let total: usize = self.toolpaths.iter().map(|tp| tp.paths.len()).sum();
+        let mut results = vec![false; total];
+
+        let mut flat_idx = 0usize;
+        for toolpath in &self.toolpaths {
+            for segment in &toolpath.paths {
+                let o = &segment.orientation;
+                let angles = self.compute_segment_axis_angles(o);
+
+                // Separate head/bed axis angles
+                let gcode_axes = self.build_gcode_axes();
+                let head_angles: Vec<f64> = gcode_axes.iter()
+                    .zip(angles.iter())
+                    .filter(|(ax, _)| ax.is_head)
+                    .take(2)
+                    .map(|(_, (_, deg))| *deg)
+                    .collect();
+                let bed_angles: Vec<f64> = gcode_axes.iter()
+                    .zip(angles.iter())
+                    .filter(|(ax, _)| !ax.is_head)
+                    .take(2)
+                    .map(|(_, (_, deg))| *deg)
+                    .collect();
+
+                let ha = head_angles.first().copied().unwrap_or(0.0_f64).to_radians() as f32;
+                let hb = head_angles.get(1).copied().unwrap_or(0.0_f64).to_radians() as f32;
+                let ba = bed_angles.first().copied().unwrap_or(0.0_f64).to_radians() as f32;
+                let bb = bed_angles.get(1).copied().unwrap_or(0.0_f64).to_radians() as f32;
+
+                // Head AABB — pivot = nozzle_tip + tcp * orientation
+                let nozzle = [
+                    segment.position.x as f32,
+                    segment.position.y as f32,
+                    segment.position.z as f32,
+                ];
+                let len = ((o.x * o.x + o.y * o.y + o.z * o.z) as f32).sqrt().max(1e-6);
+                let pivot_head = [
+                    nozzle[0] - tcp * (o.x as f32) / len,
+                    nozzle[1] - tcp * (o.y as f32) / len,
+                    nozzle[2] - tcp * (o.z as f32) / len,
+                ];
+                // Rotation matrix for head (Rx(ha) * Ry(hb))
+                let rh = rotation_matrix_xy(ha, hb);
+                let head_aabb_half = aabb_of_obb(hh, rh);
+                let head_center = [
+                    pivot_head[0],
+                    pivot_head[1],
+                    pivot_head[2] + hh[2] - tcp,  // head body centre above pivot, minus nozzle below
+                ];
+
+                // Bed AABB — rotated around bed_pivot
+                let rb = rotation_matrix_xy(ba, bb);
+                let bed_aabb_half = aabb_of_obb(bh, rb);
+                let bed_center = [
+                    bed_pivot[0],
+                    bed_pivot[1],
+                    bed_pivot[2] + bh[2],  // bed centre is half-height above pivot
+                ];
+
+                // AABB overlap check
+                let collides = (0..3).all(|i| {
+                    (head_center[i] - bed_center[i]).abs()
+                        <= head_aabb_half[i] + bed_aabb_half[i]
+                });
+                results[flat_idx] = collides;
+
+                flat_idx += 1;
+            }
+        }
+
+        let collision_count = results.iter().filter(|&&c| c).count();
+        if collision_count > 0 {
+            self.log(format!("⚠️ Machine simulation: {} collision segments detected", collision_count));
+        }
+        self.collision_segments = results;
+    }
+
+    /// Build `Vec<GCodeAxis>` from the active profile for G-code generation.
+    ///
+    /// Only rotary axes are included (linear axes X/Y/Z are handled by the
+    /// generator directly).  The profile's `AxisConfig` fields are converted to
+    /// the leaner `GCodeAxis` form expected by `GCodeGenerator`.
+    pub fn build_gcode_axes(&self) -> Vec<crate::gcode::GCodeAxis> {
+        self.profiles
+            .get(self.active_profile_index)
+            .map(|p| {
+                p.rotary_axes
+                    .iter()
+                    .filter(|ax| ax.axis_type == AxisType::Rotary)
+                    .map(|ax| crate::gcode::GCodeAxis {
+                        name: ax.name.clone(),
+                        is_head: ax.moving_part == MovingPart::Head,
+                        min_deg: ax.min,
+                        max_deg: ax.max,
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![
+                crate::gcode::GCodeAxis { name: "A".to_string(), is_head: true, min_deg: -180.0, max_deg: 180.0 },
+                crate::gcode::GCodeAxis { name: "B".to_string(), is_head: true, min_deg: -180.0, max_deg: 180.0 },
+            ])
+    }
+
+    /// Render the browser-style tab bar at the top of the window
+    fn render_tab_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.active_tab, AppTab::Main, "  Main  ");
+                ui.selectable_value(&mut self.active_tab, AppTab::PrinterProfiles, "  Printer Profiles  ");
+            });
+        });
     }
 
     /// Load a mesh from file
@@ -691,6 +1365,85 @@ impl SlicerApp {
                     p.message = "S4 pipeline failed (panic)".to_string();
                 }
             }
+        });
+    }
+
+    /// Step 2 of S4 interactive workflow: slice the deformed mesh with planar slicer.
+    /// Requires `s4_stage == Deformed` (i.e. `s4_deform_data` is set).
+    pub fn start_s4_slice_deformed(&mut self) {
+        let Some(data) = &self.s4_deform_data else {
+            self.log("S4: No deform data — run Step 1 first.".to_string());
+            return;
+        };
+        let deformed_surface = data.deformed_surface.clone();
+        let layer_height = self.config.layer_height;
+        let progress = self.slicing_progress.clone();
+
+        let (tx, rx) = mpsc::channel();
+        self.s4_deformed_layers_receiver = Some(rx);
+
+        std::thread::spawn(move || {
+            {
+                let mut p = progress.lock().unwrap();
+                p.operation = "S4 Slicing Deformed Mesh".to_string();
+                p.percentage = 10.0;
+                p.message = "Slicing deformed mesh (planar)...".to_string();
+            }
+            match execute_s4_slice(&deformed_surface, layer_height) {
+                Ok(layers) => {
+                    let n = layers.len();
+                    log::info!("S4 slice deformed: {} layers", n);
+                    let _ = tx.send(layers);
+                    let mut p = progress.lock().unwrap();
+                    p.operation = "Complete".to_string();
+                    p.percentage = 100.0;
+                    p.message = format!("Sliced deformed mesh: {} layers", n);
+                }
+                Err(e) => {
+                    log::error!("S4 slice deformed failed: {}", e);
+                    let mut p = progress.lock().unwrap();
+                    p.operation = "Error".to_string();
+                    p.message = format!("S4 slice failed: {}", e);
+                }
+            }
+        });
+    }
+
+    /// Step 3 of S4 interactive workflow: untransform the deformed layers back to original space.
+    /// Requires `s4_stage == Sliced` (i.e. `s4_deformed_layers` is populated).
+    pub fn start_s4_untransform(&mut self) {
+        let Some(data) = &self.s4_deform_data else {
+            self.log("S4: No deform data — run Steps 1 and 2 first.".to_string());
+            return;
+        };
+        let Some(mesh) = &self.mesh else { return; };
+        let planar_layers = self.s4_deformed_layers.clone();
+        let data = (**data).clone();
+        let original_mesh = mesh.clone();
+        let layer_height = self.config.layer_height;
+        let progress = self.slicing_progress.clone();
+
+        let (tx, rx) = mpsc::channel();
+        self.layers_receiver = Some(rx);
+        self.is_slicing = true;
+
+        std::thread::spawn(move || {
+            {
+                let mut p = progress.lock().unwrap();
+                p.operation = "S4 Untransform".to_string();
+                p.percentage = 10.0;
+                p.message = "Untransforming layers to original mesh space...".to_string();
+            }
+            let layers = execute_s4_untransform(planar_layers, &data, &original_mesh, layer_height);
+            let n = layers.len();
+            log::info!("S4 untransform complete: {} layers", n);
+            let _ = tx.send(layers);
+            let mut p = progress.lock().unwrap();
+            p.operation = "Complete".to_string();
+            p.percentage = 100.0;
+            p.layers_completed = n;
+            p.total_layers = n;
+            p.message = format!("S4 final layers: {}", n);
         });
     }
 
@@ -1018,75 +1771,56 @@ impl SlicerApp {
             self.is_deforming = true;
             let mesh_clone = mesh.clone();
             // Use S4-specific config when in S4 mode, fall back to S3 config for legacy S4Deform
-            let (overhang_threshold, smoothness_weight, optimization_iterations,
-                 max_rotation_degrees, asap_max_iterations, asap_convergence, z_bias) =
-                if self.slicing_mode == SlicingMode::S4 {
-                    (self.s4_overhang_threshold, self.s4_smoothness_weight,
-                     self.s4_smoothing_iterations * 2, self.s4_max_rotation_degrees,
-                     self.s4_asap_max_iterations, self.s4_asap_convergence, self.s4_z_bias)
-                } else {
-                    (self.s3_overhang_threshold, self.s3_smoothness_weight,
-                     self.s3_optimization_iterations, self.config.max_rotation_degrees,
-                     self.s3_asap_max_iterations, self.s3_asap_convergence, 0.8f64)
-                };
+            let pipeline_config = if self.slicing_mode == SlicingMode::S4 {
+                S3PipelineConfig {
+                    objective: FabricationObjective::SupportFree,
+                    layer_height: self.config.layer_height,
+                    optimization_iterations: self.s4_smoothing_iterations * 2,
+                    overhang_threshold: self.s4_overhang_threshold,
+                    smoothness_weight: self.s4_smoothness_weight,
+                    max_rotation_degrees: self.s4_max_rotation_degrees,
+                    deformation_method: crate::s3_slicer::DeformationMethod::S4Deform,
+                    asap_max_iterations: self.s4_asap_max_iterations,
+                    asap_convergence_threshold: self.s4_asap_convergence,
+                    z_bias: self.s4_z_bias,
+                }
+            } else {
+                S3PipelineConfig {
+                    objective: self.s3_fabrication_objective,
+                    layer_height: self.config.layer_height,
+                    optimization_iterations: self.s3_optimization_iterations,
+                    overhang_threshold: self.s3_overhang_threshold,
+                    smoothness_weight: self.s3_smoothness_weight,
+                    max_rotation_degrees: self.config.max_rotation_degrees,
+                    deformation_method: crate::s3_slicer::DeformationMethod::S4Deform,
+                    asap_max_iterations: self.s3_asap_max_iterations,
+                    asap_convergence_threshold: self.s3_asap_convergence,
+                    z_bias: 0.8,
+                }
+            };
 
-            let (tx, rx) = mpsc::channel();
-            self.deformed_mesh_receiver = Some(rx);
+            // Two channels: one for the deformed surface (mesh display), one for full S4DeformData
+            let (mesh_tx, mesh_rx) = mpsc::channel::<Mesh>();
+            let (data_tx, data_rx) = mpsc::channel::<S4DeformData>();
+            self.deformed_mesh_receiver = Some(mesh_rx);
+            self.s4_deform_result_receiver = Some(data_rx);
 
             std::thread::spawn(move || {
-                use crate::s3_slicer::TetMesh;
-                use crate::s3_slicer::tet_dijkstra_field::TetDijkstraField;
-                use crate::s3_slicer::s4_rotation_field::{S4RotationField, S4RotationConfig};
-                use crate::s3_slicer::pipeline::deform_tet_mesh_direct;
-
-                log::info!("=== S4 Deform Preview ===");
-
-                // Step 1: Tetrahedralize
-                log::info!("Step 1/4: Tetrahedralizing...");
-                let tet_mesh = match TetMesh::from_surface_mesh(&mesh_clone) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        log::error!("S4 preview failed: {}. No deformation preview available.", e);
-                        let _ = tx.send(mesh_clone);
-                        return;
+                log::info!("=== S4 Deform Preview (step 1 of 3) ===");
+                match execute_s4_deform(&mesh_clone, &pipeline_config) {
+                    Ok(data) => {
+                        log::info!("S4 deform complete: {} tris on deformed surface",
+                            data.deformed_surface.triangles.len());
+                        let surface = data.deformed_surface.clone();
+                        let _ = data_tx.send(data);
+                        let _ = mesh_tx.send(surface);
                     }
-                };
-                log::info!("  → {} vertices, {} tets", tet_mesh.vertices.len(), tet_mesh.tets.len());
-
-                // Step 2: Dijkstra field
-                log::info!("Step 2/4: Computing Dijkstra field (z_bias={:.2})...", z_bias);
-                let dijkstra_field = TetDijkstraField::compute(&tet_mesh, z_bias);
-
-                // Step 3: S4 rotation field
-                log::info!("Step 3/4: Computing S4 rotation field...");
-                let s4_config = S4RotationConfig {
-                    build_direction: crate::geometry::Vector3D::new(0.0, 0.0, 1.0),
-                    overhang_threshold,
-                    max_rotation_degrees,
-                    z_bias,
-                    smoothing_iterations: optimization_iterations / 2,
-                    smoothness_weight,
-                };
-                let rotation_field = S4RotationField::compute(&tet_mesh, &dijkstra_field, &s4_config);
-
-                // Step 4: Direct vertex rotation deformation
-                log::info!("Step 4/4: Applying direct vertex rotation...");
-                let deformed_tet = deform_tet_mesh_direct(&tet_mesh, &rotation_field.rotations);
-
-                let quality = deformed_tet.check_quality();
-                log::info!("  → Inverted: {}, degenerate: {}",
-                    quality.inverted_tets, quality.degenerate_tets);
-
-                // Deform original mesh surface through tet field (not blocky tet surface)
-                let deformed_surface = crate::s3_slicer::tet_point_location::deform_surface_through_tets(
-                    &mesh_clone,
-                    &tet_mesh,
-                    &deformed_tet,
-                );
-                log::info!("  → Deformed surface: {} triangles (original mesh topology)", deformed_surface.triangles.len());
-                log::info!("S4 deformation preview complete");
-
-                let _ = tx.send(deformed_surface);
+                    Err(e) => {
+                        log::error!("S4 deform preview failed: {}", e);
+                        // Send original mesh so the viewport doesn't freeze
+                        let _ = mesh_tx.send(mesh_clone);
+                    }
+                }
             });
             return;
         }
@@ -1334,6 +2068,22 @@ impl SlicerApp {
         let total_moves: usize = self.toolpaths.iter().map(|tp| tp.paths.len()).sum();
         self.log(format!("Generated {} toolpath moves using {} pattern", total_moves, self.toolpath_pattern.name()));
         self.log("💡 Tip: Run Motion Planning to optimize for singularities and collisions".to_string());
+
+        // ── Per-segment tool orientations ─────────────────────────────────
+        // Conical: analytical cone-surface normal.
+        // All other modes: nearest mesh-surface normal (clamped by profile axis limits).
+        self.apply_conical_orientations();
+        self.apply_surface_normal_orientations();
+
+        // ── Travel lift (collision avoidance) ─────────────────────────────
+        // Raise non-extruding moves above the last printed Z so the nozzle
+        // clears already-deposited material during traversals.
+        self.apply_travel_lifts();
+
+        // Check machine simulation collisions if enabled
+        if self.profiles.get(self.active_profile_index).map(|p| p.show_machine).unwrap_or(false) {
+            self.compute_all_collisions();
+        }
     }
 
     /// Generate support structures
@@ -1468,7 +2218,7 @@ impl SlicerApp {
 
         let mut gcode_gen = GCodeGenerator::new();
         gcode_gen.kinematics.tcp_offset = self.tcp_offset;
-        gcode_gen.kinematics.rotary_axes = self.rotary_axis_mode;
+        gcode_gen.kinematics.axes = self.build_gcode_axes();
         self.gcode_lines = gcode_gen.generate_to_string(&self.toolpaths);
         self.show_gcode_terminal = true;
         self.gcode_scroll_to_bottom = true;
@@ -1486,7 +2236,7 @@ impl SlicerApp {
 
         let mut gcode_gen = GCodeGenerator::new();
         gcode_gen.kinematics.tcp_offset = self.tcp_offset;
-        gcode_gen.kinematics.rotary_axes = self.rotary_axis_mode;
+        gcode_gen.kinematics.axes = self.build_gcode_axes();
         match gcode_gen.generate(&self.toolpaths, &path) {
             Ok(_) => {
                 self.log(format!("G-code exported successfully"));
@@ -1587,17 +2337,23 @@ impl eframe::App for SlicerApp {
                 self.log(format!("Received {} layers from slicing", self.layers.len()));
                 log::info!("DEBUG: Received layers, self.layers.len() = {}", self.layers.len());
                 self.layers_receiver = None; // Clear the receiver
+                // If we were in the S4 Sliced stage, receiving via layers_receiver means untransform is done
+                if self.s4_stage == S4Stage::Sliced {
+                    self.s4_stage = S4Stage::Final;
+                    self.show_deformed_mesh = false;
+                    self.log("S4 Step 3 complete: layers untransformed to original mesh space.".to_string());
+                }
             }
         }
 
-        // Check for completed deformation results
+        // Check for completed deformation results (mesh display)
         if let Some(ref receiver) = self.deformed_mesh_receiver {
             if let Ok(deformed_mesh) = receiver.try_recv() {
                 self.deformed_mesh = Some(deformed_mesh);
                 self.is_deforming = false;
                 self.show_deformed_mesh = true; // Automatically show the deformed mesh
-                self.log("✓ Mesh deformation complete - showing deformed mesh".to_string());
-                self.log("💡 Tip: Use the toggle button to switch between original and deformed views".to_string());
+                self.log("Mesh deformation complete - showing deformed mesh".to_string());
+                self.log("Tip: Use the toggle button to switch between original and deformed views".to_string());
                 self.deformed_mesh_receiver = None; // Clear the receiver
 
                 // Viewport will pick up the deformed mesh on next render frame
@@ -1605,6 +2361,32 @@ impl eframe::App for SlicerApp {
                 if let Some(viewport) = &mut self.viewport_3d {
                     viewport.clear_mesh(); // Force reload on next frame
                 }
+            }
+        }
+
+        // S4 step 1: receive full S4DeformData (after deform_mesh_preview for S4 mode)
+        if let Some(ref receiver) = self.s4_deform_result_receiver {
+            if let Ok(data) = receiver.try_recv() {
+                self.s4_deform_data = Some(Box::new(data));
+                self.s4_stage = S4Stage::Deformed;
+                self.s4_deform_result_receiver = None;
+                self.log("S4 Step 1 complete: deformed mesh ready. Click '2: Slice Deformed'.".to_string());
+            }
+        }
+
+        // S4 step 2: receive planar layers sliced on deformed mesh
+        if let Some(ref receiver) = self.s4_deformed_layers_receiver {
+            if let Ok(layers) = receiver.try_recv() {
+                let n = layers.len();
+                // Show these layers ON the deformed mesh by putting them in self.layers
+                self.s4_deformed_layers = layers.clone();
+                self.layers = layers;
+                self.s4_stage = S4Stage::Sliced;
+                self.show_deformed_mesh = true;
+                self.s4_deformed_layers_receiver = None;
+                self.has_sliced = true;
+                self.is_slicing = false;
+                self.log(format!("S4 Step 2 complete: {} layers on deformed mesh. Click '3: Untransform'.", n));
             }
         }
 
@@ -1623,6 +2405,15 @@ impl eframe::App for SlicerApp {
             }
 
             // Request repaint for smooth progress updates
+            ctx.request_repaint();
+        }
+
+        // Keep repainting while deformation is running so receivers get polled
+        if self.is_deforming
+            || self.deformed_mesh_receiver.is_some()
+            || self.s4_deform_result_receiver.is_some()
+            || self.s4_deformed_layers_receiver.is_some()
+        {
             ctx.request_repaint();
         }
 
@@ -1662,14 +2453,19 @@ impl eframe::App for SlicerApp {
         // Render UI panels
         // NOTE: In egui, all Side/Top/Bottom panels must be added BEFORE CentralPanel.
         // CentralPanel takes whatever space remains after other panels are allocated.
+        self.render_tab_bar(ctx);
         self.render_control_panel(ctx);
         self.render_stats_panel(ctx);
         self.render_gcode_terminal(ctx);
         self.render_central_panel(ctx);
     }
 
-    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
-        // Save application state if needed
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        // Persist printer profiles so they survive across sessions
+        if let Ok(json) = serde_json::to_string(&self.profiles) {
+            storage.set_string("printer_profiles", json);
+        }
+        storage.set_string("active_profile_index", self.active_profile_index.to_string());
     }
 }
 
@@ -1782,18 +2578,25 @@ impl SlicerApp {
 
     fn render_central_panel(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("3D Viewport");
-
-            if let Some(mut viewport) = self.viewport_3d.take() {
-                let clicked_face = viewport.render(ui, self);
-                self.viewport_3d = Some(viewport);
-
-                // Handle clicked face in face orientation mode
-                if let Some(face_index) = clicked_face {
-                    self.apply_face_orientation(face_index);
+            match self.active_tab {
+                AppTab::PrinterProfiles => {
+                    crate::gui::printer_profiles_page::render(self, ui);
                 }
-            } else {
-                ui.label("3D viewport not initialized");
+                AppTab::Main => {
+                    ui.heading("3D Viewport");
+
+                    if let Some(mut viewport) = self.viewport_3d.take() {
+                        let clicked_face = viewport.render(ui, self);
+                        self.viewport_3d = Some(viewport);
+
+                        // Handle clicked face in face orientation mode
+                        if let Some(face_index) = clicked_face {
+                            self.apply_face_orientation(face_index);
+                        }
+                    } else {
+                        ui.label("3D viewport not initialized");
+                    }
+                }
             }
         });
     }
@@ -1803,6 +2606,34 @@ impl SlicerApp {
         stats_panel::render(self, ctx);
     }
 }
+
+// ─── Machine simulation helpers ───────────────────────────────────────────────
+
+/// Build a 3×3 rotation matrix from pitch `a` (around X) and roll `b` (around Y).
+///
+/// R = Ry(b) * Rx(a)
+fn rotation_matrix_xy(a: f32, b: f32) -> [[f32; 3]; 3] {
+    let (sa, ca) = (a.sin(), a.cos());
+    let (sb, cb) = (b.sin(), b.cos());
+    // Ry(b) * Rx(a)
+    [
+        [cb,        sb * sa,  sb * ca],
+        [0.0,       ca,      -sa     ],
+        [-sb,       cb * sa,  cb * ca],
+    ]
+}
+
+/// Given a box with half-extents `he` and rotation matrix `r`,
+/// compute the AABB half-extents using the standard AABB-of-OBB formula.
+fn aabb_of_obb(he: [f32; 3], r: [[f32; 3]; 3]) -> [f32; 3] {
+    [
+        r[0][0].abs() * he[0] + r[0][1].abs() * he[1] + r[0][2].abs() * he[2],
+        r[1][0].abs() * he[0] + r[1][1].abs() * he[1] + r[1][2].abs() * he[2],
+        r[2][0].abs() * he[0] + r[2][1].abs() * he[1] + r[2][2].abs() * he[2],
+    ]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Mesh statistics for display
 #[derive(Debug, Clone)]

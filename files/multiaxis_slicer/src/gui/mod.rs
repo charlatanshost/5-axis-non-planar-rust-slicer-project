@@ -6,5 +6,6 @@ pub mod control_panel;
 pub mod stats_panel;
 pub mod gcode_panel;
 pub mod theme;
+pub mod printer_profiles_page;
 
 pub use app::SlicerApp;

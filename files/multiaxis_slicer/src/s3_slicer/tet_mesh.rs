@@ -366,6 +366,19 @@ impl TetMesh {
             return Err("Too few vertices/facets for tetrahedralization".to_string());
         }
 
+        // TetGen's recursive algorithms can overflow the stack on large/dense meshes,
+        // causing a C assertion abort (STATUS_STACK_BUFFER_OVERRUN on Windows) that
+        // cannot be caught from Rust.  Reject inputs that are too large so the
+        // cascade can fall through to the grid-based fallback instead of crashing.
+        const MAX_TETGEN_VERTICES: usize = 80_000;
+        const MAX_TETGEN_FACETS:   usize = 160_000;
+        if npoint > MAX_TETGEN_VERTICES || nfacet > MAX_TETGEN_FACETS {
+            return Err(format!(
+                "Input too large for TetGen ({} vertices, {} facets — limits: {}/{})",
+                npoint, nfacet, MAX_TETGEN_VERTICES, MAX_TETGEN_FACETS
+            ));
+        }
+
         let facet_npoint: Vec<usize> = vec![3; nfacet];
 
         let mut tetgen = tritet::Tetgen::new(
@@ -499,6 +512,16 @@ impl TetMesh {
 
         if npoint < 4 || nfacet < 4 {
             return Err("Too few vertices/facets for tetrahedralization".to_string());
+        }
+
+        // Same stack-overflow guard as run_tetgen_indexed — see comment there.
+        const MAX_TETGEN_VERTICES: usize = 80_000;
+        const MAX_TETGEN_FACETS:   usize = 160_000;
+        if npoint > MAX_TETGEN_VERTICES || nfacet > MAX_TETGEN_FACETS {
+            return Err(format!(
+                "Input too large for TetGen ({} vertices, {} facets — limits: {}/{})",
+                npoint, nfacet, MAX_TETGEN_VERTICES, MAX_TETGEN_FACETS
+            ));
         }
 
         let facet_npoint: Vec<usize> = vec![3; nfacet];

@@ -34,7 +34,7 @@ pub use deformation::{DeformationConfig, DeformedMesh, DeformationTransform, def
 pub use deformation_v2::S3SlicerDeformation;
 pub use quaternion_field::{QuaternionField, QuaternionFieldConfig, FabricationObjective};
 pub use isosurface::{IsosurfaceExtractor, IsosurfaceConfig, CurvedLayer, extract_curved_layers};
-pub use pipeline::{execute_s3_pipeline, execute_s4_pipeline, S3PipelineConfig, S3PipelineResult, PipelineStats, DeformationMethod};
+pub use pipeline::{execute_s3_pipeline, execute_s4_pipeline, S3PipelineConfig, S3PipelineResult, PipelineStats, DeformationMethod, S4DeformData, execute_s4_deform, execute_s4_slice, execute_s4_untransform};
 pub use heat_method::{compute_geodesic_distances, HeatMethodConfig, HeatMethodResult};
 pub use asap_deformation::{AsapSolver, AsapConfig};
 pub use tet_mesh::{TetMesh, Tetrahedron, MeshQuality};

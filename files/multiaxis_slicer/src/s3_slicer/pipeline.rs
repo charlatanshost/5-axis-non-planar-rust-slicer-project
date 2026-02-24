@@ -611,33 +611,28 @@ pub fn deform_tet_mesh_direct(
     let num_verts = tet_mesh.vertices.len();
     let mut new_vertices = Vec::with_capacity(num_verts);
 
-    // Anchor at bottom center of mesh (build plate)
+    // All rotations share the same dominant axis (enforced in S4RotationField).
+    // With a single consistent axis, the global anchor produces a clean progressive
+    // tilt: base tets (rotation=0) stay fixed, everything above tilts coherently.
+    // No conflicting axes → SLERP averaging is well-defined → no mesh collapse.
     let anchor = Point3D::new(
         (tet_mesh.bounds_min.x + tet_mesh.bounds_max.x) / 2.0,
         (tet_mesh.bounds_min.y + tet_mesh.bounds_max.y) / 2.0,
         tet_mesh.bounds_min.z,
     );
 
-    // Height range for blending: bottom vertices get no rotation, top gets full rotation.
-    // This keeps the build plate contact fixed and progressively deforms upward.
-    let height_range = (tet_mesh.bounds_max.z - tet_mesh.bounds_min.z).max(1e-6);
-
     for vi in 0..num_verts {
         let tets = &tet_mesh.vertex_tets[vi];
-        let v = &tet_mesh.vertices[vi];
+        let v    = &tet_mesh.vertices[vi];
 
         if tets.is_empty() {
             new_vertices.push(*v);
             continue;
         }
 
-        // Height-based blend: 0 at bottom (no rotation) → 1 at top (full rotation)
-        let height_param = ((v.z - tet_mesh.bounds_min.z) / height_range).clamp(0.0, 1.0);
-
-        // Compute average rotation using incremental SLERP:
-        // After k rotations, avg = correct uniform average of all k
+        // Average rotation of all tets sharing this vertex (incremental SLERP).
         let mut avg_rot = nalgebra::UnitQuaternion::identity();
-        let mut count = 0usize;
+        let mut count   = 0usize;
         for &ti in tets {
             if ti < rotations.len() {
                 count += 1;
@@ -646,12 +641,9 @@ pub fn deform_tet_mesh_direct(
             }
         }
 
-        // Scale rotation by height: bottom stays fixed, top gets full deformation
-        let scaled_rot = nalgebra::UnitQuaternion::identity().slerp(&avg_rot, height_param);
-
-        // Apply rotation relative to anchor
-        let relative = Vector3D::new(v.x - anchor.x, v.y - anchor.y, v.z - anchor.z);
-        let rotated = scaled_rot * relative;
+        // Rotate about the build-plate anchor
+        let rel     = Vector3D::new(v.x - anchor.x, v.y - anchor.y, v.z - anchor.z);
+        let rotated = avg_rot * rel;
         new_vertices.push(Point3D::new(
             anchor.x + rotated.x,
             anchor.y + rotated.y,
@@ -659,10 +651,218 @@ pub fn deform_tet_mesh_direct(
         ));
     }
 
-    log::info!("  Direct rotation deform: {} vertices, anchor=({:.1}, {:.1}, {:.1}), height_range={:.1}",
-        num_verts, anchor.x, anchor.y, anchor.z, height_range);
+    log::info!("  Direct rotation deform: {} vertices, anchor=({:.1},{:.1},{:.1})",
+        num_verts, anchor.x, anchor.y, anchor.z);
 
     TetMesh::new(new_vertices, tet_mesh.tets.clone())
+}
+
+// ── S4 step functions ────────────────────────────────────────────────────────
+
+/// Intermediate result from the S4 deformation step.
+/// Carries everything needed to planarly slice the deformed mesh, then
+/// untransform the resulting layers back to original-mesh space.
+#[derive(Debug, Clone)]
+pub struct S4DeformData {
+    /// Original tet mesh (for barycentric untransform)
+    pub original_tet: TetMesh,
+    /// Deformed tet mesh (spatial index built during untransform)
+    pub deformed_tet: TetMesh,
+    /// Deformed surface mesh, filtered and ready for planar slicing
+    pub deformed_surface: Mesh,
+}
+
+/// Steps 1-5 of the S4 pipeline: tetrahedralize, Dijkstra field, rotation
+/// field, vertex-rotation deformation, surface extraction and edge filtering.
+///
+/// Returns `Err` if TetGen fails or if >50% of tets are inverted.
+pub fn execute_s4_deform(
+    original_mesh: &Mesh,
+    config: &S3PipelineConfig,
+) -> Result<S4DeformData, String> {
+    log::info!("=== S4 Deform Step ===");
+
+    // Step 1: Tetrahedralize
+    log::info!("Step 1/4: Tetrahedralizing surface mesh...");
+    let tet_mesh = TetMesh::from_surface_mesh(original_mesh)
+        .map_err(|e| format!("Tetrahedralization failed: {}", e))?;
+    {
+        let quality = tet_mesh.check_quality();
+        log::info!("  → TetMesh: {} vertices, {} tets, {} surface tris",
+            quality.num_vertices, quality.num_tets, quality.num_surface_triangles);
+    }
+
+    // Step 2: Dijkstra distance field
+    log::info!("Step 2/4: Computing Dijkstra distance field (z_bias={:.2})...", config.z_bias);
+    let dijkstra_field = TetDijkstraField::compute(&tet_mesh, config.z_bias);
+    log::info!("  → Max distance: {:.2}, {} base tets",
+        dijkstra_field.max_distance, dijkstra_field.base_tets.len());
+
+    // Step 3: S4 rotation field
+    log::info!("Step 3/4: Computing S4 rotation field...");
+    let s4_config = S4RotationConfig {
+        build_direction: Vector3D::new(0.0, 0.0, 1.0),
+        overhang_threshold: config.overhang_threshold,
+        max_rotation_degrees: config.max_rotation_degrees,
+        z_bias: config.z_bias,
+        // Diffusion spreads Phase 1 overhang rotations into the interior.
+        // More iterations = wider spread from overhang surfaces.  The user's
+        // Smoothing Iterations slider maps directly here (GUI default: 25).
+        // Minimum 20 to ensure the rotation field reaches past the overhang surface.
+        smoothing_iterations: config.optimization_iterations.max(20),
+        smoothness_weight: config.smoothness_weight,
+    };
+    let rotation_field = S4RotationField::compute(&tet_mesh, &dijkstra_field, &s4_config);
+
+    // Step 4: Direct vertex rotation deformation
+    log::info!("Step 4/4: Applying direct vertex rotation deformation...");
+    let deformed_tet_mesh = deform_tet_mesh_direct(&tet_mesh, &rotation_field.rotations);
+
+    let deformed_quality = deformed_tet_mesh.check_quality();
+    let inverted_ratio = deformed_quality.inverted_tets as f64 / tet_mesh.tets.len().max(1) as f64;
+    let orig_extent = (tet_mesh.bounds_max - tet_mesh.bounds_min).norm();
+    let deformed_extent = (deformed_tet_mesh.bounds_max - deformed_tet_mesh.bounds_min).norm();
+    let extent_ratio = deformed_extent / orig_extent.max(1e-10);
+    log::info!("  → Extent ratio: {:.2}x, inverted: {:.1}%", extent_ratio, inverted_ratio * 100.0);
+
+    if inverted_ratio > 0.5 {
+        return Err(format!("Deformation quality too poor ({:.1}% inverted tets)", inverted_ratio * 100.0));
+    }
+
+    // Step 5: Extract and filter deformed surface
+    let raw_surface = crate::s3_slicer::tet_point_location::deform_surface_through_tets(
+        original_mesh, &tet_mesh, &deformed_tet_mesh,
+    );
+    log::info!("  → Deformed surface: {} triangles", raw_surface.triangles.len());
+
+    // Filter spurious very-long-edge triangles (from bad STL geometry)
+    let deformed_surface = {
+        let mut edge_lengths: Vec<f64> = raw_surface.triangles.iter()
+            .flat_map(|tri| {
+                let e0 = ((tri.v1.x-tri.v0.x).powi(2)+(tri.v1.y-tri.v0.y).powi(2)+(tri.v1.z-tri.v0.z).powi(2)).sqrt();
+                let e1 = ((tri.v2.x-tri.v1.x).powi(2)+(tri.v2.y-tri.v1.y).powi(2)+(tri.v2.z-tri.v1.z).powi(2)).sqrt();
+                let e2 = ((tri.v0.x-tri.v2.x).powi(2)+(tri.v0.y-tri.v2.y).powi(2)+(tri.v0.z-tri.v2.z).powi(2)).sqrt();
+                [e0, e1, e2]
+            })
+            .collect();
+        edge_lengths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median_edge = edge_lengths[edge_lengths.len() / 2];
+        let max_allowed = (median_edge * 15.0).max(5.0);
+        let filtered: Vec<_> = raw_surface.triangles.iter()
+            .filter(|tri| {
+                let e0 = ((tri.v1.x-tri.v0.x).powi(2)+(tri.v1.y-tri.v0.y).powi(2)+(tri.v1.z-tri.v0.z).powi(2)).sqrt();
+                let e1 = ((tri.v2.x-tri.v1.x).powi(2)+(tri.v2.y-tri.v1.y).powi(2)+(tri.v2.z-tri.v1.z).powi(2)).sqrt();
+                let e2 = ((tri.v0.x-tri.v2.x).powi(2)+(tri.v0.y-tri.v2.y).powi(2)+(tri.v0.z-tri.v2.z).powi(2)).sqrt();
+                e0 <= max_allowed && e1 <= max_allowed && e2 <= max_allowed
+            })
+            .cloned()
+            .collect();
+        let removed = raw_surface.triangles.len() - filtered.len();
+        if removed > 0 {
+            log::info!("  → Filtered {} spurious triangles (median edge={:.2}mm, max={:.2}mm)",
+                removed, median_edge, max_allowed);
+        }
+        Mesh::new(filtered).map_err(|e| format!("Filtered mesh construction failed: {}", e))?
+    };
+
+    log::info!("=== S4 Deform Step Complete ===");
+    Ok(S4DeformData { original_tet: tet_mesh, deformed_tet: deformed_tet_mesh, deformed_surface })
+}
+
+/// Step 5b: Planarly slice the deformed surface.
+pub fn execute_s4_slice(deformed_surface: &Mesh, layer_height: f64) -> Result<Vec<Layer>, String> {
+    let slicer = Slicer::new(SlicingConfig { layer_height, ..SlicingConfig::default() });
+    slicer.slice(deformed_surface).map_err(|e| e.to_string())
+}
+
+/// Steps 6-7: Barycentric untransform of planar layers from deformed space back
+/// to original mesh space.  Also sorts layers by min-Z for monotone print ordering.
+pub fn execute_s4_untransform(
+    planar_layers: Vec<Layer>,
+    data: &S4DeformData,
+    original_mesh: &Mesh,
+    layer_height: f64,
+) -> Vec<Layer> {
+    log::info!("S4 Untransform: {} planar layers → original space", planar_layers.len());
+    let deformed_grid = TetSpatialGrid::build(&data.deformed_tet);
+
+    let mut layers: Vec<Layer> = Vec::new();
+    let mut total_points = 0usize;
+    let mut points_found = 0usize;
+    let mut points_nearest = 0usize;
+
+    let orig_diag = (original_mesh.bounds_max - original_mesh.bounds_min).norm();
+    let bounds_margin = orig_diag * 0.5;
+    let center = Point3D::new(
+        (original_mesh.bounds_min.x + original_mesh.bounds_max.x) / 2.0,
+        (original_mesh.bounds_min.y + original_mesh.bounds_max.y) / 2.0,
+        (original_mesh.bounds_min.z + original_mesh.bounds_max.z) / 2.0,
+    );
+
+    for layer in &planar_layers {
+        let mut untransformed_contours: Vec<crate::geometry::Contour> = Vec::new();
+
+        for contour in &layer.contours {
+            if contour.points.len() < 2 { continue; }
+            let mut untransformed_points: Vec<Point3D> = Vec::new();
+
+            for point in &contour.points {
+                total_points += 1;
+                let loc = match deformed_grid.find_containing_tet(point, &data.deformed_tet) {
+                    Some(r) => { points_found += 1; r }
+                    None    => { points_nearest += 1; deformed_grid.find_nearest_tet(point, &data.deformed_tet) }
+                };
+                let tet = &data.original_tet.tets[loc.tet_index];
+                let original_point = interpolate_point(
+                    &loc.bary_coords,
+                    &data.original_tet.vertices[tet.vertices[0]],
+                    &data.original_tet.vertices[tet.vertices[1]],
+                    &data.original_tet.vertices[tet.vertices[2]],
+                    &data.original_tet.vertices[tet.vertices[3]],
+                );
+                if (original_point - center).norm() > orig_diag + bounds_margin { continue; }
+                untransformed_points.push(original_point);
+            }
+
+            // Split at large jumps (inverted-tet artifacts)
+            let max_seg_sq = (layer_height * 20.0).powi(2);
+            let mut sub_contours: Vec<Vec<Point3D>> = Vec::new();
+            let mut current_sub: Vec<Point3D> = Vec::new();
+            for pt in &untransformed_points {
+                if let Some(last) = current_sub.last() {
+                    let dx = pt.x - last.x; let dy = pt.y - last.y; let dz = pt.z - last.z;
+                    if dx*dx + dy*dy + dz*dz > max_seg_sq {
+                        if current_sub.len() >= 2 { sub_contours.push(std::mem::take(&mut current_sub)); }
+                        else { current_sub.clear(); }
+                    }
+                }
+                current_sub.push(*pt);
+            }
+            if current_sub.len() >= 2 { sub_contours.push(current_sub); }
+
+            for sub in sub_contours {
+                untransformed_contours.push(crate::geometry::Contour { points: sub, closed: false });
+            }
+        }
+
+        if !untransformed_contours.is_empty() {
+            // Use min_z for stable ordering of multi-region layers (e.g. both ears in one layer)
+            let min_z = untransformed_contours.iter()
+                .flat_map(|c| c.points.iter())
+                .map(|p| p.z)
+                .fold(f64::INFINITY, f64::min);
+            layers.push(Layer { z: min_z, contours: untransformed_contours, layer_height: layer.layer_height });
+        }
+    }
+
+    log::info!("  → {} points: {} in-tet, {} nearest fallback", total_points, points_found, points_nearest);
+
+    // Sort layers by z for monotone print ordering
+    layers.sort_by(|a, b| a.z.partial_cmp(&b.z).unwrap_or(std::cmp::Ordering::Equal));
+
+    let total_contours: usize = layers.iter().map(|l| l.contours.len()).sum();
+    log::info!("  → {} layers, {} contours (untransformed)", layers.len(), total_contours);
+    layers
 }
 
 /// Execute the S4-style pipeline
@@ -686,282 +886,44 @@ pub fn execute_s4_pipeline(
 ) -> S3PipelineResult {
     log::info!("=== S4-Style Pipeline (Dijkstra + Deform + Untransform) ===");
 
-    // Step 1: Tetrahedralize
-    log::info!("Step 1/7: Tetrahedralizing surface mesh...");
-    let tet_mesh = match TetMesh::from_surface_mesh(&original_mesh) {
-        Ok(mesh) => {
-            let quality = mesh.check_quality();
-            log::info!("  → TetMesh: {} vertices, {} tets, {} surface tris",
-                quality.num_vertices, quality.num_tets, quality.num_surface_triangles);
-            mesh
-        }
+    // Steps 1-5: deform
+    let data = match execute_s4_deform(&original_mesh, &config) {
+        Ok(d) => d,
         Err(e) => {
-            log::error!("Tetrahedralization failed: {}", e);
+            log::error!("{}", e);
             log::warn!("Falling back to VirtualScalarField pipeline");
-            let fallback_config = S3PipelineConfig {
-                deformation_method: DeformationMethod::VirtualScalarField,
-                ..config
-            };
-            return execute_s3_pipeline(original_mesh, fallback_config);
+            return execute_s3_pipeline(original_mesh, S3PipelineConfig {
+                deformation_method: DeformationMethod::VirtualScalarField, ..config
+            });
         }
     };
 
-    // Step 2: Dijkstra distance field
-    log::info!("Step 2/7: Computing Dijkstra distance field (z_bias={:.2})...", config.z_bias);
-    let dijkstra_field = TetDijkstraField::compute(&tet_mesh, config.z_bias);
-    log::info!("  → Max distance: {:.2}, {} base tets",
-        dijkstra_field.max_distance, dijkstra_field.base_tets.len());
-
-    // Step 3: S4 rotation field
-    log::info!("Step 3/7: Computing S4 rotation field...");
-    let s4_config = S4RotationConfig {
-        build_direction: Vector3D::new(0.0, 0.0, 1.0),
-        overhang_threshold: config.overhang_threshold,
-        max_rotation_degrees: config.max_rotation_degrees,
-        z_bias: config.z_bias,
-        smoothing_iterations: config.optimization_iterations / 2,
-        smoothness_weight: config.smoothness_weight,
-    };
-    let rotation_field = S4RotationField::compute(&tet_mesh, &dijkstra_field, &s4_config);
-
-    // Step 4: Direct vertex rotation (apply per-tet rotations to vertices)
-    log::info!("Step 4/7: Applying direct vertex rotation deformation...");
-    let deformed_tet_mesh = deform_tet_mesh_direct(&tet_mesh, &rotation_field.rotations);
-
-    // Quality check
-    let deformed_quality = deformed_tet_mesh.check_quality();
-    let orig_extent = (tet_mesh.bounds_max - tet_mesh.bounds_min).norm();
-    let deformed_extent = (deformed_tet_mesh.bounds_max - deformed_tet_mesh.bounds_min).norm();
-    let extent_ratio = deformed_extent / orig_extent.max(1e-10);
-    let inverted_ratio = deformed_quality.inverted_tets as f64 / tet_mesh.tets.len().max(1) as f64;
-
-    log::info!("  → Extent ratio: {:.2}x, inverted: {:.1}%",
-        extent_ratio, inverted_ratio * 100.0);
-
-    if inverted_ratio > 0.5 {
-        log::error!("Deformation quality too poor ({:.1}% inverted). Falling back to VirtualScalarField.",
-            inverted_ratio * 100.0);
-        let fallback_config = S3PipelineConfig {
-            deformation_method: DeformationMethod::VirtualScalarField,
-            ..config
-        };
-        return execute_s3_pipeline(original_mesh, fallback_config);
-    }
-
-    // Step 5: Deform original mesh surface through tet field, then slice planarly
-    log::info!("Step 5/7: Deforming original surface through tet field and slicing...");
-    let deformed_surface = crate::s3_slicer::tet_point_location::deform_surface_through_tets(
-        &original_mesh,
-        &tet_mesh,
-        &deformed_tet_mesh,
-    );
-    log::info!("  → Deformed surface: {} triangles (original mesh topology)", deformed_surface.triangles.len());
-
-    // Filter out spurious triangles (bad STL geometry with very long edges) that
-    // create stray intersection lines during slicing. Compute median edge length
-    // and remove triangles with any edge > 15× median.
-    let deformed_surface = {
-        let mut edge_lengths: Vec<f64> = deformed_surface.triangles.iter()
-            .flat_map(|tri| {
-                let e0 = ((tri.v1.x - tri.v0.x).powi(2) + (tri.v1.y - tri.v0.y).powi(2) + (tri.v1.z - tri.v0.z).powi(2)).sqrt();
-                let e1 = ((tri.v2.x - tri.v1.x).powi(2) + (tri.v2.y - tri.v1.y).powi(2) + (tri.v2.z - tri.v1.z).powi(2)).sqrt();
-                let e2 = ((tri.v0.x - tri.v2.x).powi(2) + (tri.v0.y - tri.v2.y).powi(2) + (tri.v0.z - tri.v2.z).powi(2)).sqrt();
-                vec![e0, e1, e2]
-            })
-            .collect();
-        edge_lengths.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median_edge = edge_lengths[edge_lengths.len() / 2];
-        let max_allowed_edge = (median_edge * 15.0).max(5.0); // At least 5mm threshold
-
-        let filtered: Vec<_> = deformed_surface.triangles.iter()
-            .filter(|tri| {
-                let e0 = ((tri.v1.x - tri.v0.x).powi(2) + (tri.v1.y - tri.v0.y).powi(2) + (tri.v1.z - tri.v0.z).powi(2)).sqrt();
-                let e1 = ((tri.v2.x - tri.v1.x).powi(2) + (tri.v2.y - tri.v1.y).powi(2) + (tri.v2.z - tri.v1.z).powi(2)).sqrt();
-                let e2 = ((tri.v0.x - tri.v2.x).powi(2) + (tri.v0.y - tri.v2.y).powi(2) + (tri.v0.z - tri.v2.z).powi(2)).sqrt();
-                e0 <= max_allowed_edge && e1 <= max_allowed_edge && e2 <= max_allowed_edge
-            })
-            .cloned()
-            .collect();
-        let removed = deformed_surface.triangles.len() - filtered.len();
-        if removed > 0 {
-            log::info!("  → Filtered {} spurious triangles (median edge={:.2}mm, max allowed={:.2}mm)",
-                removed, median_edge, max_allowed_edge);
+    // Step 5b: planar slice
+    let planar_layers = match execute_s4_slice(&data.deformed_surface, config.layer_height) {
+        Ok(l) if !l.is_empty() => { log::info!("  → {} layers from planar slice", l.len()); l }
+        Ok(_) => {
+            log::error!("Planar slicer produced no layers. Falling back to VirtualScalarField.");
+            return execute_s3_pipeline(original_mesh, S3PipelineConfig {
+                deformation_method: DeformationMethod::VirtualScalarField, ..config
+            });
         }
-        Mesh::new(filtered).unwrap()
-    };
-
-    let slicing_config = SlicingConfig {
-        layer_height: config.layer_height,
-        ..SlicingConfig::default()
-    };
-    let slicer = Slicer::new(slicing_config);
-    let planar_layers = match slicer.slice(&deformed_surface) {
-        Ok(layers) => layers,
         Err(e) => {
             log::error!("Planar slicer failed: {}. Falling back to VirtualScalarField.", e);
-            let fallback_config = S3PipelineConfig {
-                deformation_method: DeformationMethod::VirtualScalarField,
-                ..config
-            };
-            return execute_s3_pipeline(original_mesh, fallback_config);
+            return execute_s3_pipeline(original_mesh, S3PipelineConfig {
+                deformation_method: DeformationMethod::VirtualScalarField, ..config
+            });
         }
     };
 
-    log::info!("  → Planar slicer produced {} layers", planar_layers.len());
+    // Steps 6-7: untransform
+    let layers = execute_s4_untransform(planar_layers, &data, &original_mesh, config.layer_height);
 
-    if planar_layers.is_empty() {
-        log::error!("Planar slicer produced no layers. Falling back to VirtualScalarField.");
-        let fallback_config = S3PipelineConfig {
-            deformation_method: DeformationMethod::VirtualScalarField,
-            ..config
-        };
-        return execute_s3_pipeline(original_mesh, fallback_config);
-    }
-
-    // Step 6: Untransform each contour point via barycentric interpolation
-    // IMPORTANT: Preserve contour structure from the planar slicer! Do NOT dump all
-    // segments into one Vec and re-chain — that causes cross-contour mixing where
-    // segments from different contours connect because endpoints are within tolerance.
-    log::info!("Step 6/7: Untransforming toolpath points to original space...");
-    let deformed_grid = TetSpatialGrid::build(&deformed_tet_mesh);
-
-    let mut layers: Vec<Layer> = Vec::new();
-    let mut curved_layers: Vec<CurvedLayer> = Vec::new();
-    let mut total_points = 0usize;
-    let mut points_found = 0usize;
-    let mut points_nearest = 0usize;
-
-    // Bounds of original mesh for sanity checking untransformed points
-    let orig_diag = (original_mesh.bounds_max - original_mesh.bounds_min).norm();
-    let bounds_margin = orig_diag * 0.5; // Allow 50% outside original bounds
-
-    for layer in &planar_layers {
-        let mut untransformed_contours: Vec<crate::geometry::Contour> = Vec::new();
-        let mut all_segments = Vec::new(); // for CurvedLayer compat
-        let mut all_normals = Vec::new();
-
-        for contour in &layer.contours {
-            if contour.points.len() < 2 {
-                continue;
-            }
-
-            let mut untransformed_points: Vec<Point3D> = Vec::new();
-
-            for point in &contour.points {
-                total_points += 1;
-
-                // Find containing tet in DEFORMED mesh
-                let loc = match deformed_grid.find_containing_tet(point, &deformed_tet_mesh) {
-                    Some(r) => { points_found += 1; r }
-                    None => { points_nearest += 1; deformed_grid.find_nearest_tet(point, &deformed_tet_mesh) }
-                };
-
-                // Apply barycentric coords in ORIGINAL tet mesh
-                let tet = &tet_mesh.tets[loc.tet_index];
-                let original_point = interpolate_point(
-                    &loc.bary_coords,
-                    &tet_mesh.vertices[tet.vertices[0]],
-                    &tet_mesh.vertices[tet.vertices[1]],
-                    &tet_mesh.vertices[tet.vertices[2]],
-                    &tet_mesh.vertices[tet.vertices[3]],
-                );
-
-                // Sanity check: skip wildly out-of-bounds points (from inverted tets)
-                let dist_from_center = (original_point - Point3D::new(
-                    (original_mesh.bounds_min.x + original_mesh.bounds_max.x) / 2.0,
-                    (original_mesh.bounds_min.y + original_mesh.bounds_max.y) / 2.0,
-                    (original_mesh.bounds_min.z + original_mesh.bounds_max.z) / 2.0,
-                )).norm();
-                if dist_from_center > orig_diag + bounds_margin {
-                    continue; // Skip this point — barycentric interpolation went bad
-                }
-
-                untransformed_points.push(original_point);
-            }
-
-            // Split contour at stray jumps: if consecutive points are too far apart,
-            // break into separate sub-contours to avoid long stray lines
-            let max_seg_len = config.layer_height * 20.0; // Allow generous moves but catch strays
-            let max_seg_len_sq = max_seg_len * max_seg_len;
-
-            let mut sub_contours: Vec<Vec<Point3D>> = Vec::new();
-            let mut current_sub: Vec<Point3D> = Vec::new();
-
-            for pt in &untransformed_points {
-                if let Some(last) = current_sub.last() {
-                    let dx = pt.x - last.x;
-                    let dy = pt.y - last.y;
-                    let dz = pt.z - last.z;
-                    let dist_sq = dx * dx + dy * dy + dz * dz;
-                    if dist_sq > max_seg_len_sq {
-                        // Break: save current sub-contour and start new one
-                        if current_sub.len() >= 2 {
-                            sub_contours.push(std::mem::take(&mut current_sub));
-                        } else {
-                            current_sub.clear();
-                        }
-                    }
-                }
-                current_sub.push(*pt);
-            }
-            if current_sub.len() >= 2 {
-                sub_contours.push(current_sub);
-            }
-
-            for sub in &sub_contours {
-                for window in sub.windows(2) {
-                    all_segments.push(LineSegment::new(window[0], window[1]));
-                    all_normals.push(Vector3D::new(0.0, 0.0, 1.0));
-                }
-                untransformed_contours.push(crate::geometry::Contour {
-                    points: sub.clone(),
-                    closed: false, // Sub-contours from splits are open
-                });
-            }
-        }
-
-        if !untransformed_contours.is_empty() {
-            let point_count: usize = untransformed_contours.iter().map(|c| c.points.len()).sum();
-            let avg_z = untransformed_contours.iter()
-                .flat_map(|c| c.points.iter())
-                .map(|p| p.z)
-                .sum::<f64>() / point_count.max(1) as f64;
-
-            layers.push(Layer {
-                z: avg_z,
-                contours: untransformed_contours,
-                layer_height: layer.layer_height,
-            });
-
-            curved_layers.push(CurvedLayer {
-                z: avg_z,
-                segments: all_segments,
-                iso_value: layer.z,
-                normals: all_normals,
-            });
-        }
-    }
-
-    log::info!("  → {} points: {} found in tet, {} nearest fallback",
-        total_points, points_found, points_nearest);
-
-    // Step 7: Summary (layers already built directly above)
-    log::info!("Step 7/7: Finalizing layers...");
-    let total_contours: usize = layers.iter().map(|l| l.contours.len()).sum();
-    let total_layer_points: usize = layers.iter()
-        .flat_map(|l| l.contours.iter())
-        .map(|c| c.points.len())
-        .sum();
-    log::info!("  → {} layers, {} contours, {} points",
-        layers.len(), total_contours, total_layer_points);
-
-    // Build result with compatibility fields
-    let deformed_surface_for_result = deformed_tet_mesh.to_surface_mesh();
-
+    // Build S3PipelineResult compatibility fields
+    let deformed_surface_for_result = data.deformed_tet.to_surface_mesh();
     let num_triangles = original_mesh.triangles.len();
     let placeholder_qfield = QuaternionField {
         rotations: vec![nalgebra::UnitQuaternion::identity(); num_triangles],
-        energy: rotation_field.energy,
+        energy: 0.0, // rotation_field not accessible after refactor — placeholder only
         config: QuaternionFieldConfig {
             objective: config.objective,
             build_direction: Vector3D::new(0.0, 0.0, 1.0),
@@ -972,49 +934,41 @@ pub fn execute_s4_pipeline(
             max_rotation_degrees: config.max_rotation_degrees,
         },
     };
+    let deformation = S3SlicerDeformation::placeholder(original_mesh.clone(), placeholder_qfield.clone());
 
-    // Use lightweight placeholder — S4 has its own deformation, no need to run S3's
-    let deformation = S3SlicerDeformation::placeholder(
-        original_mesh.clone(),
-        placeholder_qfield.clone(),
-    );
-
-    let height_range = if !curved_layers.is_empty() {
-        let min_z = curved_layers.iter().map(|cl| cl.z).fold(f64::INFINITY, f64::min);
-        let max_z = curved_layers.iter().map(|cl| cl.z).fold(f64::NEG_INFINITY, f64::max);
-        max_z - min_z
-    } else {
-        original_mesh.bounds_max.z - original_mesh.bounds_min.z
+    let height_range = {
+        let min_z = layers.iter().map(|l| l.z).fold(f64::INFINITY, f64::min);
+        let max_z = layers.iter().map(|l| l.z).fold(f64::NEG_INFINITY, f64::max);
+        if min_z.is_finite() && max_z.is_finite() { max_z - min_z }
+        else { original_mesh.bounds_max.z - original_mesh.bounds_min.z }
     };
-
     let per_tri_scalar: Vec<f64> = original_mesh.triangles.iter()
         .map(|tri| {
-            let centroid_z = (tri.v0.z + tri.v1.z + tri.v2.z) / 3.0;
-            let mesh_z_range = (original_mesh.bounds_max.z - original_mesh.bounds_min.z).max(1.0);
-            let normalized = (centroid_z - original_mesh.bounds_min.z) / mesh_z_range;
-            normalized * height_range
+            let cz = (tri.v0.z + tri.v1.z + tri.v2.z) / 3.0;
+            let range = (original_mesh.bounds_max.z - original_mesh.bounds_min.z).max(1.0);
+            ((cz - original_mesh.bounds_min.z) / range) * height_range
+        })
+        .collect();
+    let virtual_scalar_field = ScalarField {
+        values: per_tri_scalar.clone(), min_value: 0.0, max_value: height_range,
+        config: ScalarFieldConfig::default(),
+    };
+    let curved_layers: Vec<CurvedLayer> = layers.iter()
+        .map(|layer| {
+            let segments: Vec<LineSegment> = layer.contours.iter()
+                .flat_map(|c| c.points.windows(2).map(|w| LineSegment::new(w[0], w[1])))
+                .collect();
+            let normals = vec![Vector3D::new(0.0, 0.0, 1.0); segments.len()];
+            CurvedLayer { z: layer.z, segments, iso_value: layer.z, normals }
         })
         .collect();
 
-    let virtual_scalar_field = ScalarField {
-        values: per_tri_scalar.clone(),
-        min_value: 0.0,
-        max_value: height_range,
-        config: ScalarFieldConfig::default(),
-    };
-
-    log::info!("=== S4-Style Pipeline Complete ===");
-    log::info!("Generated {} curved layers via deform+slice+untransform", layers.len());
-
+    log::info!("=== S4-Style Pipeline Complete: {} layers ===", layers.len());
     S3PipelineResult {
-        original_mesh,
-        deformed_mesh: deformed_surface_for_result,
-        quaternion_field: placeholder_qfield,
-        deformation,
-        deformed_scalar_field: virtual_scalar_field,
-        original_scalar_field: per_tri_scalar,
-        curved_layers,
-        layers,
+        original_mesh, deformed_mesh: deformed_surface_for_result,
+        quaternion_field: placeholder_qfield, deformation,
+        deformed_scalar_field: virtual_scalar_field, original_scalar_field: per_tri_scalar,
+        curved_layers, layers,
     }
 }
 
