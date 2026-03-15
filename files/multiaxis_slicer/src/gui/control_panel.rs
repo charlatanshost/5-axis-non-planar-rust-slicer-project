@@ -859,6 +859,12 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                 ui.checkbox(&mut app.show_travel_moves, "Show travel moves")
                     .on_hover_text("Toggle visibility of rapid travel moves (cyan lines) in toolpath view");
 
+                if !app.collision_segments.is_empty() && app.collision_segments.iter().any(|&c| c) {
+                    ui.checkbox(&mut app.show_collision_overlay, "Show collision overlay")
+                        .on_hover_text("Highlight toolpath segments where the head body \
+                            would collide with previously deposited material (red overlay).");
+                }
+
                 ui.separator();
 
                 // Toolpath playback controls
@@ -1035,6 +1041,36 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                         );
 
                     ui.add_space(4.0);
+
+                    ui.checkbox(&mut app.avoid_head_collision,
+                        "Avoid head-body collisions with previous extrusions")
+                        .on_hover_text(
+                            "After assigning the surface-normal tilt, checks whether the \
+                             printhead carriage body would physically intersect already-\
+                             deposited beads.  If a collision is predicted the tilt azimuth \
+                             is rotated in 22.5° steps to find a clear direction; if no \
+                             azimuth works the tilt magnitude is reduced toward vertical.\n\
+                             Requires a printer profile with head body dimensions set."
+                        );
+
+                    if app.avoid_head_collision {
+                        ui.horizontal(|ui| {
+                            ui.label("Head clearance:")
+                                .on_hover_text(
+                                    "Minimum gap (mm) between the head body and any previously \
+                                     printed material before the tilt is adjusted."
+                                );
+                            ui.add(
+                                egui::DragValue::new(&mut app.head_clearance_mm)
+                                    .range(0.0..=20.0)
+                                    .speed(0.1)
+                                    .suffix(" mm"),
+                            );
+                        });
+
+                    }
+
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label("Travel Z-lift:")
                             .on_hover_text(
@@ -1066,44 +1102,38 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                 ui.add_space(5.0);
 
                 // Support Generation (Optional)
-                ui.collapsing("🏗 Support Generation (Optional)", |ui| {
-                    ui.label(egui::RichText::new("Supports are optional for most prints").weak().italics());
+                ui.collapsing("🏗 Support Generation", |ui| {
+                    ui.checkbox(&mut app.enable_supports, "Generate supports with toolpaths")
+                        .on_hover_text("When enabled, supports are automatically generated and merged into the toolpaths when you click 'Generate Toolpaths'");
 
-                    ui.add_space(5.0);
+                    if app.enable_supports {
+                        ui.add_space(5.0);
 
-                    ui.horizontal(|ui| {
-                        ui.label("Overhang angle:");
-                        ui.add(egui::Slider::new(&mut app.support_config.overhang_angle, 0.0..=89.0)
-                            .suffix("°"));
-                    });
+                        ui.horizontal(|ui| {
+                            ui.label("Overhang angle:");
+                            ui.add(egui::Slider::new(&mut app.support_config.overhang_angle, 0.0..=89.0)
+                                .suffix("°"))
+                                .on_hover_text("Faces steeper than this angle will receive supports");
+                        });
 
-                    ui.horizontal(|ui| {
-                        ui.label("Min area:");
-                        ui.add(egui::DragValue::new(&mut app.support_config.min_area_threshold)
-                            .speed(0.1)
-                            .suffix(" mm²"));
-                    });
+                        ui.horizontal(|ui| {
+                            ui.label("Min area:");
+                            ui.add(egui::DragValue::new(&mut app.support_config.min_area_threshold)
+                                .speed(0.1)
+                                .suffix(" mm²"))
+                                .on_hover_text("Ignore overhang regions smaller than this area");
+                        });
 
-                    ui.checkbox(&mut app.support_config.use_curved_layers, "Use curved layer analysis");
+                        ui.checkbox(&mut app.support_config.use_curved_layers, "Use curved layer analysis");
 
-                    ui.add_space(5.0);
-
-                    let can_generate_supports = app.mesh.is_some() && app.has_sliced;
-
-                    if ui.add_enabled(can_generate_supports, egui::Button::new("Generate Supports").min_size(egui::vec2(ui.available_width(), 30.0))).clicked() {
-                        app.generate_supports();
-                    }
-
-                    if app.has_supports {
-                        ui.label(egui::RichText::new("✓ Supports generated").color(egui::Color32::from_rgb(100, 255, 100)));
-
-                        if ui.add_enabled(true, egui::Button::new("Generate Support Toolpaths").min_size(egui::vec2(ui.available_width(), 25.0))).clicked() {
-                            app.generate_support_toolpaths();
-                        }
-
-                        if let Some(result) = &app.support_result {
-                            if !result.toolpaths.is_empty() {
-                                ui.label(egui::RichText::new("✓ Support toolpaths ready").color(egui::Color32::from_rgb(100, 255, 100)));
+                        if app.has_supports {
+                            ui.add_space(3.0);
+                            if let Some(result) = &app.support_result {
+                                let stats = result.stats();
+                                ui.label(egui::RichText::new(format!(
+                                    "✓ {} support nodes, {} contact points",
+                                    stats.num_support_nodes, stats.num_contact_points
+                                )).color(egui::Color32::from_rgb(100, 200, 255)));
                             }
                         }
                     }

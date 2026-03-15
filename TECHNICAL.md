@@ -216,11 +216,14 @@ The deformed surface mesh is extracted and given to the standard planar slicer.
 
 **Step 6 — Barycentric untransform** (`tet_point_location.rs`)
 For each contour point in deformed space:
-- Find the containing tet (spatial bin grid for acceleration)
-- Compute barycentric coordinates within that tet
-- Interpolate the same barycentric coordinates in the *original* tet mesh
+1. `find_containing_tet()` — spatial bin grid lookup for the tet that encloses the point.
+2. If not found (point just outside tet mesh surface), `find_nearest_tet()` fallback — finds the closest tet and uses clamped barycentric coordinates (imprecise but usually close enough for surface-boundary points).
+3. Interpolate the same barycentric coordinates in the *original* tet mesh → original-space point.
+4. **AABB filter:** drop any result that falls outside `mesh.bounds ± 5×layer_height`. This rejects nearest-tet fallback results that teleport to wrong mesh regions, while keeping valid surface-boundary points.
+5. **Jump split:** if consecutive untransformed points are more than `10×layer_height` apart, split the contour at that gap. Each sub-contour must have ≥ 2 points to be kept.
+6. **Closed flag:** preserved when the contour was unsplit and the original planar contour was closed (normal cross-section loop). Split fragments are marked open.
 
-This maps every point back to its correct location on the original geometry.
+Layers are sorted by min-Z after untransform for monotone print ordering.
 
 ### 3.4 S3 Curved Layer
 
@@ -532,7 +535,16 @@ Inward cone (sign = +1):
 where α is the cone angle, r = sqrt(dx²+dy²), and (dx, dy) = point center relative to cone axis.
 
 ### Travel Z-Lift (`apply_travel_lifts` in `app.rs`)
-For travel moves (extrusion ≈ 0) with XY distance ≥ 1 mm, the destination Z is raised to `max(Z, last_extrude_z + lift)`. Default lift = 2 mm, configurable in the "Rotary Axes & Collision Avoidance" panel. Note: the current implementation raises the destination point Z; it does not insert an explicit Z-only departure move.
+For travel moves (extrusion ≈ 0) with XY distance ≥ 1 mm, the destination Z is raised to `max(Z, last_extrude_z + lift)`. Default lift = 2 mm, configurable in the "Rotary Axes & Collision Avoidance" panel.
+
+Additionally, a **non-extruding descent segment** is inserted before the first extrusion segment that follows a lifted travel. This clone of the extrusion segment has `extrusion = 0.0` so the nozzle descends to contact height without depositing material, then the actual extrusion begins.
+
+Note: the current implementation does not insert an explicit Z-only departure move at the start of travel — the Z rise happens simultaneously with the XY travel on the G1 command.
+
+### Mesh Collision Avoidance (`optimize_toolpath_orientations_for_mesh` in `app.rs`)
+After toolpaths are generated, each segment's capsule (body_height tall, along the tool orientation from the nozzle tip) is tested against the full unprinted mesh. If a collision is detected, the orientation is swept radially outward from 0° to `max_tilt_deg` in 5° steps until a clear orientation is found.
+
+**Key behaviour:** If no tilt angle clears the mesh (common at the bottom of a print, where the capsule is necessarily inside the mesh interior), the original slicing-direction orientation is kept. The new orientation is only committed when `found_clear == true`. This prevents the bottom layers from being forced to max-tilt (90°) which would drive the nozzle into the build plate.
 
 ---
 
@@ -592,13 +604,21 @@ Note: parry3d's Capsule takes explicit endpoints, not a half-length. The capsule
 **Files:** `support_generation/`
 
 ### Overhang Detection (`overhang_detection.rs`)
-Each triangle face is classified as overhanging if the angle between its normal and the global print direction exceeds a threshold (typically 45°). The dot product `normal · print_dir < cos(threshold)` is the test.
+Each triangle face is classified as overhanging if the angle between its normal and the global print direction exceeds a threshold (typically 45°). The dot product `normal · print_dir < cos(threshold)` is the test. Configurable: `overhang_angle`, `min_area_threshold`, `use_curved_layers`.
 
 ### Tree-Based Supports (`tree_skeleton.rs`)
 Overhanging regions are connected to the build platform by tree-like support structures. Branch points are computed using a medial-axis approximation (centroidal axis). Branches taper toward tips and merge toward the base to minimize material use.
 
 ### Support Toolpath (`support_toolpath.rs`)
 Supports are sliced the same as the main object (planar by default) and given a sparse rectilinear infill for easy removal.
+
+### Integrated Flow (`app.rs` — `generate_toolpaths`)
+When `enable_supports == true`, support generation is automatically triggered at the end of `generate_toolpaths()`:
+1. `generate_supports()` — runs overhang detection + tree skeleton, stores `SupportResult` in `self.support_result`.
+2. `generate_support_toolpaths()` — converts tree to `Vec<Toolpath>`, stores in `self.support_result.toolpaths`.
+3. Support toolpaths are appended (extended) into `self.toolpaths` so they are rendered and exported together with the part toolpaths.
+
+The GUI collapsible ("🏗 Support Generation") shows only the configuration controls when enabled; the status line updates after generation with node/contact-point counts.
 
 ---
 
@@ -631,7 +651,14 @@ three-d renders the mesh, toolpath preview, and machine geometry. The mesh is up
 - Bed geometry: flat box.
 - STL overrides: loaded via `load_stl_cpu_mesh()`, replacing the parametric shapes.
 - STL tip offset: `world_origin = seg_pos - R_head × tip_local` — pins the user-specified local point to the nozzle contact world position.
-- Per-frame transform: axis angles are computed from `compute_segment_axis_angles()`, split into head and bed rotations, and applied as `Mat4` transforms.
+- Per-frame kinematic transform:
+  1. `compute_segment_axis_angles()` returns `(name, deg)` pairs for each axis.
+  2. Bed axes (is_head=false): chained `rodrigues_f32` rotations → `R_bed`.
+  3. Head axes (is_head=true): same; angle from `(-residual_x).atan2(residual_z)` for Y-axis (IK to match residual orientation after bed counter-rotation).
+  4. Head pivot: `pivot_head = nozzle_world + R_head × (0, 0, nozzle_length)` — the nozzle tip is at `R_head × (0,0,-nl) + pivot`.
+  5. Bed pivot Z: `grid_z - bed_height - clamp(seg_z - grid_z, 0, bed_travel_z)` — lowers as the print height increases.
+  6. SLERP smoothing: head and bed rotations smoothly interpolate toward target each frame. On playback rewind (`cur_pos < prev_pos`), `machine_smooth_init` resets so the machine snaps to avoid 180° flip artifacts.
+- Collision detection (`compute_all_collisions`): per-segment bed pivot Z computed to match viewport; head OBB checked in bed's local frame to avoid AABB-expansion false positives from tilted bed.
 - Viewport renders machine geometry even when no mesh is loaded (gate checks `has_machine || has_mesh`).
 
 ### Theme (`theme.rs`)
@@ -745,3 +772,9 @@ Isotropic remeshing (legacy, now replaced by voxel reconstruction): ~28 minutes 
 - **Wall seam transitions:** Off by default. Not fully validated on all layer topologies — contour resampling assumes single outer loops and may produce artifacts on multi-island layers.
 
 - **MeshRayCaster misses at mesh boundary:** Infill/wall points that project outside the mesh XY footprint get no raycaster hit and fall back to IDW interpolation. Visible as slight Z inaccuracy at the very edge of the print.
+
+- **S4 untransform fragment artifacts:** Contour points that land just outside the deformed tet mesh use clamped barycentric coordinates (`find_nearest_tet`), which can be inaccurate. Severe outliers are caught by the AABB filter; mild inaccuracies may survive and appear as slight kinks in contours. A proper face-projection fallback would eliminate this.
+
+- **Machine simulation collision detection (AABB-of-OBB):** The collision check uses the conservative AABB-of-OBB formula for the head body, which overestimates the head's extent when the head is significantly tilted. This can produce false positive collision reports for segments where the head is near (but not actually touching) the bed. A 15-axis OBB-OBB SAT test would eliminate these.
+
+- **Travel Z-lift — no departure move:** The lift inserts a non-extruding descent at the travel destination but does not insert a Z-only departure move at the travel origin. The nozzle rises while moving in XY, which may graze the surface at the start of a long travel move.

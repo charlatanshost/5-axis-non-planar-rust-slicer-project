@@ -37,7 +37,8 @@ The output is standard G-code extended with A/B rotation axes for 5-axis machine
 - **Machine simulation** — bed and printhead rendered in the 3D viewport as parametric boxes/cylinders or custom STL files; updates live as the toolpath playback scrubber moves; nozzle tip marked with a gold sphere
 - **STL head/bed geometry** — load any STL file to replace the default box shapes; set a local "tip offset" so the model's nozzle contact point aligns exactly with the toolpath position
 - **Surface normal orientations** — for all slicing modes, each toolpath segment's rotary-axis angle is set from the nearest mesh face normal; axis tilt is clamped to the profile's configured limits
-- **Travel Z-lift** — travel moves longer than 1 mm are raised by a configurable clearance height (default 2 mm) above the last extruded position, avoiding surface collisions during traversal
+- **Travel Z-lift with descent segment** — travel moves longer than 1 mm are raised by a configurable clearance height (default 2 mm); a non-extruding descent segment is automatically inserted before the first extrusion after each lift, so the nozzle descends to contact before material is deposited
+- **Support generation integrated into toolpath flow** — enable the "Generate supports with toolpaths" checkbox; supports are automatically detected, tree-structured, and merged into the toolpath list when "Generate Toolpaths" is clicked; configuration (overhang angle, min area) is in the same collapsible
 - **Conical axis orientations** — in Conical mode the rotary tilt is computed analytically from the cone-surface normal rather than from the mesh surface
 - **Voxel reconstruction** — SDF + Marching Cubes repairs self-intersecting STL files in 2–5 seconds (versus ~28 minutes for isotropic remeshing)
 - **Multi-scale geodesic** — runs heat diffusion at several doubling timesteps and fuses results, giving both fine local detail and full-mesh coverage simultaneously
@@ -47,7 +48,8 @@ The output is standard G-code extended with A/B rotation axes for 5-axis machine
 - **Mesh-mapped gap filling** — `MeshRayCaster` projects infill and wall loop Z onto the actual surface; slope-adaptive scanline insertion fills 3D coverage gaps on steep curved surfaces
 - **Wall seam transitions** — optional ruled-surface zigzag paths between consecutive curved layers to fill the staircase gap at the outer wall
 - **5-axis G-code** — direct output with A/B (or B/C) rotary axes and TCP compensation
-- **Capsule-vs-mesh collision detection** — parry3d capsule shape tested against every triangle with AABB pre-filter
+- **Capsule-vs-mesh collision detection** — parry3d capsule shape tested against every triangle with AABB pre-filter; mesh avoidance only changes orientation when a genuinely clear tilt angle is found (does not force max-tilt at bottom layers)
+- **Machine simulation collision detection** — per-segment bed Z travel correctly tracked; head OBB checked in bed's local frame to avoid AABB-expansion false positives from tilted bed geometry
 - **Conical floating-contour filter** — 2D per-XY bin grid tracks maximum printed Z at each location; defers unsupported contours until the print surface below them has been deposited
 - **Interactive 3D GUI** — egui sidebar with live parameter controls, three-d viewport with layer-height-scaled tube rendering, G-code preview panel; viewport renders machine geometry even without a loaded mesh
 - **Parallel processing** — Rayon used throughout slicing and field computation

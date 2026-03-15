@@ -791,13 +791,30 @@ pub fn execute_s4_untransform(
     let mut points_found = 0usize;
     let mut points_nearest = 0usize;
 
-    let orig_diag = (original_mesh.bounds_max - original_mesh.bounds_min).norm();
-    let bounds_margin = orig_diag * 0.5;
-    let center = Point3D::new(
-        (original_mesh.bounds_min.x + original_mesh.bounds_max.x) / 2.0,
-        (original_mesh.bounds_min.y + original_mesh.bounds_max.y) / 2.0,
-        (original_mesh.bounds_min.z + original_mesh.bounds_max.z) / 2.0,
+    // AABB filter: drop any untransformed point that lands outside the original mesh
+    // bounding box by more than a small margin.  This catches nearest-tet fallback
+    // artefacts (which can be mm or cm off) while keeping valid surface-contour points
+    // that legitimately sit a fraction of a mm outside the mesh AABB.
+    let aabb_margin = layer_height * 5.0;
+    let aabb_min = Point3D::new(
+        original_mesh.bounds_min.x - aabb_margin,
+        original_mesh.bounds_min.y - aabb_margin,
+        original_mesh.bounds_min.z - aabb_margin,
     );
+    let aabb_max = Point3D::new(
+        original_mesh.bounds_max.x + aabb_margin,
+        original_mesh.bounds_max.y + aabb_margin,
+        original_mesh.bounds_max.z + aabb_margin,
+    );
+    let in_aabb = |p: &Point3D| {
+        p.x >= aabb_min.x && p.x <= aabb_max.x
+        && p.y >= aabb_min.y && p.y <= aabb_max.y
+        && p.z >= aabb_min.z && p.z <= aabb_max.z
+    };
+
+    // Jump-split threshold: 10× layer height — generous enough for curved surfaces while
+    // still catching genuine teleport artefacts (which are typically 10–100mm jumps).
+    let max_seg_sq = (layer_height * 10.0).powi(2);
 
     for layer in &planar_layers {
         let mut untransformed_contours: Vec<crate::geometry::Contour> = Vec::new();
@@ -808,6 +825,9 @@ pub fn execute_s4_untransform(
 
             for point in &contour.points {
                 total_points += 1;
+                // Prefer exact in-tet lookup; use nearest-tet as fallback for points that
+                // land just outside the tet mesh (common for surface contour points).
+                // The AABB check below discards any fallback result that teleported far away.
                 let loc = match deformed_grid.find_containing_tet(point, &data.deformed_tet) {
                     Some(r) => { points_found += 1; r }
                     None    => { points_nearest += 1; deformed_grid.find_nearest_tet(point, &data.deformed_tet) }
@@ -820,12 +840,11 @@ pub fn execute_s4_untransform(
                     &data.original_tet.vertices[tet.vertices[2]],
                     &data.original_tet.vertices[tet.vertices[3]],
                 );
-                if (original_point - center).norm() > orig_diag + bounds_margin { continue; }
+                if !in_aabb(&original_point) { continue; }
                 untransformed_points.push(original_point);
             }
 
-            // Split at large jumps (inverted-tet artifacts)
-            let max_seg_sq = (layer_height * 20.0).powi(2);
+            // Split at large jumps caused by missing/skipped points or deformation seams.
             let mut sub_contours: Vec<Vec<Point3D>> = Vec::new();
             let mut current_sub: Vec<Point3D> = Vec::new();
             for pt in &untransformed_points {
@@ -840,8 +859,12 @@ pub fn execute_s4_untransform(
             }
             if current_sub.len() >= 2 { sub_contours.push(current_sub); }
 
+            let n_subs = sub_contours.len();
             for sub in sub_contours {
-                untransformed_contours.push(crate::geometry::Contour { points: sub, closed: false });
+                // Preserve the closed flag when the contour was not split and the original
+                // was closed (standard cross-section loop).  Split fragments are open paths.
+                let closed = contour.closed && n_subs == 1;
+                untransformed_contours.push(crate::geometry::Contour { points: sub, closed });
             }
         }
 

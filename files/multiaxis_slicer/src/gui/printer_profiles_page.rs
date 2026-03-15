@@ -1,7 +1,7 @@
 // Printer Profiles page — browser-tab-style editor for PrinterProfile entries.
 // Renders inside CentralPanel when AppTab::PrinterProfiles is active.
 
-use crate::gui::app::{SlicerApp, AppTab, PrinterProfile, AxisConfig, AxisType, MovingPart, KinematicsType, BedShape};
+use crate::gui::app::{SlicerApp, AppTab, PrinterProfile, AxisConfig, AxisType, MovingPart, KinematicsType, BedShape, RotationAxis};
 
 pub fn render(app: &mut SlicerApp, ui: &mut egui::Ui) {
     ui.heading("Printer Profiles");
@@ -287,11 +287,37 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
                             }
                         });
 
+                    // Rotation axis (only for rotary joints)
+                    if ax.axis_type == AxisType::Rotary {
+                        egui::ComboBox::from_id_source(format!("axis_rot_{}", i))
+                            .selected_text(format!("↺{}", ax.rotation_axis.label()))
+                            .width(52.0)
+                            .show_ui(ui, |ui| {
+                                for ra in RotationAxis::all() {
+                                    if ui.selectable_label(&ax.rotation_axis == ra, ra.label()).clicked() {
+                                        ax.rotation_axis = ra.clone();
+                                        changed = true;
+                                    }
+                                }
+                            });
+                    }
+
                     // Min / Max
                     let suffix = if ax.axis_type == AxisType::Rotary { " °" } else { " mm" };
                     if ui.add(egui::DragValue::new(&mut ax.min).suffix(suffix).speed(1.0)).changed() { changed = true; }
                     ui.label("to");
                     if ui.add(egui::DragValue::new(&mut ax.max).suffix(suffix).speed(1.0)).changed() { changed = true; }
+
+                    // Max angular speed (rotary only)
+                    if ax.axis_type == AxisType::Rotary {
+                        ui.label("≤");
+                        if ui.add(egui::DragValue::new(&mut ax.max_angular_speed)
+                            .suffix(" °/s")
+                            .range(0.0..=3600.0)
+                            .speed(1.0))
+                            .on_hover_text("Maximum angular speed (deg/s). G-code feedrate is capped so this axis never moves faster than this.")
+                            .changed() { changed = true; }
+                    }
 
                     // Remove button
                     if ui.small_button("✕").clicked() {
@@ -461,6 +487,12 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
                 if ui.add(egui::DragValue::new(&mut profile.bed_pivot[2]).suffix(" mm").speed(0.5).prefix("Z ")).changed() { changed = true; }
             });
             ui.horizontal(|ui| {
+                ui.label("Linear travel (0 = fixed):");
+                if ui.add(egui::DragValue::new(&mut profile.bed_travel[0]).suffix(" mm").speed(1.0).prefix("X ")).changed() { changed = true; }
+                if ui.add(egui::DragValue::new(&mut profile.bed_travel[1]).suffix(" mm").speed(1.0).prefix("Y ")).changed() { changed = true; }
+                if ui.add(egui::DragValue::new(&mut profile.bed_travel[2]).suffix(" mm").speed(1.0).prefix("Z ")).changed() { changed = true; }
+            });
+            ui.horizontal(|ui| {
                 if ui.button("Load Bed STL...").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("STL", &["stl"])
@@ -517,6 +549,12 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
                 ).changed() { changed = true; }
             });
             ui.horizontal(|ui| {
+                ui.label("Linear travel (0 = fixed):");
+                if ui.add(egui::DragValue::new(&mut profile.head_travel[0]).suffix(" mm").speed(1.0).prefix("X ")).changed() { changed = true; }
+                if ui.add(egui::DragValue::new(&mut profile.head_travel[1]).suffix(" mm").speed(1.0).prefix("Y ")).changed() { changed = true; }
+                if ui.add(egui::DragValue::new(&mut profile.head_travel[2]).suffix(" mm").speed(1.0).prefix("Z ")).changed() { changed = true; }
+            });
+            ui.horizontal(|ui| {
                 if ui.button("Load Head STL...").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("STL", &["stl"])
@@ -563,7 +601,305 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
             }
         });
 
+        ui.add_space(4.0);
+
+        // ── Head Geometry Preview ─────────────────────────────────────────
+        ui.collapsing("Head Geometry Preview", |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Side-view diagram: head body, nozzle, TCP pivot, and tilt sweep \
+                     from the rotary axes defined above.",
+                )
+                .weak()
+                .small(),
+            );
+            ui.add_space(4.0);
+            draw_head_diagram(ui, profile);
+        });
+
     }); // end ScrollArea
 
     changed
+}
+
+/// Cached set of XZ-projected edge pairs for the side-view STL wireframe.
+/// Each entry is [[x1, z1], [x2, z2]] in tip-offset-corrected coordinates.
+type StlEdgeCache = Vec<[[f64; 2]; 2]>;
+
+/// Load an STL, translate so the nozzle tip is at the origin, and project all
+/// triangle edges onto the XZ plane (X = left/right, Z = up).  At most ~700
+/// triangles are kept so the diagram stays fast to render.
+fn load_head_stl_edges(path: &str, tip_offset: [f64; 3]) -> StlEdgeCache {
+    use crate::Mesh;
+    let mesh = match Mesh::from_stl(std::path::Path::new(path)) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    let step = (mesh.triangles.len() / 700).max(1);
+    let mut edges = Vec::with_capacity(mesh.triangles.len().min(700) * 3);
+    for tri in mesh.triangles.iter().step_by(step) {
+        let verts = [tri.v0, tri.v1, tri.v2];
+        for k in 0..3 {
+            let a = verts[k];
+            let b = verts[(k + 1) % 3];
+            edges.push([
+                [a.x - tip_offset[0], a.z - tip_offset[2]],
+                [b.x - tip_offset[0], b.z - tip_offset[2]],
+            ]);
+        }
+    }
+    edges
+}
+
+/// 2-D side-view diagram of the tool head geometry.
+/// Shows the head body (box or STL wireframe), nozzle, TCP pivot point, and the
+/// arc the nozzle tip sweeps when the machine tilts through its full rotary range.
+fn draw_head_diagram(ui: &mut egui::Ui, profile: &PrinterProfile) {
+    let canvas_size = egui::vec2(280.0, 360.0);
+    let (response, painter) = ui.allocate_painter(canvas_size, egui::Sense::hover());
+    let rect = response.rect;
+    painter.rect_filled(rect, 4.0, egui::Color32::from_gray(28));
+
+    // ── Profile values ────────────────────────────────────────────────────
+    let tcp      = profile.tcp_offset.max(1.0);
+    let head_w   = profile.head_dims[0].max(profile.head_dims[1]).max(1.0);
+    let head_h   = profile.head_dims[2].max(1.0);
+    let nozzle_l = profile.nozzle_length.max(1.0);
+    let nozzle_r = profile.nozzle_radius.max(0.5);
+
+    let max_tilt_deg: f64 = {
+        let t = profile.rotary_axes.iter()
+            .filter(|ax| ax.axis_type == AxisType::Rotary)
+            .map(|ax| ax.max.abs().max(ax.min.abs()))
+            .fold(0.0_f64, f64::max);
+        if t < 1.0 { 45.0 } else { t.min(89.0) }
+    };
+    let max_tilt_rad = max_tilt_deg.to_radians();
+
+    // ── Load / cache STL wireframe ────────────────────────────────────────
+    // Cache key includes the path and tip offset so any change triggers a reload.
+    let stl_edges: Option<StlEdgeCache> =
+        if let Some(path) = profile.head_stl_path.as_deref() {
+            let tip = profile.head_stl_tip_offset;
+            let cache_id = egui::Id::new("head_stl_edges")
+                .with(path)
+                .with(format!("{:.3},{:.3},{:.3}", tip[0], tip[1], tip[2]));
+            let cached = ui.ctx().data(|d| d.get_temp::<StlEdgeCache>(cache_id));
+            Some(if let Some(edges) = cached {
+                edges
+            } else {
+                let edges = load_head_stl_edges(path, tip);
+                ui.ctx().data_mut(|d| d.insert_temp(cache_id, edges.clone()));
+                edges
+            })
+        } else {
+            None
+        };
+
+    // ── Bounding box for world-space scaling ──────────────────────────────
+    // When an STL is loaded use its actual extents; otherwise use head_dims.
+    let (world_y_top, world_y_bot, world_x_ext) =
+        if let Some(ref edges) = stl_edges {
+            let (mut xlo, mut xhi, mut zlo, mut zhi) =
+                (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+            for e in edges {
+                for pt in e {
+                    xlo = xlo.min(pt[0]); xhi = xhi.max(pt[0]);
+                    zlo = zlo.min(pt[1]); zhi = zhi.max(pt[1]);
+                }
+            }
+            let y_top = (zhi + 8.0).max(tcp + 8.0) as f32;
+            let y_bot = (zlo - 4.0).min(-8.0) as f32;
+            let x_ext = ((xlo.abs().max(xhi.abs()) + 8.0)
+                .max(tcp * max_tilt_rad.sin() + 8.0)) as f32;
+            (y_top, y_bot, x_ext)
+        } else {
+            let arc_x  = tcp * max_tilt_rad.sin();
+            let y_top  = (nozzle_l + head_h + 8.0).max(tcp + 8.0) as f32;
+            let x_ext  = ((head_w / 2.0 + 8.0).max(arc_x + 8.0)) as f32;
+            (y_top, -8.0_f32, x_ext)
+        };
+
+    // ── Scale ─────────────────────────────────────────────────────────────
+    let margin       = 6.0_f32;
+    let right_margin = 56.0_f32;
+    let draw_h = canvas_size.y - margin * 2.0;
+    let draw_w = canvas_size.x - margin * 2.0 - right_margin;
+    let scale  = (draw_h / (world_y_top - world_y_bot))
+        .min(draw_w / (world_x_ext * 2.0));
+
+    // Screen origin = nozzle tip (world 0, 0)
+    let ox = rect.left() + margin + world_x_ext * scale;
+    let oy = rect.top()  + margin + world_y_top * scale;
+
+    let w2s = |wx: f64, wy: f64| -> egui::Pos2 {
+        egui::pos2(ox + wx as f32 * scale, oy - wy as f32 * scale)
+    };
+
+    // ── Colours ───────────────────────────────────────────────────────────
+    let head_fill   = egui::Color32::from_rgba_unmultiplied(140, 150, 175, 100);
+    let head_stroke = egui::Color32::from_rgb(185, 190, 205);
+    let nozzle_col  = egui::Color32::from_rgb(215, 165, 70);
+    let pivot_col   = egui::Color32::from_rgb(255, 140, 0);
+    let tip_col     = egui::Color32::from_rgb(70, 200, 70);
+    let arc_col     = egui::Color32::from_rgb(60, 120, 200);
+    let ghost_col   = egui::Color32::from_rgba_unmultiplied(60, 120, 200, 55);
+    let faint_arc   = egui::Color32::from_rgba_unmultiplied(60, 120, 200, 80);
+    let dim_col     = egui::Color32::from_gray(135);
+    let axis_col    = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 35);
+
+    // ── Tilt sweep arc ────────────────────────────────────────────────────
+    // When the head tilts by angle t around the fixed pivot, the nozzle traces:
+    //   nozzle_world = (tcp·sin t,  tcp·(1 − cos t))
+    // (pivot stays at (0, tcp); nozzle moves right for positive tilt)
+    let n_arc = 40_usize;
+    let arc_pts: Vec<egui::Pos2> = (0..=n_arc).map(|i| {
+        let t = -max_tilt_rad + 2.0 * max_tilt_rad * i as f64 / n_arc as f64;
+        w2s(tcp * t.sin(), tcp * (1.0 - t.cos()))
+    }).collect();
+
+    for i in 0..arc_pts.len().saturating_sub(1) {
+        painter.line_segment([arc_pts[i], arc_pts[i + 1]], egui::Stroke::new(1.5, arc_col));
+    }
+    let pivot_s = w2s(0.0, tcp);
+    if let Some(&p0) = arc_pts.first() {
+        painter.line_segment([pivot_s, p0], egui::Stroke::new(1.0, faint_arc));
+    }
+    if let Some(&p1) = arc_pts.last() {
+        painter.line_segment([pivot_s, p1], egui::Stroke::new(1.0, faint_arc));
+    }
+
+    // ── Ghost head outlines at ±max tilt ─────────────────────────────────
+    // Correct kinematics: pivot is fixed at (0, tcp); a point (lx, ly) in
+    // tool-frame (lx = right, ly = up from nozzle tip) maps to world via:
+    //   tool_X_world = (cos t,  sin t)
+    //   tool_Z_world = (−sin t, cos t)   [points toward pivot, i.e. tool "up"]
+    //   nozzle_world = (tcp·sin t,  tcp·(1−cos t))
+    //   world = nozzle_world + lx·tool_X + ly·tool_Z
+    for &tilt in &[-max_tilt_rad, max_tilt_rad] {
+        let ct = tilt.cos();
+        let st = tilt.sin();
+        let tg = |lx: f64, ly: f64| -> egui::Pos2 {
+            let wx = tcp * st + lx * ct - ly * st;
+            let wy = tcp * (1.0 - ct) + lx * st + ly * ct;
+            egui::pos2(ox + wx as f32 * scale, oy - wy as f32 * scale)
+        };
+        if let Some(ref edges) = stl_edges {
+            for e in edges {
+                let p0 = tg(e[0][0], e[0][1]);
+                let p1 = tg(e[1][0], e[1][1]);
+                painter.line_segment([p0, p1], egui::Stroke::new(0.5, ghost_col));
+            }
+        } else {
+            // Parametric box ghost
+            let corners = [
+                tg(-head_w / 2.0, nozzle_l),
+                tg( head_w / 2.0, nozzle_l),
+                tg( head_w / 2.0, nozzle_l + head_h),
+                tg(-head_w / 2.0, nozzle_l + head_h),
+            ];
+            for i in 0..4 {
+                painter.line_segment(
+                    [corners[i], corners[(i + 1) % 4]],
+                    egui::Stroke::new(1.0, ghost_col),
+                );
+            }
+        }
+        painter.circle_filled(tg(0.0, 0.0), 2.0, ghost_col);
+    }
+
+    // ── Main (upright) head ───────────────────────────────────────────────
+    if let Some(ref edges) = stl_edges {
+        // STL wireframe — XZ projection, tip offset already applied
+        for e in edges {
+            painter.line_segment(
+                [w2s(e[0][0], e[0][1]), w2s(e[1][0], e[1][1])],
+                egui::Stroke::new(0.8, head_stroke),
+            );
+        }
+    } else {
+        // Parametric head: nozzle trapezoid + body box
+        let tip_r = (nozzle_r * 0.25).max(0.25);
+        let nv = [
+            w2s(-tip_r,    0.0),
+            w2s( tip_r,    0.0),
+            w2s( nozzle_r, nozzle_l),
+            w2s(-nozzle_r, nozzle_l),
+        ];
+        painter.line_segment([nv[0], nv[1]], egui::Stroke::new(2.0,  nozzle_col));
+        painter.line_segment([nv[1], nv[2]], egui::Stroke::new(1.5,  nozzle_col));
+        painter.line_segment([nv[2], nv[3]], egui::Stroke::new(1.5,  nozzle_col));
+        painter.line_segment([nv[3], nv[0]], egui::Stroke::new(1.5,  nozzle_col));
+
+        let head_rect = egui::Rect::from_two_pos(
+            w2s(-head_w / 2.0, nozzle_l),
+            w2s( head_w / 2.0, nozzle_l + head_h),
+        );
+        painter.rect_filled(head_rect, 2.0, head_fill);
+        painter.rect_stroke(head_rect, 2.0, egui::Stroke::new(2.0, head_stroke));
+    }
+
+    // Faint tool axis line
+    painter.line_segment([w2s(0.0, 0.0), pivot_s], egui::Stroke::new(1.0, axis_col));
+
+    // ── TCP pivot (orange) and nozzle tip (green) ─────────────────────────
+    painter.circle_filled(pivot_s, 5.5, pivot_col);
+    painter.circle_stroke(pivot_s, 5.5, egui::Stroke::new(1.5, egui::Color32::WHITE));
+    let tip_s = w2s(0.0, 0.0);
+    painter.circle_filled(tip_s, 4.0, tip_col);
+
+    // ── Dimension: TCP offset ─────────────────────────────────────────────
+    let dim_x = rect.right() - right_margin + 4.0;
+    let d_tip  = egui::pos2(dim_x, oy);
+    let d_piv  = egui::pos2(dim_x, oy - tcp as f32 * scale);
+    let tick   = 3.5_f32;
+    painter.line_segment([d_tip, d_piv], egui::Stroke::new(1.0, dim_col));
+    for &py in &[d_tip.y, d_piv.y] {
+        painter.line_segment(
+            [egui::pos2(dim_x - tick, py), egui::pos2(dim_x + tick, py)],
+            egui::Stroke::new(1.0, dim_col),
+        );
+    }
+    painter.text(
+        egui::pos2(dim_x + 5.0, (d_tip.y + d_piv.y) / 2.0),
+        egui::Align2::LEFT_CENTER,
+        format!("TCP\n{:.0}mm", tcp),
+        egui::FontId::proportional(9.0),
+        dim_col,
+    );
+
+    // ── Labels ────────────────────────────────────────────────────────────
+    painter.text(
+        egui::pos2(pivot_s.x + 8.0, pivot_s.y),
+        egui::Align2::LEFT_CENTER,
+        "pivot",
+        egui::FontId::proportional(10.0),
+        pivot_col,
+    );
+    painter.text(
+        egui::pos2(tip_s.x + 6.0, tip_s.y - 1.0),
+        egui::Align2::LEFT_CENTER,
+        "tip",
+        egui::FontId::proportional(10.0),
+        tip_col,
+    );
+    // Source label (STL or parametric)
+    let src_label = if stl_edges.is_some() { "STL" } else { "parametric" };
+    painter.text(
+        egui::pos2(rect.left() + 4.0, rect.bottom() - 4.0),
+        egui::Align2::LEFT_BOTTOM,
+        src_label,
+        egui::FontId::proportional(9.0),
+        egui::Color32::from_gray(100),
+    );
+    // Tilt label
+    if let Some(&arc_pt) = arc_pts.get(n_arc * 3 / 4) {
+        painter.text(
+            egui::pos2(arc_pt.x + 3.0, arc_pt.y),
+            egui::Align2::LEFT_CENTER,
+            format!("±{:.0}°", max_tilt_deg),
+            egui::FontId::proportional(9.0),
+            arc_col,
+        );
+    }
 }

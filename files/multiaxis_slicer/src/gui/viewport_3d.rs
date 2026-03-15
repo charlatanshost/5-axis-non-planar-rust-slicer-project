@@ -79,6 +79,32 @@ pub struct Viewport3D {
     machine_profile_sig: u64,  // simple hash to detect profile or playback changes
     collision_lines_gm: Option<Arc<Gm<Mesh, ColorMaterial>>>,
     collision_lines_sig: usize, // collision_segments.len() at last rebuild
+
+    // Part-follows-bed: retained CPU data for re-baking when bed tilts
+    source_cpu_positions: Option<Vec<Vec3>>,
+    source_cpu_normals: Option<Vec<Vec3>>,
+    source_cpu_indices: Option<Vec<u32>>,
+    /// Part mesh re-baked with the current bed rotation (used instead of mesh_object
+    /// when machine simulation is active and the bed has a non-zero tilt angle).
+    part_on_bed_gm: Option<Arc<Gm<Mesh, PhysicalMaterial>>>,
+    part_bed_angle_sig: u64,   // rebuilt only when the bed angle changes
+
+    // ── Smooth machine simulation state ────────────────────────────────────
+    /// Smoothed (SLERP'd) head rotation quaternion [w,x,y,z].
+    machine_smooth_qh: [f32; 4],
+    /// Smoothed (SLERP'd) bed rotation quaternion [w,x,y,z].
+    machine_smooth_qb: [f32; 4],
+    /// Smoothed head pivot world position.
+    machine_smooth_pivot: Vec3,
+    /// Smoothed bed world pivot.
+    machine_smooth_bed_pivot: Vec3,
+    /// Whether the smooth state has been initialised (false → snap on first frame).
+    machine_smooth_init: bool,
+    /// Previous toolpath playback position — used to detect rewinds so we can snap.
+    machine_prev_pos: usize,
+    /// STL mesh cache: (path, slicer Mesh) so we don't reload from disk every frame.
+    cached_head_stl: Option<(String, crate::Mesh)>,
+    cached_bed_stl:  Option<(String, crate::Mesh)>,
 }
 
 impl Viewport3D {
@@ -133,6 +159,21 @@ impl Viewport3D {
             machine_profile_sig: u64::MAX,
             collision_lines_gm: None,
             collision_lines_sig: usize::MAX,
+
+            source_cpu_positions: None,
+            source_cpu_normals: None,
+            source_cpu_indices: None,
+            part_on_bed_gm: None,
+            part_bed_angle_sig: u64::MAX,
+
+            machine_smooth_qh: [1.0, 0.0, 0.0, 0.0], // identity quaternion
+            machine_smooth_qb: [1.0, 0.0, 0.0, 0.0],
+            machine_smooth_pivot: Vec3::new(0.0, 0.0, 0.0),
+            machine_smooth_bed_pivot: Vec3::new(0.0, 0.0, 0.0),
+            machine_smooth_init: false,
+            machine_prev_pos: usize::MAX,
+            cached_head_stl: None,
+            cached_bed_stl:  None,
         }
     }
 
@@ -323,6 +364,13 @@ impl Viewport3D {
         // Create vertex colors (all same color) to force solid rendering
         let colors = vec![Srgba::new(220, 220, 230, 255); positions.len()];
 
+        // Retain CPU data so update_machine_geometry() can re-bake when the bed tilts.
+        self.source_cpu_positions = Some(positions.clone());
+        self.source_cpu_normals   = Some(normals.clone());
+        self.source_cpu_indices   = Some(indices.clone());
+        self.part_on_bed_gm       = None;
+        self.part_bed_angle_sig   = u64::MAX; // force rebuild on next machine update
+
         // Create CPU mesh with explicit normals and colors
         let cpu_mesh = CpuMesh {
             positions: Positions::F32(positions),
@@ -373,6 +421,11 @@ impl Viewport3D {
         log::info!("Clearing viewport mesh cache - will reload on next frame");
         self.mesh_bounds = None;
         self.mesh_object = None;
+        self.source_cpu_positions = None;
+        self.source_cpu_normals   = None;
+        self.source_cpu_indices   = None;
+        self.part_on_bed_gm       = None;
+        self.part_bed_angle_sig   = u64::MAX;
         self.build_plate_mesh = None;
         self.toolpath_spheres = None;
         self.toolpath_lines = None;
@@ -1274,8 +1327,18 @@ impl Viewport3D {
                 })
                 .unwrap_or(0);
 
-            if profile_sig != self.machine_profile_sig {
-                self.update_machine_geometry(app);
+            let machine_shown = app.profiles.get(app.active_profile_index)
+                .map(|p| p.show_machine).unwrap_or(false);
+            if machine_shown {
+                // Always update when shown so smooth interpolation can animate every frame.
+                let dt = ui.ctx().input(|i| i.stable_dt as f32).clamp(0.001, 0.1);
+                let still_smoothing = self.update_machine_geometry(app, dt);
+                if still_smoothing {
+                    ui.ctx().request_repaint();
+                }
+                self.machine_profile_sig = profile_sig;
+            } else if profile_sig != self.machine_profile_sig {
+                self.update_machine_geometry(app, 0.0);
                 self.machine_profile_sig = profile_sig;
             }
 
@@ -1390,20 +1453,21 @@ impl Viewport3D {
     }
 
     /// Rebuild machine head + bed geometry for the current playback position.
-    fn update_machine_geometry(&mut self, app: &SlicerApp) {
+    /// Returns `true` if the smooth animation has not yet converged (caller should repaint).
+    fn update_machine_geometry(&mut self, app: &SlicerApp, dt: f32) -> bool {
         let profile = match app.profiles.get(app.active_profile_index) {
             Some(p) => p.clone(),
             None => {
                 self.machine_head_gm = None;
                 self.machine_bed_gm = None;
-                return;
+                return false;
             }
         };
 
         if !profile.show_machine {
             self.machine_head_gm = None;
             self.machine_bed_gm = None;
-            return;
+            return false;
         }
 
         // Find current segment's position and orientation
@@ -1428,63 +1492,188 @@ impl Viewport3D {
             ))
         };
 
-        // Compute axis angles for this orientation
+        // Compute axis angles for this orientation and build gcode axis descriptors.
         let angles = app.compute_segment_axis_angles(&seg_orient);
         let gcode_axes = app.build_gcode_axes();
 
-        let head_angles: Vec<f64> = gcode_axes.iter().zip(angles.iter())
-            .filter(|(ax, _)| ax.is_head).take(2)
-            .map(|(_, (_, d))| *d).collect();
-        let bed_angles: Vec<f64> = gcode_axes.iter().zip(angles.iter())
-            .filter(|(ax, _)| !ax.is_head).take(2)
-            .map(|(_, (_, d))| *d).collect();
+        // ── BED setup (must come before head so the bed rotation can inform head placement) ──
+        //
+        // 1. Build bed joints from the IK angles for bed axes, clamped to axis limits.
+        let bed_joints: Vec<([f32; 3], f32)> = gcode_axes.iter().zip(angles.iter())
+            .filter(|(ax, _)| !ax.is_head)
+            .map(|(ax, (_, deg))| {
+                let ra = ax.rotation_axis;
+                let clamped = deg.clamp(ax.min_deg, ax.max_deg);
+                ([ra[0] as f32, ra[1] as f32, ra[2] as f32], clamped.to_radians() as f32)
+            })
+            .collect();
 
-        let ha = head_angles.first().copied().unwrap_or(0.0).to_radians() as f32;
-        let hb = head_angles.get(1).copied().unwrap_or(0.0).to_radians() as f32;
-        let ba = bed_angles.first().copied().unwrap_or(0.0).to_radians() as f32;
-        let bb = bed_angles.get(1).copied().unwrap_or(0.0).to_radians() as f32;
+        // 2. Compute bed rotation matrix.
+        let rb = build_chained_rotation(&bed_joints);
 
-        let tcp = app.tcp_offset as f32;
-        let olen = ((seg_orient.x * seg_orient.x + seg_orient.y * seg_orient.y + seg_orient.z * seg_orient.z) as f32).sqrt().max(1e-6);
-
-        // Head pivot = nozzle_pos minus tcp along orientation
-        let pivot_head = Vec3::new(
-            seg_pos[0] - tcp * seg_orient.x as f32 / olen,
-            seg_pos[1] - tcp * seg_orient.y as f32 / olen,
-            seg_pos[2] - tcp * seg_orient.z as f32 / olen,
+        // 3. Compute bed world pivot (needed for coordinate transforms).
+        let (bw, bd, bh) = (profile.bed_dims[0] as f32, profile.bed_dims[1] as f32, profile.bed_dims[2] as f32);
+        let grid_z = self.mesh_bounds.map(|(mn, _)| mn[2]).unwrap_or(0.0f32);
+        let bed_pivot_z = if profile.bed_travel[2] > 0.0 {
+            let dz = (seg_pos[2] - grid_z).max(0.0);
+            let max_drop = profile.bed_travel[2] as f32;
+            grid_z - bh - dz.min(max_drop)
+        } else {
+            grid_z - bh
+        };
+        let bed_world_pivot = Vec3::new(
+            profile.bed_pivot[0] as f32,
+            profile.bed_pivot[1] as f32,
+            bed_pivot_z,
         );
 
-        // ── Head ─────────────────────────────────────────────────────────
-        let rh = machine_rot_xy(ha, hb);
+        // 4. World-space nozzle contact point.
+        //    seg_pos lives in object/bed frame. When the bed rotates, the contact point
+        //    moves in world space. Track it so the head follows the part.
+        let seg_pos_vec3 = Vec3::new(seg_pos[0], seg_pos[1], seg_pos[2]);
+        let nozzle_world = if !bed_joints.is_empty() {
+            machine_apply_rot(rb, seg_pos_vec3 - bed_world_pivot) + bed_world_pivot
+        } else {
+            seg_pos_vec3
+        };
+
+        // 5. Residual orientation the head must achieve AFTER the bed has handled its share.
+        //    rb^T (= rb inverse for orthogonal rotation matrices) un-rotates seg_orient
+        //    back into the bed's reference frame, leaving only what the head must do.
+        let residual_orient: crate::geometry::Vector3D = if !bed_joints.is_empty() {
+            let rb_t = mat3_transpose(rb);
+            let o = machine_apply_rot(rb_t, Vec3::new(
+                seg_orient.x as f32, seg_orient.y as f32, seg_orient.z as f32,
+            ));
+            crate::geometry::Vector3D::new(o.x as f64, o.y as f64, o.z as f64)
+        } else {
+            seg_orient
+        };
+
+        // ── HEAD setup ────────────────────────────────────────────────────────────────────
+        //
+        // Recompute head joints from the residual orientation so that head + bed together
+        // achieve the target orientation (rather than each independently trying to match
+        // the full seg_orient, which would over-rotate).
+        let head_joints: Vec<([f32; 3], f32)> = gcode_axes.iter()
+            .filter(|ax| ax.is_head)
+            .map(|ax| {
+                let [rx, ry, rz] = ax.rotation_axis;
+                let angle_deg = if rx.abs() > 0.7 {
+                    residual_orient.y.atan2(residual_orient.z).to_degrees()
+                } else if ry.abs() > 0.7 {
+                    (-residual_orient.x).atan2(residual_orient.z).to_degrees()
+                } else {
+                    residual_orient.y.atan2(residual_orient.x).to_degrees()
+                };
+                let clamped = angle_deg.clamp(ax.min_deg, ax.max_deg).to_radians() as f32;
+                ([rx as f32, ry as f32, rz as f32], clamped)
+            })
+            .collect();
+
+        // nozzle_length = distance from head pivot (rotary axis) to nozzle tip.
+        // The nozzle cylinder in local space runs from (0,0,-nl) [tip] to (0,0,0) [pivot].
+        // So in world space: world_pivot = nozzle_world - rh*(0,0,-nl) = nozzle_world + rh*(0,0,nl).
+        let nl = profile.nozzle_length as f32;
+        let target_rh = build_chained_rotation(&head_joints);
+        // Target pivot for SLERP tracking (uses target rotation, not smoothed).
+        let pivot_head = nozzle_world + machine_apply_rot(target_rh, Vec3::new(0.0, 0.0, nl));
+
+        // ── Smooth interpolation ──────────────────────────────────────────
+        // Snap (don't SLERP) when the playback position moves backward — this prevents
+        // the visible 180° flip when the user rewinds or resets to position 0.
+        let cur_pos = app.toolpath_playback_position;
+        if self.machine_smooth_init && cur_pos < self.machine_prev_pos {
+            self.machine_smooth_init = false;
+        }
+        self.machine_prev_pos = cur_pos;
+
+        // Compute target rotations as quaternions.
+        let target_qh = mat3_to_quat(target_rh);
+        let target_qb = mat3_to_quat(rb);
+
+        // Maximum angular simulation speed: 90 deg/s, assuming ~16ms per call.
+        // Capped to a fixed visual speed independent of machine limits (just aesthetics).
+        let sim_speed_rad = 90_f32.to_radians() * dt;
+
+        let slerp_step = |q_cur: [f32;4], q_tgt: [f32;4]| -> ([f32;4], bool) {
+            let dot = (q_cur[0]*q_tgt[0]+q_cur[1]*q_tgt[1]+q_cur[2]*q_tgt[2]+q_cur[3]*q_tgt[3])
+                .abs().min(1.0_f32);
+            let total_angle = 2.0 * dot.acos();
+            if total_angle < 1e-5 { return (q_tgt, false); } // converged
+            let t = (sim_speed_rad / total_angle).min(1.0);
+            (quat_slerp(q_cur, q_tgt, t), t < 1.0)
+        };
+
+        let (smooth_qh, still_moving_h);
+        let (smooth_qb, still_moving_b);
+        let smooth_pivot;
+        let smooth_bed_pivot;
+        if !self.machine_smooth_init {
+            // First frame: snap to target
+            smooth_qh = target_qh;
+            smooth_qb = target_qb;
+            smooth_pivot = pivot_head;
+            smooth_bed_pivot = bed_world_pivot;
+            still_moving_h = false;
+            still_moving_b = false;
+        } else {
+            (smooth_qh, still_moving_h) = slerp_step(self.machine_smooth_qh, target_qh);
+            (smooth_qb, still_moving_b) = slerp_step(self.machine_smooth_qb, target_qb);
+            // Lerp the pivot positions too
+            let lf = (sim_speed_rad * 5.0).min(1.0); // faster lerp for position
+            smooth_pivot = Vec3::new(
+                self.machine_smooth_pivot.x + lf * (pivot_head.x - self.machine_smooth_pivot.x),
+                self.machine_smooth_pivot.y + lf * (pivot_head.y - self.machine_smooth_pivot.y),
+                self.machine_smooth_pivot.z + lf * (pivot_head.z - self.machine_smooth_pivot.z),
+            );
+            smooth_bed_pivot = Vec3::new(
+                self.machine_smooth_bed_pivot.x + lf * (bed_world_pivot.x - self.machine_smooth_bed_pivot.x),
+                self.machine_smooth_bed_pivot.y + lf * (bed_world_pivot.y - self.machine_smooth_bed_pivot.y),
+                self.machine_smooth_bed_pivot.z + lf * (bed_world_pivot.z - self.machine_smooth_bed_pivot.z),
+            );
+        }
+        self.machine_smooth_qh = smooth_qh;
+        self.machine_smooth_qb = smooth_qb;
+        self.machine_smooth_pivot = smooth_pivot;
+        self.machine_smooth_bed_pivot = smooth_bed_pivot;
+        self.machine_smooth_init = true;
+
+        // Use smoothed matrices for all rendering below.
+        let rh = quat_to_mat3(smooth_qh);
+        let rb_smooth = quat_to_mat3(smooth_qb);
+        let still_smoothing = still_moving_h || still_moving_b;
+        // Render pivot: derived from smooth rotation so the head body tracks the smooth animation.
+        let render_pivot_head = nozzle_world + machine_apply_rot(rh, Vec3::new(0.0, 0.0, nl));
+
+        // ── Head geometry ─────────────────────────────────────────────────
         let (w, d, h) = (profile.head_dims[0] as f32, profile.head_dims[1] as f32, profile.head_dims[2] as f32);
         let nr = profile.nozzle_radius as f32;
-        // nozzle_length drives the visual cylinder; tcp drives G-code compensation
-        let nl = profile.nozzle_length as f32;
         let head_color   = Srgba::new(80, 140, 220, 200);
         let nozzle_color = Srgba::new(200, 200, 200, 220);
         let tip_color    = Srgba::new(255, 200, 60, 255); // bright gold tip marker
 
-        // Nozzle tip in world space (the actual contact point)
-        let seg_pos_vec3 = Vec3::new(seg_pos[0], seg_pos[1], seg_pos[2]);
+        // Cache head STL to avoid reloading from disk every frame during smooth animation.
+        if let Some(ref path_str) = profile.head_stl_path.clone() {
+            if self.cached_head_stl.as_ref().map(|(p,_)| p != path_str).unwrap_or(true) {
+                match crate::Mesh::from_stl(std::path::Path::new(path_str)) {
+                    Ok(sm) => self.cached_head_stl = Some((path_str.clone(), sm)),
+                    Err(e) => { log::warn!("Head STL load failed ({}): {}", path_str, e); self.cached_head_stl = None; }
+                }
+            }
+        } else {
+            self.cached_head_stl = None;
+        }
 
         self.machine_head_gm = {
-            // Try STL override first
-            let cpu_opt: Option<CpuMesh> = profile.head_stl_path.as_ref().and_then(|path_str| {
-                match crate::Mesh::from_stl(std::path::Path::new(path_str)) {
-                    Ok(sm) => {
-                        // The user-specified tip offset tells us which point in the STL is the
-                        // nozzle tip.  We pin that local point to seg_pos_vec3 in world space:
-                        //   world_origin = seg_pos - rh * tip_local
-                        let tip_local = Vec3::new(
-                            profile.head_stl_tip_offset[0] as f32,
-                            profile.head_stl_tip_offset[1] as f32,
-                            profile.head_stl_tip_offset[2] as f32,
-                        );
-                        let world_origin = seg_pos_vec3 - machine_apply_rot(rh, tip_local);
-                        Some(machine_slicer_mesh_to_cpu_mesh(&sm, head_color, world_origin, rh))
-                    }
-                    Err(e) => { log::warn!("Head STL load failed ({}): {}", path_str, e); None }
-                }
+            let cpu_opt: Option<CpuMesh> = self.cached_head_stl.as_ref().map(|(_, sm)| {
+                let tip_local = Vec3::new(
+                    profile.head_stl_tip_offset[0] as f32,
+                    profile.head_stl_tip_offset[1] as f32,
+                    profile.head_stl_tip_offset[2] as f32,
+                );
+                let world_origin = nozzle_world - machine_apply_rot(rh, tip_local);
+                machine_slicer_mesh_to_cpu_mesh(sm, head_color, world_origin, rh)
             });
 
             if let Some(cpu) = cpu_opt {
@@ -1501,21 +1690,21 @@ impl Viewport3D {
                 machine_append_box(&mut pos, &mut nor, &mut col, &mut idx,
                     w, d, h, head_color,
                     Vec3::new(0.0, 0.0, h / 2.0),
-                    pivot_head, rh);
+                    render_pivot_head, rh);
 
-                // Nozzle cylinder hanging below pivot — uses nozzle_length, not tcp
+                // Nozzle cylinder hanging below pivot — tip is at (0,0,-nl) = nozzle_world
                 if nl > 0.5 {
                     machine_append_cylinder(&mut pos, &mut nor, &mut col, &mut idx,
                         nr, nl, 12, nozzle_color,
                         Vec3::new(0.0, 0.0, -nl),
-                        pivot_head, rh);
+                        render_pivot_head, rh);
 
                     // Bright tip sphere at the nozzle tip so it's easy to identify
                     let tip_r = (nr * 1.5).max(2.5);
                     machine_append_sphere(&mut pos, &mut nor, &mut col, &mut idx,
                         tip_r, 8, tip_color,
                         Vec3::new(0.0, 0.0, -nl),
-                        pivot_head, rh);
+                        render_pivot_head, rh);
                 }
 
                 if pos.is_empty() { None } else {
@@ -1530,25 +1719,24 @@ impl Viewport3D {
         };
 
         // ── Bed ──────────────────────────────────────────────────────────
-        let rb = machine_rot_xy(ba, bb);
-        let (bw, bd, bh) = (profile.bed_dims[0] as f32, profile.bed_dims[1] as f32, profile.bed_dims[2] as f32);
-
-        // Snap bed's top face to just below the grid (mesh bottom Z), falling back to z=0
-        let grid_z = self.mesh_bounds.map(|(mn, _)| mn[2]).unwrap_or(0.0f32);
-        let bed_world_pivot = Vec3::new(
-            profile.bed_pivot[0] as f32,
-            profile.bed_pivot[1] as f32,
-            grid_z - bh,  // top face of bed aligns with the build-plate grid
-        );
+        // rb, bw/bd/bh, grid_z, bed_pivot_z, bed_world_pivot already computed above.
         let bed_color = Srgba::new(180, 100, 60, 200);
 
         self.machine_bed_gm = {
-            // Try STL override first
-            let cpu_opt: Option<CpuMesh> = profile.bed_stl_path.as_ref().and_then(|path_str| {
-                match crate::Mesh::from_stl(std::path::Path::new(path_str)) {
-                    Ok(sm) => Some(machine_slicer_mesh_to_cpu_mesh(&sm, bed_color, bed_world_pivot, rb)),
-                    Err(e) => { log::warn!("Bed STL load failed ({}): {}", path_str, e); None }
+            // Try STL override first (cached to avoid reloading every frame)
+            if let Some(ref path_str) = profile.bed_stl_path.clone() {
+                if self.cached_bed_stl.as_ref().map(|(p,_)| p != path_str).unwrap_or(true) {
+                    match crate::Mesh::from_stl(std::path::Path::new(path_str)) {
+                        Ok(sm) => self.cached_bed_stl = Some((path_str.clone(), sm)),
+                        Err(e) => { log::warn!("Bed STL load failed ({}): {}", path_str, e); self.cached_bed_stl = None; }
+                    }
                 }
+            } else {
+                self.cached_bed_stl = None;
+            }
+
+            let cpu_opt: Option<CpuMesh> = self.cached_bed_stl.as_ref().map(|(_, sm)| {
+                machine_slicer_mesh_to_cpu_mesh(sm, bed_color, smooth_bed_pivot, rb_smooth)
             });
 
             if let Some(cpu) = cpu_opt {
@@ -1566,7 +1754,7 @@ impl Viewport3D {
                         machine_append_box(&mut pos, &mut nor, &mut col, &mut idx,
                             bw, bd, bh, bed_color,
                             Vec3::new(0.0, 0.0, bh / 2.0),
-                            bed_world_pivot, rb);
+                            smooth_bed_pivot, rb_smooth);
                     }
                     BedShape::Circle => {
                         // Cylinder: radius = min(bw, bd)/2, along +Z
@@ -1574,7 +1762,7 @@ impl Viewport3D {
                         machine_append_cylinder(&mut pos, &mut nor, &mut col, &mut idx,
                             radius, bh, 32, bed_color,
                             Vec3::new(0.0, 0.0, 0.0),
-                            bed_world_pivot, rb);
+                            smooth_bed_pivot, rb_smooth);
                     }
                 }
 
@@ -1588,6 +1776,72 @@ impl Viewport3D {
                 }
             }
         };
+
+        // ── Part follows bed ──────────────────────────────────────────────
+        // When the bed tilts OR moves in Z, the printed part (sitting on it) moves with it.
+        // Rebuild a transformed copy of the part mesh only when the bed transform changes.
+        let bed_z_offset = bed_pivot_z - (grid_z - bh); // how far bed has dropped from rest
+        // Change detection: hash smooth quaternion + Z offset so part follows smooth animation.
+        let bed_angle_sig = {
+            let [a, b, c, d] = smooth_qb;
+            let q_bits = (a.to_bits() as u64)
+                ^ ((b.to_bits() as u64).wrapping_mul(0x9e3779b9))
+                ^ ((c.to_bits() as u64).wrapping_mul(0x6c62272e))
+                ^ ((d.to_bits() as u64).wrapping_mul(0x517cc1b7));
+            q_bits ^ ((bed_z_offset * 10.0) as i32 as u64).wrapping_mul(0xdeadbeef)
+        };
+        if bed_angle_sig != self.part_bed_angle_sig {
+            self.part_bed_angle_sig = bed_angle_sig;
+            let is_tilted = smooth_qb != [1.0f32, 0.0, 0.0, 0.0]
+                && smooth_qb.iter().skip(1).any(|&v| v.abs() > 0.001);
+            let has_z_shift = bed_z_offset.abs() > 0.05;
+            self.part_on_bed_gm = if is_tilted || has_z_shift {
+                if let (Some(ref orig_pos), Some(ref orig_nor), Some(ref orig_idx)) = (
+                    &self.source_cpu_positions,
+                    &self.source_cpu_normals,
+                    &self.source_cpu_indices,
+                ) {
+                    // Apply smoothed bed transform: first shift in Z (if bed travels Z),
+                    // then rotate around the smoothed pivot.
+                    let z_shift = Vec3::new(0.0, 0.0, bed_z_offset);
+                    let new_positions: Vec<Vec3> = orig_pos.iter().map(|&p| {
+                        let p_shifted = p + z_shift;
+                        machine_apply_rot(rb_smooth, p_shifted - smooth_bed_pivot) + smooth_bed_pivot
+                    }).collect();
+                    let new_normals: Vec<Vec3> = orig_nor.iter().map(|&n| {
+                        machine_apply_rot(rb_smooth, n)
+                    }).collect();
+                    let n = new_positions.len();
+                    let colors = vec![Srgba::new(220, 220, 230, 255); n];
+                    let cpu = CpuMesh {
+                        positions: Positions::F32(new_positions),
+                        normals: Some(new_normals),
+                        colors: Some(colors),
+                        indices: Indices::U32(orig_idx.clone()),
+                        ..Default::default()
+                    };
+                    let gpu = Mesh::new(&self.context, &cpu);
+                    let mut mat = PhysicalMaterial::new_opaque(
+                        &self.context,
+                        &CpuMaterial {
+                            albedo: Srgba::new(220, 220, 230, 255),
+                            roughness: 0.7,
+                            metallic: 0.05,
+                            ..Default::default()
+                        },
+                    );
+                    mat.render_states.cull = Cull::None;
+                    mat.render_states.depth_test = DepthTest::Less;
+                    Some(Arc::new(Gm::new(gpu, mat)))
+                } else {
+                    None
+                }
+            } else {
+                None // not tilted: normal mesh_object is used
+            };
+        }
+
+        still_smoothing
     }
 
     /// Rebuild the red collision overlay tubes from `app.collision_segments`.
@@ -1666,8 +1920,10 @@ impl Viewport3D {
                 .map(|p| p.show_machine)
                 .unwrap_or(false);
             let machine_head_arc = if show_machine { self.machine_head_gm.clone() } else { None };
-            let machine_bed_arc = if show_machine { self.machine_bed_gm.clone() } else { None };
-            let collision_lines_arc = self.collision_lines_gm.clone();
+            let machine_bed_arc  = if show_machine { self.machine_bed_gm.clone()  } else { None };
+            // When the bed is tilted the part rotates with it; use the pre-baked copy.
+            let part_on_bed_arc  = if show_machine && app.show_mesh { self.part_on_bed_gm.clone()  } else { None };
+            let collision_lines_arc = if app.show_collision_overlay { self.collision_lines_gm.clone() } else { None };
             let camera_yaw = self.camera_yaw;
             let camera_pitch = self.camera_pitch;
             let camera_distance = self.camera_distance;
@@ -1764,9 +2020,15 @@ impl Viewport3D {
                         // Collect objects to render
                         let mut objects: Vec<&dyn three_d::Object> = Vec::new();
 
-                        // Add mesh if show_mesh is enabled
+                        // Add mesh if show_mesh is enabled.
+                        // When machine simulation is active and the bed is tilted,
+                        // use the pre-baked bed-rotated copy so the part moves with the bed.
                         let mesh_ref;
-                        if let Some(ref m) = mesh_arc {
+                        let part_on_bed_ref;
+                        if let Some(ref pob) = part_on_bed_arc {
+                            part_on_bed_ref = pob.clone();
+                            objects.push(&*part_on_bed_ref);
+                        } else if let Some(ref m) = mesh_arc {
                             mesh_ref = m.clone();
                             objects.push(&*mesh_ref);
                         }
@@ -2387,15 +2649,100 @@ fn machine_slicer_mesh_to_cpu_mesh(
     }
 }
 
-/// Build rotation matrix Ry(b) * Rx(a) for machine simulation.
-fn machine_rot_xy(a: f32, b: f32) -> [[f32; 3]; 3] {
-    let (sa, ca) = (a.sin(), a.cos());
-    let (sb, cb) = (b.sin(), b.cos());
+/// Rodrigues rotation matrix: rotate `angle` radians around unit `axis`.
+fn rodrigues_mat3(axis: [f32; 3], angle: f32) -> [[f32; 3]; 3] {
+    let (s, c) = (angle.sin(), angle.cos());
+    let t = 1.0 - c;
+    let [x, y, z] = axis;
     [
-        [cb,   sb * sa,  sb * ca],
-        [0.0,  ca,      -sa     ],
-        [-sb,  cb * sa,  cb * ca],
+        [t*x*x + c,   t*x*y - s*z, t*x*z + s*y],
+        [t*x*y + s*z, t*y*y + c,   t*y*z - s*x],
+        [t*x*z - s*y, t*y*z + s*x, t*z*z + c  ],
     ]
+}
+
+/// Transpose a 3×3 matrix (= inverse for pure-rotation matrices).
+fn mat3_transpose(m: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    [
+        [m[0][0], m[1][0], m[2][0]],
+        [m[0][1], m[1][1], m[2][1]],
+        [m[0][2], m[1][2], m[2][2]],
+    ]
+}
+
+/// Multiply two 3×3 matrices: result = a * b.
+fn mat3_mul(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut r = [[0.0f32; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            for k in 0..3 { r[i][j] += a[i][k] * b[k][j]; }
+        }
+    }
+    r
+}
+
+/// Build a chained rotation from (unit_axis, angle_rad) pairs.
+/// Pairs are applied in order: the first entry is the innermost joint (applied first to local vectors).
+fn build_chained_rotation(joints: &[([f32; 3], f32)]) -> [[f32; 3]; 3] {
+    let mut r = [[1.0f32, 0., 0.], [0., 1., 0.], [0., 0., 1.]]; // identity
+    for &(axis, angle) in joints {
+        r = mat3_mul(rodrigues_mat3(axis, angle), r);
+    }
+    r
+}
+
+/// Convert a 3×3 rotation matrix to a unit quaternion [w, x, y, z].
+fn mat3_to_quat(m: [[f32; 3]; 3]) -> [f32; 4] {
+    let trace = m[0][0] + m[1][1] + m[2][2];
+    if trace > 0.0 {
+        let s = 0.5 / (trace + 1.0).sqrt();
+        [0.25 / s,
+         (m[2][1] - m[1][2]) * s,
+         (m[0][2] - m[2][0]) * s,
+         (m[1][0] - m[0][1]) * s]
+    } else if m[0][0] > m[1][1] && m[0][0] > m[2][2] {
+        let s = 2.0 * (1.0 + m[0][0] - m[1][1] - m[2][2]).sqrt();
+        [(m[2][1] - m[1][2]) / s, 0.25 * s,
+         (m[0][1] + m[1][0]) / s, (m[0][2] + m[2][0]) / s]
+    } else if m[1][1] > m[2][2] {
+        let s = 2.0 * (1.0 - m[0][0] + m[1][1] - m[2][2]).sqrt();
+        [(m[0][2] - m[2][0]) / s, (m[0][1] + m[1][0]) / s,
+         0.25 * s, (m[1][2] + m[2][1]) / s]
+    } else {
+        let s = 2.0 * (1.0 - m[0][0] - m[1][1] + m[2][2]).sqrt();
+        [(m[1][0] - m[0][1]) / s, (m[0][2] + m[2][0]) / s,
+         (m[1][2] + m[2][1]) / s, 0.25 * s]
+    }
+}
+
+/// Convert a unit quaternion [w, x, y, z] to a 3×3 rotation matrix.
+fn quat_to_mat3(q: [f32; 4]) -> [[f32; 3]; 3] {
+    let [w, x, y, z] = q;
+    [
+        [1.0 - 2.0*(y*y + z*z), 2.0*(x*y - z*w),       2.0*(x*z + y*w)      ],
+        [2.0*(x*y + z*w),       1.0 - 2.0*(x*x + z*z), 2.0*(y*z - x*w)      ],
+        [2.0*(x*z - y*w),       2.0*(y*z + x*w),       1.0 - 2.0*(x*x + y*y)],
+    ]
+}
+
+/// Spherical linear interpolation between two unit quaternions.
+/// `t` in [0, 1]; 0 → q1, 1 → q2.
+fn quat_slerp(q1: [f32; 4], q2: [f32; 4], t: f32) -> [f32; 4] {
+    let mut dot = q1[0]*q2[0] + q1[1]*q2[1] + q1[2]*q2[2] + q1[3]*q2[3];
+    // Shortest-path: flip q2 if dot is negative
+    let q2 = if dot < 0.0 { dot = -dot; [-q2[0],-q2[1],-q2[2],-q2[3]] } else { q2 };
+    if dot > 0.9995 {
+        // Quaternions nearly identical — safe to lerp + normalise
+        let q = [q1[0]+t*(q2[0]-q1[0]), q1[1]+t*(q2[1]-q1[1]),
+                 q1[2]+t*(q2[2]-q1[2]), q1[3]+t*(q2[3]-q1[3])];
+        let len = (q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]).sqrt().max(1e-10);
+        return [q[0]/len, q[1]/len, q[2]/len, q[3]/len];
+    }
+    let theta0 = dot.acos();
+    let theta  = theta0 * t;
+    let s0 = (theta0 - theta).sin() / theta0.sin();
+    let s1 = theta.sin()            / theta0.sin();
+    [s0*q1[0]+s1*q2[0], s0*q1[1]+s1*q2[1], s0*q1[2]+s1*q2[2], s0*q1[3]+s1*q2[3]]
 }
 
 /// Apply a 3×3 rotation matrix to a Vec3.

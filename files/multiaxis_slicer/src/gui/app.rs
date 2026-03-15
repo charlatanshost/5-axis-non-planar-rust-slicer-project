@@ -115,6 +115,30 @@ impl AxisType {
     pub fn all() -> &'static [Self] { &[Self::Linear, Self::Rotary] }
 }
 
+/// Physical axis a rotary joint revolves around (X, Y, or Z in machine frame)
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub enum RotationAxis {
+    X,
+    #[default]
+    Y,
+    Z,
+}
+
+impl RotationAxis {
+    pub fn label(&self) -> &'static str { match self { Self::X => "X", Self::Y => "Y", Self::Z => "Z" } }
+    pub fn all() -> &'static [Self] { &[Self::X, Self::Y, Self::Z] }
+    /// Sensible default rotation axis inferred from conventional axis letter.
+    pub fn default_for_name(name: &str) -> Self {
+        match name { "A" | "a" => Self::X, "B" | "b" => Self::Y, _ => Self::Z }
+    }
+    pub fn as_vec3_f64(&self) -> [f64; 3] {
+        match self { Self::X => [1.,0.,0.], Self::Y => [0.,1.,0.], Self::Z => [0.,0.,1.] }
+    }
+    pub fn as_vec3_f32(&self) -> [f32; 3] {
+        match self { Self::X => [1.,0.,0.], Self::Y => [0.,1.,0.], Self::Z => [0.,0.,1.] }
+    }
+}
+
 /// Configuration for a single machine axis
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AxisConfig {
@@ -123,11 +147,28 @@ pub struct AxisConfig {
     pub moving_part: MovingPart,
     pub min: f64,
     pub max: f64,
+    /// Which physical axis this joint revolves around (default Y)
+    #[serde(default)]
+    pub rotation_axis: RotationAxis,
+    /// Maximum angular speed in degrees/second. G-code feedrate is capped so
+    /// this axis never exceeds this speed. 0 = unlimited.
+    #[serde(default = "default_axis_angular_speed")]
+    pub max_angular_speed: f64,
 }
+
+fn default_axis_angular_speed() -> f64 { 30.0 }
 
 impl Default for AxisConfig {
     fn default() -> Self {
-        Self { name: "A".to_string(), axis_type: AxisType::Rotary, moving_part: MovingPart::Head, min: -180.0, max: 180.0 }
+        Self {
+            name: "A".to_string(),
+            axis_type: AxisType::Rotary,
+            moving_part: MovingPart::Head,
+            min: -180.0,
+            max: 180.0,
+            rotation_axis: RotationAxis::X,
+            max_angular_speed: 30.0,
+        }
     }
 }
 
@@ -214,6 +255,15 @@ pub struct PrinterProfile {
     /// Bed surface shape for machine simulation
     #[serde(default)]
     pub bed_shape: BedShape,
+    /// Maximum symmetric linear travel of the bed on each axis [X, Y, Z] in mm.
+    /// A value of 0 means the bed does not travel on that axis.
+    /// Z travel means the bed rises/falls to meet the head (bed-slinger Z motion).
+    #[serde(default)]
+    pub bed_travel: [f64; 3],
+    /// Maximum symmetric linear travel of the toolhead on each axis [X, Y, Z] in mm.
+    /// A value of 0 means the toolhead does not travel on that axis.
+    #[serde(default)]
+    pub head_travel: [f64; 3],
 }
 
 fn profile_default_show_machine() -> bool { true }
@@ -239,8 +289,8 @@ impl Default for PrinterProfile {
             workspace_z: (0.0, 200.0),
             kinematics_type: KinematicsType::FiveAxis,
             rotary_axes: vec![
-                AxisConfig { name: "A".to_string(), axis_type: AxisType::Rotary, moving_part: MovingPart::Head, min: -180.0, max: 180.0 },
-                AxisConfig { name: "B".to_string(), axis_type: AxisType::Rotary, moving_part: MovingPart::Bed,  min: -180.0, max: 180.0 },
+                AxisConfig { name: "A".to_string(), axis_type: AxisType::Rotary, moving_part: MovingPart::Head, min: -180.0, max: 180.0, rotation_axis: RotationAxis::X, max_angular_speed: 30.0 },
+                AxisConfig { name: "B".to_string(), axis_type: AxisType::Rotary, moving_part: MovingPart::Bed,  min: -180.0, max: 180.0, rotation_axis: RotationAxis::Y, max_angular_speed: 30.0 },
             ],
             tcp_offset: 0.0,
             rotary_axis_mode: crate::gcode::RotaryAxisMode::AB,
@@ -257,6 +307,8 @@ impl Default for PrinterProfile {
             bed_shape: BedShape::Rectangle,
             nozzle_radius: 5.0,
             nozzle_length: 20.0,
+            bed_travel:  [0.0, 0.0, 200.0], // bed moves up to 200 mm in Z by default
+            head_travel: [300.0, 300.0, 0.0], // head moves 300 mm in X/Y by default
         }
     }
 }
@@ -267,6 +319,80 @@ pub enum AppTab {
     #[default]
     Main,
     PrinterProfiles,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── HeightMap ────────────────────────────────────────────────────────────────
+/// 2-D grid that tracks the maximum Z deposited at each XY cell.
+/// Used by `apply_tilt_collision_avoidance` to detect head-body collisions
+/// with previously printed material.
+struct HeightMap {
+    cells: Vec<f64>,
+    nx: usize,
+    ny: usize,
+    x0: f64,
+    y0: f64,
+    cell: f64, // cell side length (mm)
+}
+
+impl HeightMap {
+    fn new(x0: f64, y0: f64, x1: f64, y1: f64, cell: f64) -> Self {
+        let nx = (((x1 - x0) / cell).ceil() as usize).max(1);
+        let ny = (((y1 - y0) / cell).ceil() as usize).max(1);
+        Self {
+            cells: vec![f64::NEG_INFINITY; nx * ny],
+            nx, ny, x0, y0, cell,
+        }
+    }
+
+    /// Mark a circle of radius `r` around `(cx, cy)` as having height `z`.
+    fn update_circle(&mut self, cx: f64, cy: f64, z: f64, r: f64) {
+        let ix0 = (((cx - r - self.x0) / self.cell).floor() as isize).max(0);
+        let ix1 = (((cx + r - self.x0) / self.cell).ceil() as isize).min(self.nx as isize - 1);
+        let iy0 = (((cy - r - self.y0) / self.cell).floor() as isize).max(0);
+        let iy1 = (((cy + r - self.y0) / self.cell).ceil() as isize).min(self.ny as isize - 1);
+        let r2 = r * r;
+        for iy in iy0..=iy1 {
+            for ix in ix0..=ix1 {
+                let gx = self.x0 + (ix as f64 + 0.5) * self.cell;
+                let gy = self.y0 + (iy as f64 + 0.5) * self.cell;
+                if (gx - cx) * (gx - cx) + (gy - cy) * (gy - cy) <= r2 {
+                    let idx = iy as usize * self.nx + ix as usize;
+                    if z > self.cells[idx] { self.cells[idx] = z; }
+                }
+            }
+        }
+    }
+
+    /// Height at a single point `(x, y)`.  Returns `f64::NEG_INFINITY` if outside the map.
+    fn get(&self, x: f64, y: f64) -> f64 {
+        let ix = (((x - self.x0) / self.cell).floor() as isize).clamp(0, self.nx as isize - 1) as usize;
+        let iy = (((y - self.y0) / self.cell).floor() as isize).clamp(0, self.ny as isize - 1) as usize;
+        self.cells[iy * self.nx + ix]
+    }
+
+    /// Maximum height in a circle of radius `r` around `(cx, cy)`.
+    /// Returns `f64::NEG_INFINITY` if no material has been deposited yet in that region.
+    fn max_z_in_circle(&self, cx: f64, cy: f64, r: f64) -> f64 {
+        let ix0 = (((cx - r - self.x0) / self.cell).floor() as isize).max(0);
+        let ix1 = (((cx + r - self.x0) / self.cell).ceil() as isize).min(self.nx as isize - 1);
+        let iy0 = (((cy - r - self.y0) / self.cell).floor() as isize).max(0);
+        let iy1 = (((cy + r - self.y0) / self.cell).ceil() as isize).min(self.ny as isize - 1);
+        let r2 = r * r;
+        let mut best = f64::NEG_INFINITY;
+        for iy in iy0..=iy1 {
+            for ix in ix0..=ix1 {
+                let gx = self.x0 + (ix as f64 + 0.5) * self.cell;
+                let gy = self.y0 + (iy as f64 + 0.5) * self.cell;
+                if (gx - cx) * (gx - cx) + (gy - cy) * (gy - cy) <= r2 {
+                    let v = self.cells[iy as usize * self.nx + ix as usize];
+                    if v > best { best = v; }
+                }
+            }
+        }
+        best
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -306,12 +432,14 @@ pub struct SlicerApp {
     pub support_result: Option<SupportResult>,
     pub has_supports: bool,
     pub show_supports: bool,
+    pub enable_supports: bool,  // auto-generate supports when generating toolpaths
 
     // UI state
     pub show_mesh: bool,
     pub show_layers: bool,
     pub show_toolpaths: bool,
     pub show_wireframe: bool,
+    pub show_collision_overlay: bool,
     pub selected_layer: Option<usize>,
     pub show_gcode_terminal: bool,
     pub gcode_scroll_to_bottom: bool,
@@ -420,6 +548,12 @@ pub struct SlicerApp {
     pub use_surface_normals: bool,
     /// Z clearance (mm) added to non-extruding travel moves so the nozzle clears the print.
     pub travel_z_lift: f64,
+    /// If true, after assigning surface-normal orientations, check whether the tilted head body
+    /// would intersect previously deposited extrusions and adjust the tilt azimuth (and
+    /// magnitude if necessary) to maintain `head_clearance_mm` of clearance.
+    pub avoid_head_collision: bool,
+    /// Minimum clearance (mm) between the head body and already-printed material.
+    pub head_clearance_mm: f64,
 
     // Machine simulation
     /// Whether to show the machine bed + head in the viewport (mirrors active profile flag)
@@ -471,11 +605,13 @@ impl Default for SlicerApp {
             support_result: None,
             has_supports: false,
             show_supports: true,
+            enable_supports: false,
 
             show_mesh: true,
             show_layers: true,
             show_toolpaths: true,
             show_wireframe: false,
+            show_collision_overlay: true,
             selected_layer: None,
             show_gcode_terminal: false,
             gcode_scroll_to_bottom: false,
@@ -571,6 +707,8 @@ impl Default for SlicerApp {
             // Toolpath post-processing
             use_surface_normals: true,
             travel_z_lift: 2.0,
+            avoid_head_collision: true,
+            head_clearance_mm: 1.0,
 
             // Machine simulation
             show_machine_simulation: false,
@@ -809,23 +947,358 @@ impl SlicerApp {
             let mut last_extrude_x = 0.0_f64;
             let mut last_extrude_y = 0.0_f64;
 
-            for seg in &mut toolpath.paths {
+            let old_paths = std::mem::take(&mut toolpath.paths);
+            let mut new_paths: Vec<crate::toolpath::ToolpathSegment> =
+                Vec::with_capacity(old_paths.len() + 4);
+
+            let mut prev_was_lifted = false;
+
+            for mut seg in old_paths {
                 if seg.extrusion > 1e-8 {
+                    // First extrusion after a lifted travel: insert a non-extruding descent
+                    // so the nozzle reaches print height before extruding begins.
+                    if prev_was_lifted {
+                        let mut descend = seg.clone();
+                        descend.extrusion = 0.0;
+                        new_paths.push(descend);
+                    }
                     last_extrude_z = seg.position.z;
                     last_extrude_x = seg.position.x;
                     last_extrude_y = seg.position.y;
+                    prev_was_lifted = false;
                 } else {
                     // Travel move: lift Z if far enough from last extrusion point
                     let dx = seg.position.x - last_extrude_x;
                     let dy = seg.position.y - last_extrude_y;
                     if (dx * dx + dy * dy).sqrt() >= MIN_XY {
-                        seg.position.z = seg.position.z.max(last_extrude_z + lift);
+                        let lifted_z = seg.position.z.max(last_extrude_z + lift);
+                        if lifted_z > seg.position.z + 1e-6 {
+                            seg.position.z = lifted_z;
+                            prev_was_lifted = true;
+                        } else {
+                            prev_was_lifted = false;
+                        }
+                    } else {
+                        prev_was_lifted = false;
                     }
+                }
+                new_paths.push(seg);
+            }
+
+            toolpath.paths = new_paths;
+        }
+
+        self.log(format!("Applied {:.1} mm travel lift to all toolpaths", lift));
+    }
+
+    /// After surface-normal (or conical) orientations have been assigned, check whether the
+    /// tilted printhead body would physically intersect previously deposited extrusions and
+    /// adjust the tilt azimuth — or reduce the tilt magnitude — until `head_clearance_mm` of
+    /// clearance is maintained.
+    ///
+    /// ## Algorithm
+    /// Iterates all toolpath segments **in printing order** (bottom layer first, within each
+    /// layer in path order).  For each segment:
+    ///
+    /// 1. **Collision check** — Given the current orientation (θ, φ) where θ = tilt from
+    ///    vertical and φ = azimuth in XY, compute the head body's XY footprint and query the
+    ///    incremental height map for maximum previously-deposited Z in that region.  The head
+    ///    body bottom is at `nozzle_z + (tcp − head_h/2) × cos(θ)`.  If the height map max >
+    ///    head_body_bottom − clearance, a collision is predicted.
+    ///
+    /// 2. **Azimuth search** — Try 16 candidate azimuths (φ + k × 22.5°, k = 1..15) with the
+    ///    same tilt magnitude, pick the one with the smallest collision depth.  If any is
+    ///    collision-free, use it.
+    ///
+    /// 3. **Tilt reduction** — If no azimuth is clear, reduce θ in 5° steps down to 0°
+    ///    (vertical), each time trying all 16 azimuths.  Vertical is always safe.
+    ///
+    /// 4. **Height map update** — After assigning the final orientation, update the
+    ///    height map with a circle of radius = line_width/2 at the segment's XY position.
+    ///    Only extrusion segments (e > 0) are added; travel moves are not deposited material.
+    pub fn apply_tilt_collision_avoidance(&mut self) {
+        if !self.avoid_head_collision { return; }
+
+        let profile = match self.profiles.get(self.active_profile_index) {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        let tcp   = profile.tcp_offset.max(1.0);
+        let head_w = profile.head_dims[0];
+        let head_d = profile.head_dims[1];
+        let head_h = profile.head_dims[2];
+        let clearance = self.head_clearance_mm;
+
+        // Guard: if TCP offset is smaller than half the head body height the head body
+        // extends below the nozzle tip — physically invalid geometry that makes every
+        // segment appear to collide, causing the algorithm to run for trillions of
+        // iterations.  Skip with a clear log message so the user can fix their profile.
+        let min_valid_tcp = head_h / 2.0 + clearance + 5.0;
+        if tcp < min_valid_tcp {
+            self.log(format!(
+                "Head-body collision avoidance skipped: TCP offset ({:.1} mm) must be \
+                 ≥ {:.1} mm (head_height/2 + clearance + 5 mm safety margin). \
+                 Increase the TCP offset in the active printer profile.",
+                tcp, min_valid_tcp
+            ));
+            return;
+        }
+
+        // Bounding radius of head body in XY (conservative for any yaw orientation)
+        let head_half_diag = ((head_w / 2.0).powi(2) + (head_d / 2.0).powi(2)).sqrt();
+        // Bead deposit radius (half the line width)
+        let bead_r = (self.nozzle_diameter / 2.0).max(0.2);
+
+        // Build height map covering the mesh footprint + generous margin
+        let margin = (head_half_diag + tcp).max(80.0);
+        let (x0, y0, x1, y1) = if let Some(mesh) = &self.mesh {
+            (mesh.bounds_min.x - margin, mesh.bounds_min.y - margin,
+             mesh.bounds_max.x + margin, mesh.bounds_max.y + margin)
+        } else {
+            (-200.0 - margin, -200.0 - margin, 200.0 + margin, 200.0 + margin)
+        };
+        // Cell size must be proportional to the head body so that max_z_in_circle only
+        // iterates a handful of cells. ~3 cells across the head footprint diameter is
+        // plenty accurate (head body is 60mm wide → cell ≈14mm → 3 cells across).
+        // Keeping it small relative to nozzle diameter gives no benefit here and would
+        // make the grid enormous, turning every query into thousands of cell lookups.
+        let cell_size = (head_half_diag / 3.0).max(8.0).min(25.0);
+        let mut hmap = HeightMap::new(x0, y0, x1, y1, cell_size);
+
+        // Maximum tilt allowed by the active profile's head rotary axes
+        let max_tilt_rad = {
+            let deg = profile.rotary_axes.iter()
+                .filter(|ax| ax.moving_part == MovingPart::Head
+                          && ax.axis_type  == AxisType::Rotary)
+                .map(|ax| ax.max.abs().max(ax.min.abs()))
+                .fold(0.0f64, f64::max);
+            if deg < 1.0 { 45.0f64.to_radians() } else { deg.to_radians() }
+        };
+
+        // Pre-compute 16 azimuth offsets (0°, 22.5°, 45°, …)
+        const N_PHI: usize = 16;
+        let phi_offsets: [f64; N_PHI] = {
+            let mut arr = [0.0f64; N_PHI];
+            for k in 0..N_PHI {
+                arr[k] = (k as f64) * (2.0 * std::f64::consts::PI / N_PHI as f64);
+            }
+            arr
+        };
+
+        let mut adjusted_count = 0usize;
+
+        // Pre-extract head STL vertices from the active printer profile.
+        // The profile stores a file path; we load it once here and flatten to a Vec so the
+        // hot collision loop only does simple array indexing.
+        // head_stl_tip_offset is the LOCAL position of the nozzle tip inside that STL — we
+        // subtract it so the nozzle tip is at the local origin before applying the rotation.
+        // Falls back to the bounding-box cylinder approximation if no STL is configured.
+        // Pre-extract head STL vertices — capped at MAX_HEAD_VERTS so the per-segment
+        // collision check stays O(1) regardless of mesh complexity.  Representative
+        // downsampling (every Nth vertex) is sufficient; the head body is tens of mm
+        // wide so fine surface detail adds no collision-detection value.
+        const MAX_HEAD_VERTS: usize = 300;
+        let tip = profile.head_stl_tip_offset;
+        let head_verts: Option<Vec<[f64; 3]>> = profile.head_stl_path.as_deref()
+            .and_then(|p| Mesh::from_stl(std::path::Path::new(p)).ok())
+            .map(|mesh| {
+                // Collect all vertices shifted to nozzle-tip-at-origin frame
+                let all: Vec<[f64; 3]> = mesh.triangles.iter()
+                    .flat_map(|t| [t.v0, t.v1, t.v2])
+                    .map(|p| [p.x - tip[0], p.y - tip[1], p.z - tip[2]])
+                    .collect();
+                // Downsample if necessary
+                if all.len() <= MAX_HEAD_VERTS {
+                    all
+                } else {
+                    let step = all.len() / MAX_HEAD_VERTS;
+                    all.into_iter().step_by(step).take(MAX_HEAD_VERTS).collect()
+                }
+            });
+
+        self.log(format!(
+            "Head-body collision avoidance: {} segments, {} (cell {:.1}mm, tcp {:.1}mm)",
+            self.toolpaths.iter().map(|t| t.paths.len()).sum::<usize>(),
+            match &head_verts {
+                Some(v) => format!("head STL ({} probe points)", v.len()),
+                None    => format!("bounding box {:.0}×{:.0}×{:.0}mm",
+                                   head_w, head_d, head_h),
+            },
+            cell_size, tcp,
+        ));
+
+        // Closure: collision depth at a specific (theta, phi).
+        // Returns > 0 if there is a collision, ≤ 0 if clear.
+        //
+        // When a head STL is loaded, each vertex is rotated from the tool's local frame
+        // to world space and tested against the height map individually.  The rotation maps
+        // local +Z (nozzle-to-body axis) onto the world tool direction:
+        //   ex = (cos θ·cos φ,  cos θ·sin φ, −sin θ)   ← local X
+        //   ey = (     −sin φ,       cos φ,       0 )   ← local Y
+        //   ez = (sin θ·cos φ,  sin θ·sin φ,  cos θ)   ← local Z (tool direction)
+        //
+        // Without a head STL, the original bounding-box cylinder approximation is used.
+        let collision_depth = |hmap: &HeightMap, nox: f64, noy: f64, noz: f64,
+                                theta: f64, phi: f64| -> f64 {
+            if let Some(ref verts) = head_verts {
+                let ct = theta.cos(); let st = theta.sin();
+                let cp = phi.cos();   let sp = phi.sin();
+                let mut max_depth = f64::NEG_INFINITY;
+                for v in verts {
+                    let (vx, vy, vz) = (v[0], v[1], v[2]);
+                    // Rotate local vertex into world space (relative to nozzle tip)
+                    let wx = nox + vx * (ct * cp) - vy * sp + vz * (st * cp);
+                    let wy = noy + vx * (ct * sp) + vy * cp + vz * (st * sp);
+                    let wz = noz - vx * st                  + vz * ct;
+                    let depth = hmap.get(wx, wy) - (wz - clearance);
+                    if depth > max_depth { max_depth = depth; }
+                }
+                max_depth
+            } else {
+                // Bounding-box cylinder approximation
+                let sin_t = theta.sin();
+                let pivot_x = nox + sin_t * phi.cos() * tcp;
+                let pivot_y = noy + sin_t * phi.sin() * tcp;
+                let head_bottom_z = noz + (tcp - head_h / 2.0) * theta.cos();
+                let max_h = hmap.max_z_in_circle(pivot_x, pivot_y, head_half_diag);
+                max_h - (head_bottom_z - clearance)
+            }
+        };
+
+        // Score function (Nishat et al. 2024, Heuristic 1):
+        // - Collision-free candidates scored by 3D angular distance from the previous
+        //   orientation (0…π), ensuring smooth tool-vector transitions between segments.
+        // - Colliding candidates always score ≥ 100, so any collision-free option beats
+        //   any colliding one regardless of angular distance.
+        let score = |hmap: &HeightMap, nox: f64, noy: f64, noz: f64,
+                      t: f64, p: f64, pt: f64, pp: f64| -> f64 {
+            let d = collision_depth(hmap, nox, noy, noz, t, p);
+            if d <= 0.0 {
+                let dot = (pt.sin() * t.sin() * (p - pp).cos()
+                         + pt.cos() * t.cos()).clamp(-1.0, 1.0);
+                dot.acos() // [0, π] — lower = smaller angular change
+            } else {
+                100.0 + d
+            }
+        };
+
+        // Track previous segment orientation for angular continuity.
+        let mut prev_theta = 0.0f64;
+        let mut prev_phi   = 0.0f64;
+
+        for toolpath in &mut self.toolpaths {
+            for segment in &mut toolpath.paths {
+                let nx = segment.position.x;
+                let ny = segment.position.y;
+                let nz = segment.position.z;
+
+                // Decompose current orientation into (theta, phi)
+                let ori = segment.orientation;
+                let len = ori.norm();
+                if len < 1e-6 {
+                    if segment.extrusion > 1e-8 {
+                        hmap.update_circle(nx, ny, nz, bead_r);
+                    }
+                    continue;
+                }
+                let oz_unit = (ori.z / len).clamp(-1.0, 1.0);
+                let theta = oz_unit.acos();
+                let phi   = ori.y.atan2(ori.x);
+
+                // --- 1. Check collision at current orientation ---
+                let current_depth = collision_depth(&hmap, nx, ny, nz, theta, phi);
+
+                if current_depth > 0.0 {
+                    let mut best_score = f64::MAX;
+                    let mut best_theta = theta;
+                    let mut best_phi   = phi;
+
+                    // Quick escape: check whether the vertical orientation (θ=0) also
+                    // collides.  If it does, no tilt adjustment can possibly clear the
+                    // head body — this almost always means an out-of-order floating
+                    // contour is being printed beneath already-deposited material (the
+                    // height map shows z=80mm while the nozzle is at z=5mm, for
+                    // example).  Running the full 160-candidate search would waste time
+                    // and still fail, so skip it and fall through to the vertical
+                    // last-resort path below.
+                    let vertical_also_collides =
+                        collision_depth(&hmap, nx, ny, nz, 0.0, prev_phi) > 0.0;
+
+                    if !vertical_also_collides {
+                        // --- 2. Try all 16 azimuths at the same tilt magnitude.
+                        // Score combines collision clearance + angular continuity from prev.
+                        // Collision-free options (score < 100) always beat colliding ones.
+                        for k in 0..N_PHI {
+                            let p_try = phi + phi_offsets[k];
+                            let s = score(&hmap, nx, ny, nz, theta, p_try, prev_theta, prev_phi);
+                            if s < best_score {
+                                best_score = s;
+                                best_phi   = p_try;
+                                best_theta = theta;
+                            }
+                        }
+
+                        // --- 3. Reduce tilt in 5° steps if still colliding (score ≥ 100) ---
+                        if best_score >= 100.0 {
+                            let step = 5.0f64.to_radians();
+                            let mut t = theta;
+                            'reduce: while t > step {
+                                t = (t - step).max(0.0);
+                                let t_clamped = t.min(max_tilt_rad);
+                                for k in 0..N_PHI {
+                                    let p_try = phi + phi_offsets[k];
+                                    let s = score(&hmap, nx, ny, nz, t_clamped, p_try,
+                                                 prev_theta, prev_phi);
+                                    if s < best_score {
+                                        best_score = s;
+                                        best_phi   = p_try;
+                                        best_theta = t_clamped;
+                                    }
+                                    if s < 100.0 { break 'reduce; } // found collision-free
+                                }
+                                if t == 0.0 { break; }
+                            }
+                        }
+                    }
+
+                    // Vertical is always the last resort — keep azimuth continuous.
+                    // Triggers when either: (a) the full search found no clear orientation,
+                    // or (b) vertical was also colliding (floating contour fast-path).
+                    if best_score >= 100.0 || vertical_also_collides {
+                        best_theta = 0.0;
+                        best_phi   = prev_phi;
+                    }
+
+                    // Apply the adjusted orientation
+                    let st = best_theta.sin();
+                    segment.orientation = crate::geometry::Vector3D::new(
+                        st * best_phi.cos(),
+                        st * best_phi.sin(),
+                        best_theta.cos(),
+                    );
+                    adjusted_count += 1;
+                }
+
+                // --- 4. Update angular-continuity tracking ---
+                let final_ori = segment.orientation;
+                let flen = final_ori.norm();
+                if flen > 1e-6 {
+                    prev_theta = (final_ori.z / flen).clamp(-1.0, 1.0).acos();
+                    prev_phi   = final_ori.y.atan2(final_ori.x);
+                }
+
+                // --- 5. Update height map with this bead ---
+                if segment.extrusion > 1e-8 {
+                    hmap.update_circle(nx, ny, nz, bead_r);
                 }
             }
         }
 
-        self.log(format!("Applied {:.1} mm travel lift to all toolpaths", lift));
+        self.log(format!(
+            "Head-body collision avoidance: adjusted {} segment(s) ({:.1} mm clearance, {:.0}×{:.0}×{:.0} mm head)",
+            adjusted_count, clearance, head_w, head_d, head_h
+        ));
     }
 
     /// Post-process toolpath segments generated by conical slicing to assign the correct
@@ -842,7 +1315,22 @@ impl SlicerApp {
             return;
         }
 
-        let alpha_rad = self.conical_angle_degrees.to_radians();
+        // Max tilt the machine can actually execute: limited by the tightest rotary axis
+        // (IK assigns the same angle magnitude to both head and bed axes, so each must
+        // be within its own limit; the bottleneck is whichever axis is most restricted).
+        let max_tilt_rad = {
+            let profile_max = self.profiles.get(self.active_profile_index).map(|p| {
+                p.rotary_axes.iter()
+                    .filter(|ax| ax.axis_type == AxisType::Rotary)
+                    .map(|ax| ax.max.abs().max(ax.min.abs()))
+                    .fold(f64::MAX, f64::min) // tightest axis
+            }).unwrap_or(f64::MAX);
+            if profile_max == f64::MAX || profile_max < 1.0 { 90_f64.to_radians() }
+            else { profile_max.to_radians() }
+        };
+
+        // Clamp the cone half-angle to the machine limit.
+        let alpha_rad = self.conical_angle_degrees.to_radians().min(max_tilt_rad);
         let sin_a = alpha_rad.sin();
         let cos_a = alpha_rad.cos();
 
@@ -909,28 +1397,34 @@ impl SlicerApp {
             return;
         }
 
-        // Half-extents of bed box
-        let bh = [
-            profile.bed_dims[0] as f32 / 2.0,
-            profile.bed_dims[1] as f32 / 2.0,
-            profile.bed_dims[2] as f32 / 2.0,
-        ];
-        // Half-extents of head box (centred at head_h/2 above pivot)
-        // We treat the head as a box with half-extents covering the full carriage + nozzle below
-        let total_head_h = profile.head_dims[2] as f32 + self.tcp_offset as f32;
-        let hh = [
+        // Bottom Z of the print — needed to place the bed in world space.
+        let grid_z: f32 = self.toolpaths.iter()
+            .flat_map(|tp| tp.paths.iter())
+            .map(|s| s.position.z as f32)
+            .fold(f32::INFINITY, f32::min);
+        let grid_z = if grid_z.is_infinite() { 0.0 } else { grid_z };
+
+        let bed_full_h = profile.bed_dims[2] as f32;
+        let bed_travel_z = profile.bed_travel[2] as f32;
+        let bed_pivot_xy = [profile.bed_pivot[0] as f32, profile.bed_pivot[1] as f32];
+
+        // Nozzle length = distance from head pivot to nozzle tip (same as viewport).
+        let nl = profile.nozzle_length as f32;
+        let head_h = profile.head_dims[2] as f32;
+
+        // OBB half-extents (head body only — not including the nozzle cylinder below pivot).
+        let head_he = [
             profile.head_dims[0] as f32 / 2.0,
             profile.head_dims[1] as f32 / 2.0,
-            total_head_h / 2.0,
+            head_h / 2.0,
         ];
-        // Bed pivot in world space
-        let bed_pivot = [
-            profile.bed_pivot[0] as f32,
-            profile.bed_pivot[1] as f32,
-            profile.bed_pivot[2] as f32,
+        let bed_he = [
+            profile.bed_dims[0] as f32 / 2.0,
+            profile.bed_dims[1] as f32 / 2.0,
+            bed_full_h / 2.0,
         ];
 
-        let tcp = self.tcp_offset as f32;
+        let gcode_axes = self.build_gcode_axes();
 
         let total: usize = self.toolpaths.iter().map(|tp| tp.paths.len()).sum();
         let mut results = vec![false; total];
@@ -941,63 +1435,114 @@ impl SlicerApp {
                 let o = &segment.orientation;
                 let angles = self.compute_segment_axis_angles(o);
 
-                // Separate head/bed axis angles
-                let gcode_axes = self.build_gcode_axes();
-                let head_angles: Vec<f64> = gcode_axes.iter()
-                    .zip(angles.iter())
-                    .filter(|(ax, _)| ax.is_head)
-                    .take(2)
-                    .map(|(_, (_, deg))| *deg)
-                    .collect();
-                let bed_angles: Vec<f64> = gcode_axes.iter()
+                // Per-segment bed Z: matches viewport logic (bed lowers as print height increases).
+                let seg_z = segment.position.z as f32;
+                let bed_pivot_z = if bed_travel_z > 0.0 {
+                    let dz = (seg_z - grid_z).max(0.0);
+                    grid_z - bed_full_h - dz.min(bed_travel_z)
+                } else {
+                    grid_z - bed_full_h
+                };
+                let bed_world_pivot = [bed_pivot_xy[0], bed_pivot_xy[1], bed_pivot_z];
+
+                // ── Bed rotation (chained Rodrigues over bed axes) ──────────
+                let bed_joints: Vec<([f32; 3], f32)> = gcode_axes.iter()
                     .zip(angles.iter())
                     .filter(|(ax, _)| !ax.is_head)
-                    .take(2)
-                    .map(|(_, (_, deg))| *deg)
+                    .map(|(ax, (_, deg))| {
+                        let ra = ax.rotation_axis;
+                        let clamped = deg.clamp(ax.min_deg, ax.max_deg);
+                        ([ra[0] as f32, ra[1] as f32, ra[2] as f32], clamped.to_radians() as f32)
+                    })
                     .collect();
+                let rb = chained_rotation_f32(&bed_joints);
 
-                let ha = head_angles.first().copied().unwrap_or(0.0_f64).to_radians() as f32;
-                let hb = head_angles.get(1).copied().unwrap_or(0.0_f64).to_radians() as f32;
-                let ba = bed_angles.first().copied().unwrap_or(0.0_f64).to_radians() as f32;
-                let bb = bed_angles.get(1).copied().unwrap_or(0.0_f64).to_radians() as f32;
-
-                // Head AABB — pivot = nozzle_tip + tcp * orientation
-                let nozzle = [
+                // ── Nozzle world position (print point after bed tilt) ──────
+                let seg_pos = [
                     segment.position.x as f32,
                     segment.position.y as f32,
                     segment.position.z as f32,
                 ];
-                let len = ((o.x * o.x + o.y * o.y + o.z * o.z) as f32).sqrt().max(1e-6);
+                let rel = [
+                    seg_pos[0] - bed_world_pivot[0],
+                    seg_pos[1] - bed_world_pivot[1],
+                    seg_pos[2] - bed_world_pivot[2],
+                ];
+                let rotated = rot3_apply(rb, rel);
+                let nozzle_world = [
+                    rotated[0] + bed_world_pivot[0],
+                    rotated[1] + bed_world_pivot[1],
+                    rotated[2] + bed_world_pivot[2],
+                ];
+
+                // ── Residual orientation the head must achieve ──────────────
+                let rb_t = mat3_transpose_f32(rb);
+                let o_vec = [o.x as f32, o.y as f32, o.z as f32];
+                let residual = rot3_apply(rb_t, o_vec);
+
+                // ── Head rotation (same IK as viewport) ─────────────────────
+                let head_joints: Vec<([f32; 3], f32)> = gcode_axes.iter()
+                    .filter(|ax| ax.is_head)
+                    .map(|ax| {
+                        let [rx, ry, _rz] = ax.rotation_axis;
+                        let angle_deg = if rx.abs() > 0.7 {
+                            (residual[1] as f64).atan2(residual[2] as f64).to_degrees()
+                        } else if ry.abs() > 0.7 {
+                            (-(residual[0] as f64)).atan2(residual[2] as f64).to_degrees()
+                        } else {
+                            (residual[1] as f64).atan2(residual[0] as f64).to_degrees()
+                        };
+                        let clamped = angle_deg.clamp(ax.min_deg, ax.max_deg).to_radians() as f32;
+                        ([rx as f32, ry as f32, _rz as f32], clamped)
+                    })
+                    .collect();
+                let rh = chained_rotation_f32(&head_joints);
+
+                // ── Head pivot and OBB center ───────────────────────────────
+                // pivot = nozzle_world + rh * (0, 0, nl)  [nozzle tip is at rh*(0,0,-nl)+pivot]
+                let pivot_offset = rot3_apply(rh, [0.0, 0.0, nl]);
                 let pivot_head = [
-                    nozzle[0] - tcp * (o.x as f32) / len,
-                    nozzle[1] - tcp * (o.y as f32) / len,
-                    nozzle[2] - tcp * (o.z as f32) / len,
+                    nozzle_world[0] + pivot_offset[0],
+                    nozzle_world[1] + pivot_offset[1],
+                    nozzle_world[2] + pivot_offset[2],
                 ];
-                // Rotation matrix for head (Rx(ha) * Ry(hb))
-                let rh = rotation_matrix_xy(ha, hb);
-                let head_aabb_half = aabb_of_obb(hh, rh);
+                // Head OBB center = pivot + rh*(0, 0, head_h/2)  [box bottom at pivot, top at pivot+head_h]
+                let head_box_offset = rot3_apply(rh, [0.0, 0.0, head_h / 2.0]);
                 let head_center = [
-                    pivot_head[0],
-                    pivot_head[1],
-                    pivot_head[2] + hh[2] - tcp,  // head body centre above pivot, minus nozzle below
+                    pivot_head[0] + head_box_offset[0],
+                    pivot_head[1] + head_box_offset[1],
+                    pivot_head[2] + head_box_offset[2],
                 ];
 
-                // Bed AABB — rotated around bed_pivot
-                let rb = rotation_matrix_xy(ba, bb);
-                let bed_aabb_half = aabb_of_obb(bh, rb);
+                // ── Bed OBB center ──────────────────────────────────────────
+                // Bed box bottom at bed_world_pivot, top at +bed_full_h in local Z.
+                let bed_box_offset = rot3_apply(rb, [0.0, 0.0, bed_full_h / 2.0]);
                 let bed_center = [
-                    bed_pivot[0],
-                    bed_pivot[1],
-                    bed_pivot[2] + bh[2],  // bed centre is half-height above pivot
+                    bed_world_pivot[0] + bed_box_offset[0],
+                    bed_world_pivot[1] + bed_box_offset[1],
+                    bed_world_pivot[2] + bed_box_offset[2],
                 ];
 
-                // AABB overlap check
-                let collides = (0..3).all(|i| {
-                    (head_center[i] - bed_center[i]).abs()
-                        <= head_aabb_half[i] + bed_aabb_half[i]
-                });
+                // ── OBB overlap: check in bed's local frame ─────────────────
+                // Express the head box in the bed's coordinate frame.
+                // This avoids the large world-AABB that a tilted bed produces (a
+                // 200 mm bed at 45° has ±74 mm Z AABB, causing massive false positives).
+                // Head center in bed frame
+                let hc_rel = [
+                    head_center[0] - bed_world_pivot[0],
+                    head_center[1] - bed_world_pivot[1],
+                    head_center[2] - bed_world_pivot[2],
+                ];
+                let hc_bed = rot3_apply(rb_t, hc_rel);
+                // Head OBB rotation in bed frame: rb_t * rh
+                let rh_in_bed = mat3_mul_f32(rb_t, rh);
+                // AABB half-extents of head OBB expressed in bed frame
+                let head_aabb_bed = aabb_of_obb(head_he, rh_in_bed);
+                // Bed occupies [−bw/2 .. +bw/2, −bd/2 .. +bd/2, 0 .. bh] in its own frame
+                let collides = (hc_bed[0].abs() <= head_aabb_bed[0] + bed_he[0])
+                    && (hc_bed[1].abs() <= head_aabb_bed[1] + bed_he[1])
+                    && (hc_bed[2] - bed_full_h / 2.0).abs() <= head_aabb_bed[2] + bed_he[2];
                 results[flat_idx] = collides;
-
                 flat_idx += 1;
             }
         }
@@ -1007,6 +1552,135 @@ impl SlicerApp {
             self.log(format!("⚠️ Machine simulation: {} collision segments detected", collision_count));
         }
         self.collision_segments = results;
+    }
+
+    /// For every toolpath segment where the tool body (capsule from nozzle tip along the
+    /// tool orientation) would intersect the mesh, search for a collision-free orientation
+    /// by sweeping the tilt angle radially outward from the cone/mesh center.
+    ///
+    /// This is the active avoidance counterpart to `compute_all_collisions` (which only marks).
+    /// Called after toolpaths are generated when the mesh is available.
+    pub fn optimize_toolpath_orientations_for_mesh(&mut self) {
+        let mesh = match self.mesh.as_ref() {
+            Some(m) => m.clone(),
+            None => return,
+        };
+        let profile = match self.profiles.get(self.active_profile_index) {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        // Must have at least one rotary head axis to benefit from orientation changes.
+        let has_head_rotary = profile.rotary_axes.iter().any(|ax| {
+            ax.axis_type == AxisType::Rotary && ax.moving_part == MovingPart::Head
+        });
+        if !has_head_rotary { return; }
+
+        // Approximate head geometry from profile dimensions.
+        let body_radius = (profile.head_dims[0].min(profile.head_dims[1]) / 2.0)
+            .max(profile.nozzle_radius * 2.0)
+            .max(5.0);
+        let body_height = self.tcp_offset + profile.head_dims[2];
+
+        let detector = crate::motion_planning::collision::CollisionDetector {
+            print_head: crate::motion_planning::collision::PrintHead {
+                nozzle_diameter: 0.4,
+                body_radius,
+                body_height,
+            },
+            platform_bounds: (
+                crate::geometry::Point3D::new(-500.0, -500.0, -50.0),
+                crate::geometry::Point3D::new(500.0, 500.0, 1000.0),
+            ),
+            printed_mesh: None,
+        };
+
+        // Maximum tilt each individual axis can handle (IK assigns the same magnitude to
+        // head and bed, so the bottleneck is the most restricted rotary axis overall).
+        let max_tilt_deg = {
+            let tightest = profile.rotary_axes.iter()
+                .filter(|ax| ax.axis_type == AxisType::Rotary)
+                .map(|ax| ax.max.abs().max(ax.min.abs()))
+                .fold(f64::MAX, f64::min);
+            if tightest == f64::MAX || tightest < 1.0 { 45.0 } else { tightest }
+        };
+
+        // Radial center for escape direction: use conical center or mesh centroid.
+        let (cone_cx, cone_cy) = if matches!(self.slicing_mode, SlicingMode::Conical) {
+            if self.conical_auto_center {
+                let cx = (mesh.bounds_min.x + mesh.bounds_max.x) / 2.0;
+                let cy = (mesh.bounds_min.y + mesh.bounds_max.y) / 2.0;
+                (cx, cy)
+            } else {
+                (self.conical_center_x, self.conical_center_y)
+            }
+        } else {
+            let cx = (mesh.bounds_min.x + mesh.bounds_max.x) / 2.0;
+            let cy = (mesh.bounds_min.y + mesh.bounds_max.y) / 2.0;
+            (cx, cy)
+        };
+
+        let tilt_step_deg = 5.0_f64;
+        let steps = ((max_tilt_deg / tilt_step_deg).ceil() as usize + 1).max(1);
+        let mut n_fixed = 0usize;
+
+        for toolpath in &mut self.toolpaths {
+            for seg in &mut toolpath.paths {
+                // Skip if current orientation already clears the mesh.
+                if !detector.check_collision_with_mesh_oriented(
+                    &seg.position, &seg.orientation, &mesh,
+                ) {
+                    continue;
+                }
+
+                // Radial escape direction (away from cone/mesh center in XY).
+                let dx = seg.position.x - cone_cx;
+                let dy = seg.position.y - cone_cy;
+                let rxy = (dx * dx + dy * dy).sqrt();
+                let (ex, ey) = if rxy > 1e-6 {
+                    (dx / rxy, dy / rxy)
+                } else {
+                    (1.0_f64, 0.0_f64)
+                };
+
+                // Sweep tilt from 0° to max_tilt_deg in tilt_step_deg increments.
+                // We try the full outward tilt first (fastest escape), then reduce.
+                let mut best_orient = seg.orientation;
+                let mut found_clear = false;
+                for step in 0..=steps {
+                    let tilt_deg = (step as f64) * tilt_step_deg;
+                    let tilt_rad = tilt_deg.min(max_tilt_deg).to_radians();
+                    let sin_t = tilt_rad.sin();
+                    let cos_t = tilt_rad.cos();
+                    let nx = ex * sin_t;
+                    let ny = ey * sin_t;
+                    let nz = cos_t;
+                    let len = (nx * nx + ny * ny + nz * nz).sqrt();
+                    let trial = crate::geometry::Vector3D::new(nx / len, ny / len, nz / len);
+
+                    if !detector.check_collision_with_mesh_oriented(&seg.position, &trial, &mesh) {
+                        best_orient = trial;
+                        found_clear = true;
+                        break;
+                    }
+                }
+
+                // Only override the orientation if a clear angle was actually found.
+                // If every tilt angle still collides (e.g. we're inside the mesh at the
+                // bottom of the print), keep the original orientation — do NOT force max tilt.
+                if found_clear {
+                    seg.orientation = best_orient;
+                    n_fixed += 1;
+                }
+            }
+        }
+
+        if n_fixed > 0 {
+            self.log(format!(
+                "Collision avoidance: adjusted {} segment orientations to avoid mesh",
+                n_fixed
+            ));
+        }
     }
 
     /// Build `Vec<GCodeAxis>` from the active profile for G-code generation.
@@ -1026,12 +1700,14 @@ impl SlicerApp {
                         is_head: ax.moving_part == MovingPart::Head,
                         min_deg: ax.min,
                         max_deg: ax.max,
+                        rotation_axis: ax.rotation_axis.as_vec3_f64(),
+                        max_deg_per_s: ax.max_angular_speed,
                     })
                     .collect()
             })
             .unwrap_or_else(|| vec![
-                crate::gcode::GCodeAxis { name: "A".to_string(), is_head: true, min_deg: -180.0, max_deg: 180.0 },
-                crate::gcode::GCodeAxis { name: "B".to_string(), is_head: true, min_deg: -180.0, max_deg: 180.0 },
+                crate::gcode::GCodeAxis { name: "A".to_string(), is_head: true, min_deg: -180.0, max_deg: 180.0, rotation_axis: [1.,0.,0.], max_deg_per_s: 30.0 },
+                crate::gcode::GCodeAxis { name: "B".to_string(), is_head: true, min_deg: -180.0, max_deg: 180.0, rotation_axis: [0.,1.,0.], max_deg_per_s: 30.0 },
             ])
     }
 
@@ -2075,10 +2751,37 @@ impl SlicerApp {
         self.apply_conical_orientations();
         self.apply_surface_normal_orientations();
 
-        // ── Travel lift (collision avoidance) ─────────────────────────────
+        // ── Static mesh body avoidance ────────────────────────────────────
+        // Check each segment's tool capsule against the original mesh and tilt
+        // outward to avoid passing through unprinted model geometry (e.g., bunny nose).
+        // This runs before the height-map pass so the improved orientations feed into it.
+        self.optimize_toolpath_orientations_for_mesh();
+
+        // ── Head-body collision avoidance (deposited material) ────────────
+        // Rotate the tilt azimuth (and reduce magnitude if needed) so the
+        // printhead body clears previously deposited extrusions.
+        self.apply_tilt_collision_avoidance();
+
+        // ── Travel lift (Z clearance on non-extrusion moves) ──────────────
         // Raise non-extruding moves above the last printed Z so the nozzle
         // clears already-deposited material during traversals.
         self.apply_travel_lifts();
+
+        // ── Support generation (if enabled) ──────────────────────────────
+        // Runs after main toolpaths are ready so supports are appended at the end.
+        if self.enable_supports && self.mesh.is_some() {
+            self.generate_supports();
+            self.generate_support_toolpaths();
+            // Merge support toolpaths into the main toolpath list.
+            if let Some(result) = &self.support_result {
+                if !result.toolpaths.is_empty() {
+                    let support_tps = result.toolpaths.clone();
+                    let n = support_tps.len();
+                    self.toolpaths.extend(support_tps);
+                    self.log(format!("Merged {} support toolpath layers into main toolpaths", n));
+                }
+            }
+        }
 
         // Check machine simulation collisions if enabled
         if self.profiles.get(self.active_profile_index).map(|p| p.show_machine).unwrap_or(false) {
@@ -2609,22 +3312,52 @@ impl SlicerApp {
 
 // ─── Machine simulation helpers ───────────────────────────────────────────────
 
-/// Build a 3×3 rotation matrix from pitch `a` (around X) and roll `b` (around Y).
-///
-/// R = Ry(b) * Rx(a)
-fn rotation_matrix_xy(a: f32, b: f32) -> [[f32; 3]; 3] {
-    let (sa, ca) = (a.sin(), a.cos());
-    let (sb, cb) = (b.sin(), b.cos());
-    // Ry(b) * Rx(a)
+/// Rodrigues rotation matrix around a unit axis by `angle` radians.
+fn rodrigues_f32(axis: [f32; 3], angle: f32) -> [[f32; 3]; 3] {
+    let (s, c) = (angle.sin(), angle.cos());
+    let t = 1.0 - c;
+    let [x, y, z] = axis;
     [
-        [cb,        sb * sa,  sb * ca],
-        [0.0,       ca,      -sa     ],
-        [-sb,       cb * sa,  cb * ca],
+        [t*x*x + c,   t*x*y - s*z, t*x*z + s*y],
+        [t*x*y + s*z, t*y*y + c,   t*y*z - s*x],
+        [t*x*z - s*y, t*y*z + s*x, t*z*z + c  ],
     ]
 }
 
+/// Multiply two 3×3 matrices.
+fn mat3_mul_f32(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut r = [[0.0f32; 3]; 3];
+    for i in 0..3 { for j in 0..3 { for k in 0..3 { r[i][j] += a[i][k] * b[k][j]; } } }
+    r
+}
+
+/// Apply a 3×3 rotation matrix to a [f32; 3] vector.
+fn rot3_apply(r: [[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+    [
+        r[0][0]*v[0] + r[0][1]*v[1] + r[0][2]*v[2],
+        r[1][0]*v[0] + r[1][1]*v[1] + r[1][2]*v[2],
+        r[2][0]*v[0] + r[2][1]*v[1] + r[2][2]*v[2],
+    ]
+}
+
+/// Transpose a 3×3 matrix (= inverse for rotation matrices).
+fn mat3_transpose_f32(m: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    [[m[0][0], m[1][0], m[2][0]],
+     [m[0][1], m[1][1], m[2][1]],
+     [m[0][2], m[1][2], m[2][2]]]
+}
+
+/// Build a chained rotation from `(unit_axis, angle_rad)` pairs applied in order.
+fn chained_rotation_f32(joints: &[([f32; 3], f32)]) -> [[f32; 3]; 3] {
+    let mut r = [[1.0f32,0.,0.],[0.,1.,0.],[0.,0.,1.]];
+    for &(axis, angle) in joints {
+        r = mat3_mul_f32(rodrigues_f32(axis, angle), r);
+    }
+    r
+}
+
 /// Given a box with half-extents `he` and rotation matrix `r`,
-/// compute the AABB half-extents using the standard AABB-of-OBB formula.
+/// compute the world-space AABB half-extents using the standard AABB-of-OBB formula.
 fn aabb_of_obb(he: [f32; 3], r: [[f32; 3]; 3]) -> [f32; 3] {
     [
         r[0][0].abs() * he[0] + r[0][1].abs() * he[1] + r[0][2].abs() * he[2],

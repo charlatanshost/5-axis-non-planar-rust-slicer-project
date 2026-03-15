@@ -36,6 +36,12 @@ pub struct GCodeAxis {
     /// controller will fault if these are exceeded, so we clamp pre-emptively.
     pub min_deg: f64,
     pub max_deg: f64,
+    /// Unit vector in machine frame that this joint rotates around.
+    /// X=[1,0,0], Y=[0,1,0], Z=[0,0,1].
+    pub rotation_axis: [f64; 3],
+    /// Maximum angular speed in degrees/second. The linear feedrate is capped
+    /// each move so this axis never exceeds this speed. 0 = unlimited.
+    pub max_deg_per_s: f64,
 }
 
 // ─── Kinematics ──────────────────────────────────────────────────────────────
@@ -60,8 +66,8 @@ impl Default for MachineKinematics {
         Self {
             tcp_offset: 0.0,
             axes: vec![
-                GCodeAxis { name: "A".to_string(), is_head: true,  min_deg: -180.0, max_deg: 180.0 },
-                GCodeAxis { name: "B".to_string(), is_head: true,  min_deg: -180.0, max_deg: 180.0 },
+                GCodeAxis { name: "A".to_string(), is_head: true,  min_deg: -180.0, max_deg: 180.0, rotation_axis: [1.,0.,0.], max_deg_per_s: 30.0 },
+                GCodeAxis { name: "B".to_string(), is_head: true,  min_deg: -180.0, max_deg: 180.0, rotation_axis: [0.,1.,0.], max_deg_per_s: 30.0 },
             ],
         }
     }
@@ -106,9 +112,15 @@ impl GCodeGenerator {
         self.write_header(&mut file)?;
 
         let mut total_extrusion = 0.0;
+        let mut prev_pos: Option<crate::geometry::Point3D> = None;
+        let mut prev_angles: Vec<(String, f64)> = Vec::new();
         for toolpath in toolpaths {
             for segment in &toolpath.paths {
-                self.write_move(&mut file, segment, &mut total_extrusion)?;
+                let (new_pos, new_angles) = self.write_move(
+                    &mut file, segment, &mut total_extrusion,
+                    prev_pos.as_ref(), &prev_angles)?;
+                prev_pos = Some(new_pos);
+                prev_angles = new_angles;
             }
         }
 
@@ -157,6 +169,9 @@ impl GCodeGenerator {
         let mut total_extrusion = 0.0_f64;
         let mut processed = 0usize;
         let report_every = (total_segments / 10).max(1000);
+        // Track previous move's position and axis angles for feedrate limiting.
+        let mut prev_pos: Option<crate::geometry::Point3D> = None;
+        let mut prev_angles: Vec<(String, f64)> = Vec::new();
 
         for (layer_idx, toolpath) in toolpaths.iter().enumerate() {
             lines.push(format!("; LAYER:{}", layer_idx));
@@ -168,7 +183,7 @@ impl GCodeGenerator {
                 let rot_str = self.format_all_axes(&axis_angles);
 
                 if segment.extrusion < 1e-8 {
-                    // Travel: retract → rapid → re-prime
+                    // Travel: retract → rapid → re-prime  (no angular speed limiting on rapids)
                     lines.push(format!("G1 E{:.5} F{:.0} ; Retract",
                         total_extrusion - self.retraction_distance,
                         self.retraction_speed * 60.0));
@@ -178,12 +193,26 @@ impl GCodeGenerator {
                         total_extrusion,
                         self.retraction_speed * 60.0));
                 } else {
-                    // Extrusion move
+                    // Extrusion move — cap feedrate by rotary axis angular speed limits.
+                    let dist_mm = prev_pos.as_ref().map(|pp| {
+                        let dx = pos.x - pp.x; let dy = pos.y - pp.y; let dz = pos.z - pp.z;
+                        (dx*dx + dy*dy + dz*dz).sqrt()
+                    }).unwrap_or(0.0);
+                    let capped_f = if prev_angles.is_empty() {
+                        segment.feedrate
+                    } else {
+                        self.limit_feedrate_for_angular_speed(
+                            segment.feedrate, dist_mm, &axis_angles, &prev_angles)
+                    };
                     total_extrusion += segment.extrusion;
                     lines.push(format!("G1 X{:.3} Y{:.3} Z{:.3} {} E{:.5} F{:.0}",
                         pos.x, pos.y, pos.z, rot_str, total_extrusion,
-                        segment.feedrate * 60.0));
+                        capped_f * 60.0));
                 }
+
+                // Update tracking state for next move.
+                prev_pos = Some(pos);
+                prev_angles = axis_angles;
 
                 processed += 1;
                 if processed % report_every == 0 {
@@ -237,17 +266,22 @@ impl GCodeGenerator {
         Ok(())
     }
 
+    /// Returns `(commanded_pos, axis_angles)` so the caller can pass them as
+    /// `prev_pos`/`prev_angles` to the next call for feedrate limiting.
     fn write_move(
         &self,
         file: &mut File,
         segment: &ToolpathSegment,
         total_extrusion: &mut f64,
-    ) -> io::Result<()> {
+        prev_pos: Option<&crate::geometry::Point3D>,
+        prev_angles: &[(String, f64)],
+    ) -> io::Result<(crate::geometry::Point3D, Vec<(String, f64)>)> {
         let axis_angles = self.compute_axis_angles(&segment.orientation);
         let pos = self.tcp_compensate(&segment.position, &axis_angles);
         let rot_str = self.format_all_axes(&axis_angles);
 
         if segment.extrusion < 1e-8 {
+            // Travel: no angular speed limiting on rapids
             writeln!(file, "G1 E{:.5} F{:.0} ; Retract",
                 *total_extrusion - self.retraction_distance,
                 self.retraction_speed * 60.0)?;
@@ -257,12 +291,22 @@ impl GCodeGenerator {
                 *total_extrusion,
                 self.retraction_speed * 60.0)?;
         } else {
+            let dist_mm = prev_pos.map(|pp| {
+                let dx = pos.x - pp.x; let dy = pos.y - pp.y; let dz = pos.z - pp.z;
+                (dx*dx + dy*dy + dz*dz).sqrt()
+            }).unwrap_or(0.0);
+            let capped_f = if prev_angles.is_empty() {
+                segment.feedrate
+            } else {
+                self.limit_feedrate_for_angular_speed(
+                    segment.feedrate, dist_mm, &axis_angles, prev_angles)
+            };
             *total_extrusion += segment.extrusion;
             writeln!(file, "G1 X{:.3} Y{:.3} Z{:.3} {} E{:.5} F{:.0}",
                 pos.x, pos.y, pos.z, rot_str, *total_extrusion,
-                segment.feedrate * 60.0)?;
+                capped_f * 60.0)?;
         }
-        Ok(())
+        Ok((pos, axis_angles))
     }
 
     fn write_footer(&self, file: &mut File) -> io::Result<()> {
@@ -311,34 +355,35 @@ impl GCodeGenerator {
         &self,
         orientation: &crate::geometry::Vector3D,
     ) -> Vec<(String, f64)> {
-        // Decompose orientation vector into pitch + roll angles
-        let pitch_deg = orientation.y.atan2(orientation.z).to_degrees();
-        let roll_deg  = (-orientation.x).atan2(orientation.z).to_degrees();
+        let nx = orientation.x;
+        let ny = orientation.y;
+        let nz = orientation.z;
 
-        // Count head and bed rotary axes
-        let head_indices: Vec<usize> = self.kinematics.axes.iter()
-            .enumerate()
-            .filter(|(_, ax)| ax.is_head)
-            .map(|(i, _)| i)
-            .collect();
-
-        let bed_indices: Vec<usize> = self.kinematics.axes.iter()
-            .enumerate()
-            .filter(|(_, ax)| !ax.is_head)
-            .map(|(i, _)| i)
-            .collect();
+        // IK angle for a single-axis joint given its rotation direction.
+        // We compute the angle needed to rotate the default tool direction (0,0,1)
+        // toward `orientation` around `rot_axis`.
+        let ik_angle = |rot_axis: &[f64; 3]| -> f64 {
+            let [ax, ay, az] = *rot_axis;
+            if ax.abs() > 0.7 {
+                // Joint revolves around X: angle = atan2(ny, nz)
+                ny.atan2(nz).to_degrees()
+            } else if ay.abs() > 0.7 {
+                // Joint revolves around Y: angle = atan2(-nx, nz)
+                (-nx).atan2(nz).to_degrees()
+            } else {
+                // Joint revolves around Z: angle = atan2(ny, nx)
+                let _ = az;
+                ny.atan2(nx).to_degrees()
+            }
+        };
 
         let mut raw = vec![0.0_f64; self.kinematics.axes.len()];
-
-        // Assign pitch + roll to head axes (1st and 2nd)
-        if let Some(&i) = head_indices.get(0) { raw[i] = pitch_deg; }
-        if let Some(&i) = head_indices.get(1) { raw[i] = roll_deg; }
-        // head_indices[2+] stay 0 — no simple rule beyond 2-DOF orientation
-
-        // Bed axes counter-rotate so the geometry relative to the nozzle is the same
-        if let Some(&i) = bed_indices.get(0) { raw[i] = -pitch_deg; }
-        if let Some(&i) = bed_indices.get(1) { raw[i] = -roll_deg; }
-        // bed_indices[2+] stay 0
+        for (i, ax) in self.kinematics.axes.iter().enumerate() {
+            let angle = ik_angle(&ax.rotation_axis);
+            // Bed axes counter-rotate: tilting the bed by -α is kinematically
+            // equivalent to tilting the head by +α for the printed geometry.
+            raw[i] = if ax.is_head { angle } else { -angle };
+        }
 
         // Clamp each axis to its configured range, then produce (name, angle) pairs
         self.kinematics.axes.iter()
@@ -348,6 +393,36 @@ impl GCodeGenerator {
                 (ax.name.clone(), clamped)
             })
             .collect()
+    }
+
+    /// Cap the linear feedrate (mm/s) so that no rotary axis exceeds its maximum
+    /// angular speed (deg/s) over this move.
+    ///
+    /// `dist_mm` — Euclidean distance of the linear XYZ move.
+    /// `cur`     — Axis angles at the end of this move (from `compute_axis_angles`).
+    /// `prev`    — Axis angles at the start of this move (end of previous move).
+    ///
+    /// Returns the minimum of `requested_feedrate` and the axis-constrained limit.
+    pub fn limit_feedrate_for_angular_speed(
+        &self,
+        requested: f64,
+        dist_mm: f64,
+        cur: &[(String, f64)],
+        prev: &[(String, f64)],
+    ) -> f64 {
+        if dist_mm < 1e-6 { return requested; }
+        let mut max_f = requested;
+        for ax in &self.kinematics.axes {
+            if ax.max_deg_per_s <= 0.0 { continue; }
+            let c = cur .iter().find(|(n,_)| *n == ax.name).map(|(_,v)| *v).unwrap_or(0.0);
+            let p = prev.iter().find(|(n,_)| *n == ax.name).map(|(_,v)| *v).unwrap_or(0.0);
+            let delta = (c - p).abs();
+            if delta < 0.01 { continue; }
+            // feedrate_limit = max_deg_per_s * dist_mm / delta_deg
+            let f_limit = ax.max_deg_per_s * dist_mm / delta;
+            if f_limit < max_f { max_f = f_limit; }
+        }
+        max_f
     }
 
     /// Apply TCP (tool-centre-point) compensation for multi-axis moves.
@@ -447,13 +522,13 @@ mod tests {
             kinematics: MachineKinematics {
                 tcp_offset: 0.0,
                 axes: vec![
-                    GCodeAxis { name: "A".to_string(), is_head: false, min_deg: -90.0, max_deg: 90.0 },
-                    GCodeAxis { name: "B".to_string(), is_head: false, min_deg: -90.0, max_deg: 90.0 },
-                    GCodeAxis { name: "C".to_string(), is_head: true,  min_deg: -180.0, max_deg: 180.0 },
-                    GCodeAxis { name: "U".to_string(), is_head: true,  min_deg: -180.0, max_deg: 180.0 },
-                    GCodeAxis { name: "V".to_string(), is_head: false, min_deg: -45.0, max_deg: 45.0 },
-                    GCodeAxis { name: "W".to_string(), is_head: false, min_deg: -45.0, max_deg: 45.0 },
-                    GCodeAxis { name: "Q".to_string(), is_head: true,  min_deg: -180.0, max_deg: 180.0 },
+                    GCodeAxis { name: "A".to_string(), is_head: false, min_deg: -90.0,  max_deg: 90.0,  rotation_axis: [1.,0.,0.], max_deg_per_s: 30.0 },
+                    GCodeAxis { name: "B".to_string(), is_head: false, min_deg: -90.0,  max_deg: 90.0,  rotation_axis: [0.,1.,0.], max_deg_per_s: 30.0 },
+                    GCodeAxis { name: "C".to_string(), is_head: true,  min_deg: -180.0, max_deg: 180.0, rotation_axis: [0.,0.,1.], max_deg_per_s: 30.0 },
+                    GCodeAxis { name: "U".to_string(), is_head: true,  min_deg: -180.0, max_deg: 180.0, rotation_axis: [1.,0.,0.], max_deg_per_s: 30.0 },
+                    GCodeAxis { name: "V".to_string(), is_head: false, min_deg: -45.0,  max_deg: 45.0,  rotation_axis: [1.,0.,0.], max_deg_per_s: 30.0 },
+                    GCodeAxis { name: "W".to_string(), is_head: false, min_deg: -45.0,  max_deg: 45.0,  rotation_axis: [0.,1.,0.], max_deg_per_s: 30.0 },
+                    GCodeAxis { name: "Q".to_string(), is_head: true,  min_deg: -180.0, max_deg: 180.0, rotation_axis: [0.,0.,1.], max_deg_per_s: 30.0 },
                 ],
             },
             ..GCodeGenerator::default()
@@ -468,27 +543,29 @@ mod tests {
 
     #[test]
     fn test_bed_axes_counter_rotate() {
-        // Machine with one bed axis (A) and one head axis (B).
-        // Tilting 30° toward +Y produces pitch = 30°.
-        // A (bed, 1st bed slot)  → receives −pitch = −30° (counter-rotation).
-        // B (head, 1st head slot) → receives +pitch = +30°.
+        // Machine with one bed axis (A, around X) and one head axis (B, around X).
+        // Tilting 30° toward +Y (in Y-Z plane) is a rotation around X by 30°.
+        // A (bed, around X)  → receives −30° (counter-rotation so part moves with head).
+        // B (head, around X) → receives +30°.
+        // Both axes revolve around X, so both produce the same IK magnitude with opposite signs.
         let gen = GCodeGenerator {
             kinematics: MachineKinematics {
                 tcp_offset: 0.0,
                 axes: vec![
-                    GCodeAxis { name: "A".to_string(), is_head: false, min_deg: -90.0, max_deg: 90.0 },
-                    GCodeAxis { name: "B".to_string(), is_head: true,  min_deg: -90.0, max_deg: 90.0 },
+                    GCodeAxis { name: "A".to_string(), is_head: false, min_deg: -90.0, max_deg: 90.0, rotation_axis: [1.,0.,0.], max_deg_per_s: 30.0 },
+                    GCodeAxis { name: "B".to_string(), is_head: true,  min_deg: -90.0, max_deg: 90.0, rotation_axis: [1.,0.,0.], max_deg_per_s: 30.0 },
                 ],
             },
             ..GCodeGenerator::default()
         };
         let angle = 30_f64.to_radians();
+        // Orientation tilted 30° toward +Y: achieved by rotating [0,0,1] around X by 30°
         let orientation = Vector3D::new(0.0, angle.sin(), angle.cos());
         let angles = gen.compute_axis_angles(&orientation);
         let a = angles.iter().find(|(n, _)| n == "A").map(|(_, v)| *v).unwrap();
         let b = angles.iter().find(|(n, _)| n == "B").map(|(_, v)| *v).unwrap();
-        assert!(a < 0.0,  "Bed axis A should be negative (−pitch counter-rotation), got {}", a);
-        assert!(b > 0.0,  "Head axis B is 1st head slot, should be +pitch (+30°), got {}", b);
+        assert!(a < 0.0,  "Bed axis A should be negative (−30° counter-rotation), got {}", a);
+        assert!(b > 0.0,  "Head axis B should be positive (+30°), got {}", b);
         assert!((a + b).abs() < 0.01, "Bed and head angles should cancel: a={} b={}", a, b);
     }
 

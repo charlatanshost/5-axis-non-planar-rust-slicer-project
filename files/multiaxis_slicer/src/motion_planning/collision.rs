@@ -46,22 +46,46 @@ impl CollisionDetector {
     /// with radius `body_radius`. Uses parry3d's Capsule + Triangle shapes with
     /// an AABB pre-filter for performance.
     pub fn check_collision_with_mesh(&self, position: &Point3D, mesh: &crate::mesh::Mesh) -> bool {
+        self.check_collision_with_mesh_oriented(position, &Vector3D::new(0.0, 0.0, 1.0), mesh)
+    }
+
+    /// Check if the printhead capsule (oriented along `orientation` from the nozzle tip)
+    /// intersects any triangle of `mesh`.
+    ///
+    /// A small clearance gap is skipped from the nozzle tip so the capsule does not
+    /// self-intersect the layer surface the nozzle is printing on.
+    ///
+    /// `orientation` must be a unit vector pointing from the nozzle tip toward the head base.
+    pub fn check_collision_with_mesh_oriented(
+        &self,
+        position: &Point3D,
+        orientation: &Vector3D,
+        mesh: &crate::mesh::Mesh,
+    ) -> bool {
         use parry3d::shape::{Capsule, Triangle as ParryTriangle};
         use parry3d::query::intersection_test;
-        use nalgebra::{Isometry3, Translation3, Point3};
+        use nalgebra::{Isometry3, Translation3, Point3, UnitQuaternion, Vector3 as NaVec3};
 
         let height = self.print_head.body_height as f32;
         let radius = self.print_head.body_radius as f32;
 
-        // Capsule from nozzle tip upward by body_height (local coords: Z axis).
-        let a = Point3::new(0.0_f32, 0.0, 0.0);
-        let b = Point3::new(0.0_f32, 0.0, height);
+        // Skip a small clearance from the tip so we don't count the print surface itself.
+        let clearance = (radius * 0.5_f32).max(1.0_f32);
+
+        // Capsule in local space: from clearance to height+clearance along +Z.
+        let a = Point3::new(0.0_f32, 0.0, clearance);
+        let b = Point3::new(0.0_f32, 0.0, height + clearance);
         let capsule = Capsule::new(a, b, radius);
 
-        // Translate capsule to world position (nozzle tip).
+        // Rotate local +Z to align with orientation.
+        let local_z = NaVec3::new(0.0_f32, 0.0, 1.0);
+        let target = NaVec3::new(orientation.x as f32, orientation.y as f32, orientation.z as f32);
+        let rot = UnitQuaternion::rotation_between(&local_z, &target)
+            .unwrap_or(UnitQuaternion::identity());
+
         let capsule_iso = Isometry3::from_parts(
             Translation3::new(position.x as f32, position.y as f32, position.z as f32),
-            nalgebra::UnitQuaternion::identity(),
+            rot,
         );
 
         // Compute capsule AABB for fast rejection.
