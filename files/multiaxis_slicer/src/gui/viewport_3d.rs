@@ -1470,13 +1470,17 @@ impl Viewport3D {
             return false;
         }
 
-        // Find current segment's position and orientation
+        // Find current segment's position and orientation.
+        // Must use the same windows(2) indexing as create_toolpath_lines_up_to()
+        // so the head STL aligns with the endpoint of the last drawn tube.
         let (seg_pos, seg_orient) = {
             let mut found = None;
             let mut idx = 0usize;
             'outer: for tp in &app.toolpaths {
-                for seg in &tp.paths {
+                for window in tp.paths.windows(2) {
                     if idx == app.toolpath_playback_position {
+                        // Use window[1] — the endpoint of the tube being drawn
+                        let seg = &window[1];
                         found = Some((
                             [seg.position.x as f32, seg.position.y as f32, seg.position.z as f32],
                             seg.orientation,

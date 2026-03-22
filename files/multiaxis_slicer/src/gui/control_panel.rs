@@ -508,6 +508,20 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                                     .on_hover_text("How much faster heat flows along chosen axis vs. perpendicular.\nHigher = stronger directional alignment. Typical: 5–20.");
                             });
                         }
+
+                        // Z-regularization slider (always visible in geodesic mode)
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Z coverage:");
+                            ui.add(egui::Slider::new(&mut app.geodesic_z_weight, 0.0..=1.0)
+                                .step_by(0.01)
+                                .text("blend"))
+                                .on_hover_text("Blends geodesic distance with Z height for guaranteed full-height coverage.\n\n\
+                                    0.0 = pure geodesic (surface-following, may miss distant features)\n\
+                                    0.3 = recommended (mostly surface-following, all heights covered)\n\
+                                    1.0 = pure planar (flat layers)\n\n\
+                                    Increase this if thin protrusions (ears, tails) are missing layers.");
+                        });
                     });
 
                     ui.add_space(5.0);
@@ -819,6 +833,9 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                 ui.checkbox(&mut app.wall_seam_transitions, "Wall seam transitions")
                     .on_hover_text("Insert a ruled-surface zigzag path between the outer walls of\nconsecutive curved layers. Fills the staircase gap so the surface\nhas no visible seams. Only activates when layers have varying Z.");
 
+                ui.checkbox(&mut app.optimize_print_order, "Optimize print order")
+                    .on_hover_text("Reorder contours within each layer using nearest-neighbor\ngreedy algorithm to minimize travel distance and reduce\ncollision risk from long cross-model travels.");
+
                 ui.separator();
 
                 ui.horizontal(|ui| {
@@ -873,9 +890,9 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                     ui.checkbox(&mut app.toolpath_playback_enabled, "Enable playback");
 
                     if app.toolpath_playback_enabled {
-                        // Calculate total segments
+                        // Calculate total tube segments (windows(2) pairs, matching viewport rendering)
                         let total_segments: usize = app.toolpaths.iter()
-                            .map(|tp| tp.paths.len())
+                            .map(|tp| tp.paths.len().saturating_sub(1))
                             .sum();
 
                         if total_segments > 0 {
@@ -1087,6 +1104,77 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                             ui.label(egui::RichText::new("(disabled)").weak());
                         }
                     });
+
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(2.0);
+
+                    // ── Orientation smoothing (Phase C) ──────────────────────
+                    ui.checkbox(&mut app.enable_orientation_smoothing, "Smooth orientations")
+                        .on_hover_text(
+                            "Limit how fast the tool orientation can change per mm of travel.\n\
+                             Uses bidirectional SLERP to prevent sharp axis jerks that cause \
+                             mechanical wear and surface artifacts."
+                        );
+                    if app.enable_orientation_smoothing {
+                        ui.horizontal(|ui| {
+                            ui.label("Max angular rate:")
+                                .on_hover_text(
+                                    "Maximum orientation change in degrees per millimetre of \
+                                     travel.  Lower = smoother but may deviate further from \
+                                     ideal surface normals."
+                                );
+                            ui.add(
+                                egui::DragValue::new(&mut app.orientation_smoothing_rate)
+                                    .range(1.0..=45.0)
+                                    .speed(0.5)
+                                    .suffix(" °/mm"),
+                            );
+                        });
+                    }
+
+                    ui.add_space(4.0);
+
+                    // ── Look-ahead window (Phase D) ──────────────────────────
+                    ui.horizontal(|ui| {
+                        ui.label("Collision look-ahead:")
+                            .on_hover_text(
+                                "Number of future segments considered when scoring collision-\
+                                 avoidance orientation candidates.  Higher values produce \
+                                 smoother transitions but are slightly slower."
+                            );
+                        ui.add(
+                            egui::DragValue::new(&mut app.look_ahead_window)
+                                .range(1..=5_usize)
+                                .speed(0.1)
+                                .suffix(" segs"),
+                        );
+                    });
+
+                    ui.add_space(4.0);
+
+                    // ── Singularity avoidance (Phase F) ──────────────────────
+                    ui.checkbox(&mut app.enable_singularity_avoidance, "Singularity avoidance")
+                        .on_hover_text(
+                            "Penalize orientations near gimbal-lock configurations where a \
+                             rotary axis loses a degree of freedom (e.g. A≈0° for AB axes).\n\
+                             Biases the optimizer toward mechanically stable orientations."
+                        );
+                    if app.enable_singularity_avoidance {
+                        ui.horizontal(|ui| {
+                            ui.label("Threshold:")
+                                .on_hover_text(
+                                    "Manipulability below this value triggers a penalty.\n\
+                                     Lower = only penalize very close to singularity.\n\
+                                     Higher = more aggressive avoidance."
+                                );
+                            ui.add(
+                                egui::DragValue::new(&mut app.singularity_threshold)
+                                    .range(0.01..=0.5)
+                                    .speed(0.01),
+                            );
+                        });
+                    }
                 });
 
                 ui.add_space(5.0);

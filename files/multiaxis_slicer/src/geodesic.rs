@@ -79,6 +79,17 @@ pub struct GeodesicSlicerConfig {
     pub num_scales: usize,
     /// Diffusion mode for the heat step. Controls how the Laplacian is built.
     pub diffusion_mode: GeodesicDiffusionMode,
+    /// Z-regularization weight (0.0–1.0).  Blends the geodesic distance field with
+    /// the normalized vertex Z coordinate so that every Z-height band is guaranteed to
+    /// have level-set crossings at roughly uniform density.
+    ///
+    /// - 0.0 = pure geodesic (surface-following, may miss features at extreme geodesic
+    ///   distances from the source)
+    /// - 1.0 = pure planar (flat layers, no surface conformity)
+    /// - 0.3–0.5 = recommended: mostly surface-following with full-height coverage
+    ///
+    /// Default: 0.0 (backward compatible, pure geodesic).
+    pub z_weight: f64,
 }
 
 impl Default for GeodesicSlicerConfig {
@@ -91,6 +102,7 @@ impl Default for GeodesicSlicerConfig {
             use_multiscale: true,
             num_scales: 6,
             diffusion_mode: GeodesicDiffusionMode::Isotropic,
+            z_weight: 0.0,
         }
     }
 }
@@ -1181,21 +1193,43 @@ pub fn geodesic_slice(mesh: &Mesh, config: &GeodesicSlicerConfig) -> Vec<Layer> 
         )
     };
 
-    // Step 5: Extract level-set layers
-    log::info!("Step 5: Extracting geodesic layers...");
-    let max_dist = distances.iter().cloned().fold(0.0f64, f64::max);
-
-    // The source vertices define the "bottom" plane. Geodesic from the bottom boundary
-    // wraps all the way around a closed mesh, producing distances >> model height.
-    // Cap at the model's Z range so we only produce layers for the "outward" wavefront.
+    // Step 5: Z-regularization blending
+    // Blend geodesic distance with normalized Z so every height band gets level-set coverage.
+    let z_weight = config.z_weight.clamp(0.0, 1.0);
     let source_z_min = sources.iter()
         .map(|&s| topo.vertices[s].z)
         .fold(f64::INFINITY, f64::min);
     let model_z_max = topo.vertices.iter().map(|v| v.z).fold(f64::NEG_INFINITY, f64::max);
     let z_range = (model_z_max - source_z_min).max(config.layer_height);
-    let effective_max_dist = max_dist.min(z_range);
-    log::info!("  Z range: {:.2}mm, geodesic max: {:.2}mm, effective cap: {:.2}mm",
-        z_range, max_dist, effective_max_dist);
+
+    let distances = if z_weight > 1e-6 {
+        let max_geo = distances.iter().cloned().fold(0.0f64, f64::max).max(1e-12);
+        log::info!("  Z-regularization: z_weight={:.2}, blending geodesic (max={:.2}) with Z (range={:.2})",
+            z_weight, max_geo, z_range);
+        let blended: Vec<f64> = distances.iter().enumerate().map(|(i, &d)| {
+            let geo_norm = d / max_geo;
+            let z_norm = (topo.vertices[i].z - source_z_min) / z_range;
+            let mixed = (1.0 - z_weight) * geo_norm + z_weight * z_norm;
+            // Scale back to physical units (z_range) so layer_height spacing is meaningful
+            (mixed * z_range).max(0.0)
+        }).collect();
+        blended
+    } else {
+        distances
+    };
+
+    // Step 6: Extract level-set layers
+    log::info!("Step 6: Extracting geodesic layers...");
+    let max_dist = distances.iter().cloned().fold(0.0f64, f64::max);
+
+    // Cap: when z_weight > 0 the field is already Z-bounded, so use a generous cap.
+    // When z_weight == 0 (pure geodesic), the field can wrap around a closed mesh
+    // producing distances >> Z range; cap at 1.5× Z range to cover features with long
+    // geodesic paths (e.g. ears, tails) while preventing runaway layer counts.
+    let cap_factor = if z_weight > 0.1 { 3.0 } else { 1.5 };
+    let effective_max_dist = max_dist.min(z_range * cap_factor);
+    log::info!("  Z range: {:.2}mm, geodesic max: {:.2}mm, effective cap: {:.2}mm (factor={:.1})",
+        z_range, max_dist, effective_max_dist, cap_factor);
 
     let num_layers = (effective_max_dist / config.layer_height).ceil() as usize;
     if num_layers == 0 {
@@ -1247,19 +1281,11 @@ pub fn geodesic_slice(mesh: &Mesh, config: &GeodesicSlicerConfig) -> Vec<Layer> 
         }
     }
 
-    // Keep layers in geodesic distance order (level 1, 2, 3, …).
-    // A Z-sort was previously used here but caused "layers start from top AND bottom and meet in
-    // the middle": surfaces reached by long geodesic paths (e.g. the inside of a hull) have large
-    // geodesic distance but low Z; Z-sorting promoted those to the front of the print, producing
-    // the mirrored-wavefront artifact. Geodesic order guarantees each layer is one step further
-    // from the source (base), which is the correct bottom-up surface-following sequence.
-
     // Deduplicate consecutive layers at nearly identical Z heights (merge contours)
     let mut merged_layers: Vec<Layer> = Vec::new();
     for layer in layers {
         if let Some(last) = merged_layers.last_mut() {
             if (layer.z - last.z).abs() < config.layer_height * 0.1 {
-                // Merge contours into existing layer
                 last.contours.extend(layer.contours);
                 continue;
             }
@@ -1267,7 +1293,124 @@ pub fn geodesic_slice(mesh: &Mesh, config: &GeodesicSlicerConfig) -> Vec<Layer> 
         merged_layers.push(layer);
     }
 
-    log::info!("=== Geodesic slicing complete: {} layers (sorted by Z) ===", merged_layers.len());
+    // ── Floating contour filter ────────────────────────────────────────────
+    // Geodesic layers are ordered by geodesic distance, not Z height. A contour
+    // at geodesic distance 60 might be at Z=50 (ear tip) while a contour at
+    // distance 80 is at Z=15 (belly). Printing in pure geodesic order would
+    // deposit material in mid-air with no support below.
+    //
+    // Fix: maintain a 2D bin grid of "max Z printed so far at each XY cell".
+    // A contour is supported if every point has grid Z within z_tolerance below
+    // it. Unsupported contours are deferred and flushed once the grid fills in
+    // below them. This is the same algorithm used in conical mode.
+    //
+    // Input layers are in geodesic order. The filter preserves that order for
+    // contours that ARE supported (maintaining surface-following quality) and
+    // only defers those that would print in mid-air.
+    {
+        let z_tolerance = (config.layer_height * 3.0).max(0.4);
+
+        const NX: usize = 64;
+        const NY: usize = 64;
+        let gx_min = mesh.bounds_min.x;
+        let gx_max = mesh.bounds_max.x;
+        let gy_min = mesh.bounds_min.y;
+        let gy_max = mesh.bounds_max.y;
+        let dx = (gx_max - gx_min).max(1e-6) / NX as f64;
+        let dy = (gy_max - gy_min).max(1e-6) / NY as f64;
+        // Initialised to source_z_min — the build plate provides support at the base.
+        let mut z_grid = vec![source_z_min; NX * NY];
+
+        macro_rules! grid_idx {
+            ($x:expr, $y:expr) => {{
+                let ix = (($x - gx_min) / dx).floor() as usize;
+                let iy = (($y - gy_min) / dy).floor() as usize;
+                iy.min(NY - 1) * NX + ix.min(NX - 1)
+            }};
+        }
+        macro_rules! grid_supported {
+            ($contour:expr) => {
+                $contour.points.iter().all(|p| {
+                    z_grid[grid_idx!(p.x, p.y)] >= p.z - z_tolerance
+                })
+            };
+        }
+        macro_rules! grid_update {
+            ($contour:expr) => {
+                for p in &$contour.points {
+                    let idx = grid_idx!(p.x, p.y);
+                    if p.z > z_grid[idx] { z_grid[idx] = p.z; }
+                }
+            };
+        }
+
+        let mut deferred: Vec<(f64, f64, Contour)> = Vec::new(); // (min_z, layer_height, contour)
+        let mut ordered: Vec<Layer> = Vec::with_capacity(merged_layers.len());
+
+        for layer in merged_layers {
+            let lh = layer.layer_height;
+
+            // Partition contours into grounded and floating.
+            let mut grounded: Vec<Contour> = Vec::new();
+            for contour in layer.contours {
+                if grid_supported!(contour) {
+                    grounded.push(contour);
+                } else {
+                    let min_z = contour.points.iter().map(|p| p.z)
+                        .fold(f64::INFINITY, f64::min);
+                    deferred.push((min_z, lh, contour));
+                }
+            }
+
+            // Accept grounded contours and update the grid.
+            for c in &grounded { grid_update!(c); }
+            if !grounded.is_empty() {
+                let avg_z = grounded.iter()
+                    .flat_map(|c| c.points.iter())
+                    .map(|p| p.z).sum::<f64>()
+                    / grounded.iter().map(|c| c.points.len()).sum::<usize>().max(1) as f64;
+                ordered.push(Layer::new(avg_z, grounded, lh));
+            }
+
+            // Flush deferred contours that have become reachable.
+            let pending = std::mem::take(&mut deferred);
+            for (min_z, d_lh, contour) in pending {
+                if grid_supported!(contour) {
+                    grid_update!(contour);
+                    let avg_z = contour.points.iter().map(|p| p.z).sum::<f64>()
+                        / contour.points.len().max(1) as f64;
+                    ordered.push(Layer::new(avg_z, vec![contour], d_lh));
+                } else {
+                    deferred.push((min_z, d_lh, contour));
+                }
+            }
+        }
+
+        // Append remaining deferred contours sorted by min_z.
+        deferred.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let n_deferred = deferred.len();
+        for (_min_z, lh, contour) in deferred {
+            let avg_z = contour.points.iter().map(|p| p.z).sum::<f64>()
+                / contour.points.len().max(1) as f64;
+            ordered.push(Layer::new(avg_z, vec![contour], lh));
+        }
+
+        if n_deferred > 0 {
+            log::warn!(
+                "  Floating contour filter: {} contour(s) had no printable support \
+                 and were appended at end — consider increasing z_weight or enabling supports.",
+                n_deferred
+            );
+        }
+
+        let pre = ordered.len();
+        log::info!("  Floating contour filter: {} layers accepted in support order, {} deferred to end",
+            pre - n_deferred, n_deferred);
+        merged_layers = ordered;
+    }
+    // ──────────────────────────────────────────────────────────────────────────
+
+    log::info!("=== Geodesic slicing complete: {} layers ===", merged_layers.len());
     merged_layers
 }
 
@@ -1417,6 +1560,7 @@ mod tests {
             use_multiscale: false,
             num_scales: 4,
             diffusion_mode: GeodesicDiffusionMode::Isotropic,
+            z_weight: 0.0,
         };
         let layers = geodesic_slice(&mesh, &config);
         // Should get some layers (cube is 10mm tall, geodesic dist ~10mm, so ~3 layers at 3mm spacing)

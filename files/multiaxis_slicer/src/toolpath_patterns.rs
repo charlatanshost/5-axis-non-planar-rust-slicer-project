@@ -67,6 +67,8 @@ pub struct ToolpathConfig {
     ///   z(x,y) = max(deformed_z - signed_tan × sqrt((x−cx)² + (y−cy)²), z_min)
     /// replacing IDW which gives badly wrong Z for interior points of large cross-sections.
     pub conical_params: Option<(f64, f64, f64, f64)>,
+    /// Reorder contours within each layer to minimize travel distance (nearest-neighbor greedy).
+    pub optimize_print_order: bool,
 }
 
 impl Default for ToolpathConfig {
@@ -85,6 +87,7 @@ impl Default for ToolpathConfig {
             wall_transitions: false,
             use_mesh_raycaster: false,
             conical_params: None,
+            optimize_print_order: true,
         }
     }
 }

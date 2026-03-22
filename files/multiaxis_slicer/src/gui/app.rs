@@ -1,6 +1,7 @@
 // Main GUI application state and update logic
 
 use crate::{Mesh, Result};
+use crate::geometry::Vector3D;
 use crate::slicing::{Slicer, SlicingConfig, Layer};
 use crate::toolpath::{Toolpath, ToolpathGenerator};
 use crate::gcode::GCodeGenerator;
@@ -393,6 +394,23 @@ impl HeightMap {
         }
         best
     }
+
+    /// Maximum height along a line from `(x0,y0)` to `(x1,y1)`.
+    /// Samples every `cell`-sized step and returns the highest Z encountered.
+    fn max_z_along_line(&self, x0: f64, y0: f64, x1: f64, y1: f64) -> f64 {
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1e-6 { return self.get(x0, y0); }
+        let steps = ((len / self.cell).ceil() as usize).max(1);
+        let mut best = f64::NEG_INFINITY;
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64;
+            let v = self.get(x0 + dx * t, y0 + dy * t);
+            if v > best { best = v; }
+        }
+        best
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -426,6 +444,12 @@ pub struct SlicerApp {
     pub infill_pattern: crate::toolpath_patterns::InfillPattern,
     pub force_nonplanar_infill: bool,  // Override skip_infill for geodesic/cylindrical/spherical
     pub wall_seam_transitions: bool,   // Insert ruled-surface seam paths between consecutive curved layers
+    pub optimize_print_order: bool,    // Reorder contours per-layer to minimize travel (nearest-neighbor)
+    pub enable_orientation_smoothing: bool,  // Phase C: bidirectional SLERP smoothing
+    pub orientation_smoothing_rate: f64,     // Phase C: max degrees per mm of travel
+    pub look_ahead_window: usize,            // Phase D: segments to look ahead in collision scoring
+    pub enable_singularity_avoidance: bool,  // Phase F: penalize near-singular orientations
+    pub singularity_threshold: f64,          // Phase F: manipulability threshold
 
     // Support generation
     pub support_config: OverhangConfig,
@@ -530,6 +554,7 @@ pub struct SlicerApp {
     pub geodesic_aniso_smooth_iters: usize, // Smoothing passes for curvature dirs (mode 2)
     pub geodesic_print_dir_axis: u8,        // 0=X, 1=Y, 2=Z preferred print direction (mode 3)
     pub geodesic_print_dir_ratio: f64,      // Diffusivity ratio along print direction (mode 3)
+    pub geodesic_z_weight: f64,             // Z-regularization weight (0=pure geodesic, 1=pure planar)
 
     // G-code / machine kinematics configuration
     pub tcp_offset: f64,                               // pivot-to-nozzle distance (mm); 0 = disabled
@@ -600,6 +625,12 @@ impl Default for SlicerApp {
             infill_pattern: crate::toolpath_patterns::InfillPattern::Rectilinear,
             force_nonplanar_infill: false,
             wall_seam_transitions: false,
+            optimize_print_order: true,
+            enable_orientation_smoothing: true,
+            orientation_smoothing_rate: 15.0,
+            look_ahead_window: 3,
+            enable_singularity_avoidance: false,
+            singularity_threshold: 0.1,
 
             support_config: OverhangConfig::default(),
             support_result: None,
@@ -693,6 +724,7 @@ impl Default for SlicerApp {
             geodesic_aniso_smooth_iters: 2,
             geodesic_print_dir_axis: 2,     // Z-axis
             geodesic_print_dir_ratio: 10.0,
+            geodesic_z_weight: 0.0,
 
             // G-code kinematics defaults
             tcp_offset: 0.0,
@@ -942,6 +974,19 @@ impl SlicerApp {
 
         const MIN_XY: f64 = 1.0; // mm — ignore micro-travels within a region
 
+        // Build a HeightMap to track deposited material so travel moves can
+        // clear tall features along the XY corridor, not just the last extrusion Z.
+        let bead_r = (self.nozzle_diameter / 2.0).max(0.2);
+        let cell_size = (self.nozzle_diameter * 3.0).clamp(2.0, 10.0);
+        let (x0, y0, x1, y1) = if let Some(mesh) = &self.mesh {
+            let margin = 20.0;
+            (mesh.bounds_min.x - margin, mesh.bounds_min.y - margin,
+             mesh.bounds_max.x + margin, mesh.bounds_max.y + margin)
+        } else {
+            (-220.0, -220.0, 220.0, 220.0)
+        };
+        let mut hmap = HeightMap::new(x0, y0, x1, y1, cell_size);
+
         for toolpath in &mut self.toolpaths {
             let mut last_extrude_z = toolpath.z;
             let mut last_extrude_x = 0.0_f64;
@@ -962,16 +1007,29 @@ impl SlicerApp {
                         descend.extrusion = 0.0;
                         new_paths.push(descend);
                     }
+                    // Update HeightMap with this deposited extrusion
+                    hmap.update_circle(seg.position.x, seg.position.y, seg.position.z, bead_r);
                     last_extrude_z = seg.position.z;
                     last_extrude_x = seg.position.x;
                     last_extrude_y = seg.position.y;
                     prev_was_lifted = false;
                 } else {
-                    // Travel move: lift Z if far enough from last extrusion point
+                    // Travel move: lift Z to clear all deposited material along the XY corridor
                     let dx = seg.position.x - last_extrude_x;
                     let dy = seg.position.y - last_extrude_y;
                     if (dx * dx + dy * dy).sqrt() >= MIN_XY {
-                        let lifted_z = seg.position.z.max(last_extrude_z + lift);
+                        // Sample HeightMap along the travel corridor
+                        let corridor_max_z = hmap.max_z_along_line(
+                            last_extrude_x, last_extrude_y,
+                            seg.position.x, seg.position.y,
+                        );
+                        // Lift above the higher of: last extrusion Z or corridor max Z
+                        let reference_z = if corridor_max_z > f64::NEG_INFINITY {
+                            last_extrude_z.max(corridor_max_z)
+                        } else {
+                            last_extrude_z
+                        };
+                        let lifted_z = seg.position.z.max(reference_z + lift);
                         if lifted_z > seg.position.z + 1e-6 {
                             seg.position.z = lifted_z;
                             prev_was_lifted = true;
@@ -988,7 +1046,7 @@ impl SlicerApp {
             toolpath.paths = new_paths;
         }
 
-        self.log(format!("Applied {:.1} mm travel lift to all toolpaths", lift));
+        self.log(format!("Applied {:.1} mm HeightMap-aware travel lift to all toolpaths", lift));
     }
 
     /// After surface-normal (or conical) orientations have been assigned, check whether the
@@ -1166,26 +1224,77 @@ impl SlicerApp {
             }
         };
 
-        // Score function (Nishat et al. 2024, Heuristic 1):
+        // Phase F: singularity avoidance config
+        let sing_enabled = self.enable_singularity_avoidance;
+        let sing_threshold = self.singularity_threshold;
+
+        // Score function (Nishat et al. 2024, Heuristic 1) with Phase D look-ahead
+        // and Phase F singularity penalty:
         // - Collision-free candidates scored by 3D angular distance from the previous
         //   orientation (0…π), ensuring smooth tool-vector transitions between segments.
+        // - Look-ahead: also penalizes large angular jumps to upcoming segments.
+        // - Singularity: penalizes orientations near gimbal-lock configurations.
         // - Colliding candidates always score ≥ 100, so any collision-free option beats
         //   any colliding one regardless of angular distance.
         let score = |hmap: &HeightMap, nox: f64, noy: f64, noz: f64,
-                      t: f64, p: f64, pt: f64, pp: f64| -> f64 {
+                      t: f64, p: f64, pt: f64, pp: f64,
+                      future_orientations: &[(f64, f64, f64)]| -> f64 {
             let d = collision_depth(hmap, nox, noy, noz, t, p);
             if d <= 0.0 {
                 let dot = (pt.sin() * t.sin() * (p - pp).cos()
                          + pt.cos() * t.cos()).clamp(-1.0, 1.0);
-                dot.acos() // [0, π] — lower = smaller angular change
+                let base = dot.acos(); // [0, π] — lower = smaller angular change
+
+                // Look-ahead penalty: penalize if candidate creates large jumps to future segments
+                let mut penalty = 0.0;
+                for &(ft, fp, dist_to) in future_orientations {
+                    let f_dot = (ft.sin() * t.sin() * (p - fp).cos()
+                               + ft.cos() * t.cos()).clamp(-1.0, 1.0);
+                    let angle_to_future = f_dot.acos();
+                    // Allow 15°/mm of distance to the future segment
+                    let allowed = 15.0f64.to_radians() * dist_to;
+                    if angle_to_future > allowed {
+                        penalty += (angle_to_future - allowed) * 0.5;
+                    }
+                }
+
+                // Singularity penalty: |sin(theta)| measures manipulability for tilt-rotate systems
+                if sing_enabled {
+                    let manipulability = t.sin().abs();
+                    if manipulability < sing_threshold {
+                        penalty += (sing_threshold - manipulability) * 10.0;
+                    }
+                }
+
+                base + penalty
             } else {
                 100.0 + d
             }
         };
 
+        let look_ahead = self.look_ahead_window;
+
+        // Pre-collect all segment orientations and positions for look-ahead access.
+        // Structure: Vec<(toolpath_idx, seg_idx, theta, phi, x, y, z)>
+        let mut all_seg_info: Vec<(usize, usize, f64, f64, f64, f64, f64)> = Vec::new();
+        for (ti, tp) in self.toolpaths.iter().enumerate() {
+            for (si, seg) in tp.paths.iter().enumerate() {
+                let ori = seg.orientation;
+                let len = ori.norm();
+                if len > 1e-6 {
+                    let theta = (ori.z / len).clamp(-1.0, 1.0).acos();
+                    let phi = ori.y.atan2(ori.x);
+                    all_seg_info.push((ti, si, theta, phi, seg.position.x, seg.position.y, seg.position.z));
+                }
+            }
+        }
+
         // Track previous segment orientation for angular continuity.
         let mut prev_theta = 0.0f64;
         let mut prev_phi   = 0.0f64;
+
+        // Flat index into all_seg_info for look-ahead
+        let mut flat_idx = 0usize;
 
         for toolpath in &mut self.toolpaths {
             for segment in &mut toolpath.paths {
@@ -1205,6 +1314,23 @@ impl SlicerApp {
                 let oz_unit = (ori.z / len).clamp(-1.0, 1.0);
                 let theta = oz_unit.acos();
                 let phi   = ori.y.atan2(ori.x);
+
+                // Build look-ahead data: orientations of the next `look_ahead` segments
+                let mut future_oris: Vec<(f64, f64, f64)> = Vec::new();
+                if look_ahead > 0 && flat_idx < all_seg_info.len() {
+                    for fi in (flat_idx + 1)..all_seg_info.len().min(flat_idx + 1 + look_ahead) {
+                        let (_, _, ft, fp, fx, fy, fz) = all_seg_info[fi];
+                        let dx = fx - nx;
+                        let dy = fy - ny;
+                        let dz = fz - nz;
+                        let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.1);
+                        future_oris.push((ft, fp, dist));
+                    }
+                }
+                // Advance flat index (it tracks segments with valid orientations)
+                if flat_idx < all_seg_info.len() {
+                    flat_idx += 1;
+                }
 
                 // --- 1. Check collision at current orientation ---
                 let current_depth = collision_depth(&hmap, nx, ny, nz, theta, phi);
@@ -1231,7 +1357,7 @@ impl SlicerApp {
                         // Collision-free options (score < 100) always beat colliding ones.
                         for k in 0..N_PHI {
                             let p_try = phi + phi_offsets[k];
-                            let s = score(&hmap, nx, ny, nz, theta, p_try, prev_theta, prev_phi);
+                            let s = score(&hmap, nx, ny, nz, theta, p_try, prev_theta, prev_phi, &future_oris);
                             if s < best_score {
                                 best_score = s;
                                 best_phi   = p_try;
@@ -1249,7 +1375,7 @@ impl SlicerApp {
                                 for k in 0..N_PHI {
                                     let p_try = phi + phi_offsets[k];
                                     let s = score(&hmap, nx, ny, nz, t_clamped, p_try,
-                                                 prev_theta, prev_phi);
+                                                 prev_theta, prev_phi, &future_oris);
                                     if s < best_score {
                                         best_score = s;
                                         best_phi   = p_try;
@@ -1299,6 +1425,86 @@ impl SlicerApp {
             "Head-body collision avoidance: adjusted {} segment(s) ({:.1} mm clearance, {:.0}×{:.0}×{:.0} mm head)",
             adjusted_count, clearance, head_w, head_d, head_h
         ));
+    }
+
+    /// Smooth toolpath orientations using a bidirectional angular-velocity-limited pass.
+    /// Prevents sharp orientation jumps between consecutive extrusion segments that would
+    /// cause jerky axis motion and mechanical wear.
+    pub fn smooth_toolpath_orientations(&mut self) {
+        if !self.enable_orientation_smoothing {
+            return;
+        }
+        let rate_rad = self.orientation_smoothing_rate.to_radians(); // max rad per mm
+
+        for tp in &mut self.toolpaths {
+            let segs = &mut tp.paths;
+            if segs.len() < 2 {
+                continue;
+            }
+
+            // Collect indices of extrusion segments only
+            let ext_indices: Vec<usize> = (0..segs.len())
+                .filter(|&i| segs[i].extrusion > 0.0)
+                .collect();
+            if ext_indices.len() < 2 {
+                continue;
+            }
+
+            // --- Forward pass ---
+            let mut forward: Vec<Vector3D> = ext_indices.iter().map(|&i| segs[i].orientation).collect();
+            for k in 1..forward.len() {
+                let i0 = ext_indices[k - 1];
+                let i1 = ext_indices[k];
+                let dx = segs[i1].position.x - segs[i0].position.x;
+                let dy = segs[i1].position.y - segs[i0].position.y;
+                let dz = segs[i1].position.z - segs[i0].position.z;
+                let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-6);
+                let max_angle = rate_rad * dist;
+
+                let prev = forward[k - 1];
+                let cur = forward[k];
+                let dot = prev.dot(&cur).clamp(-1.0, 1.0);
+                let angle = dot.acos();
+
+                if angle > max_angle && angle > 1e-9 {
+                    let t = max_angle / angle;
+                    // SLERP: interpolate cur toward prev
+                    forward[k] = slerp_vec3(prev, cur, 1.0 - t);
+                }
+            }
+
+            // --- Backward pass ---
+            let mut backward: Vec<Vector3D> = ext_indices.iter().map(|&i| segs[i].orientation).collect();
+            let n = backward.len();
+            for k in (0..n - 1).rev() {
+                let i0 = ext_indices[k];
+                let i1 = ext_indices[k + 1];
+                let dx = segs[i1].position.x - segs[i0].position.x;
+                let dy = segs[i1].position.y - segs[i0].position.y;
+                let dz = segs[i1].position.z - segs[i0].position.z;
+                let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-6);
+                let max_angle = rate_rad * dist;
+
+                let next = backward[k + 1];
+                let cur = backward[k];
+                let dot = next.dot(&cur).clamp(-1.0, 1.0);
+                let angle = dot.acos();
+
+                if angle > max_angle && angle > 1e-9 {
+                    let t = max_angle / angle;
+                    backward[k] = slerp_vec3(next, cur, 1.0 - t);
+                }
+            }
+
+            // --- Merge: midpoint SLERP of forward and backward ---
+            for k in 0..ext_indices.len() {
+                let merged = slerp_vec3(forward[k], backward[k], 0.5);
+                let norm = merged.norm();
+                if norm > 1e-9 {
+                    segs[ext_indices[k]].orientation = merged / norm;
+                }
+            }
+        }
     }
 
     /// Post-process toolpath segments generated by conical slicing to assign the correct
@@ -2213,6 +2419,7 @@ impl SlicerApp {
         let aniso_smooth_iters = self.geodesic_aniso_smooth_iters;
         let print_dir_axis = self.geodesic_print_dir_axis;
         let print_dir_ratio = self.geodesic_print_dir_ratio;
+        let z_weight_val = self.geodesic_z_weight;
 
         let (tx, rx) = mpsc::channel();
         self.layers_receiver = Some(rx);
@@ -2255,6 +2462,7 @@ impl SlicerApp {
                 use_multiscale,
                 num_scales,
                 diffusion_mode,
+                z_weight: z_weight_val,
             };
 
             let result = std::panic::catch_unwind(|| {
@@ -2730,6 +2938,7 @@ impl SlicerApp {
             wall_transitions: self.wall_seam_transitions,
             use_mesh_raycaster,
             conical_params,
+            optimize_print_order: self.optimize_print_order,
             ..ToolpathConfig::default()
         };
 
@@ -2761,6 +2970,11 @@ impl SlicerApp {
         // Rotate the tilt azimuth (and reduce magnitude if needed) so the
         // printhead body clears previously deposited extrusions.
         self.apply_tilt_collision_avoidance();
+
+        // ── Orientation smoothing (angular velocity limiter) ──────────────
+        // Bidirectional SLERP pass that limits how fast the tool orientation
+        // can change per mm of travel, preventing jerky axis motion.
+        self.smooth_toolpath_orientations();
 
         // ── Travel lift (Z clearance on non-extrusion moves) ──────────────
         // Raise non-extruding moves above the last printed Z so the nozzle
@@ -3122,8 +3336,9 @@ impl eframe::App for SlicerApp {
 
         // Handle automatic playback
         if self.toolpath_playback_playing && self.toolpath_playback_enabled {
+            // Use windows(2) count to match viewport tube rendering
             let total_segments: usize = self.toolpaths.iter()
-                .map(|tp| tp.paths.len())
+                .map(|tp| tp.paths.len().saturating_sub(1))
                 .sum();
 
             if total_segments > 0 {
@@ -3308,6 +3523,24 @@ impl SlicerApp {
         use crate::gui::stats_panel;
         stats_panel::render(self, ctx);
     }
+}
+
+// ─── Orientation smoothing helpers ─────────────────────────────────────────────
+
+/// SLERP between two unit vectors `a` and `b` by parameter `t` (0=a, 1=b).
+/// Falls back to linear interpolation for nearly-parallel vectors.
+fn slerp_vec3(a: Vector3D, b: Vector3D, t: f64) -> Vector3D {
+    let dot = a.dot(&b).clamp(-1.0, 1.0);
+    let theta = dot.acos();
+    if theta.abs() < 1e-9 {
+        return a; // Nearly identical — no interpolation needed
+    }
+    let sin_theta = theta.sin();
+    let wa = ((1.0 - t) * theta).sin() / sin_theta;
+    let wb = (t * theta).sin() / sin_theta;
+    let result = a * wa + b * wb;
+    let norm = result.norm();
+    if norm > 1e-9 { result / norm } else { a }
 }
 
 // ─── Machine simulation helpers ───────────────────────────────────────────────

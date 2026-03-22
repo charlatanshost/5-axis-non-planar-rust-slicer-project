@@ -60,7 +60,29 @@ impl ToolpathGenerator {
         // Calculate centroidal axis for non-planar orientation
         let centroidal_axis = CentroidalAxis::compute(layers, 15.0);
 
-        let mut toolpaths: Vec<Toolpath> = layers
+        // Optionally reorder contours within each layer to minimize travel distance
+        let optimized_layers: Vec<Layer>;
+        let layers_ref = if self.pattern_config.optimize_print_order {
+            let mut last_pos = Point3D::new(0.0, 0.0, 0.0);
+            optimized_layers = layers.iter().map(|layer| {
+                let mut l = layer.clone();
+                if l.contours.len() > 1 {
+                    Self::optimize_contour_order(&mut l.contours, last_pos);
+                }
+                // Track last point for inter-layer continuity
+                if let Some(last_c) = l.contours.last() {
+                    if let Some(last_p) = last_c.points.last() {
+                        last_pos = *last_p;
+                    }
+                }
+                l
+            }).collect();
+            &optimized_layers
+        } else {
+            layers
+        };
+
+        let mut toolpaths: Vec<Toolpath> = layers_ref
             .iter()
             .enumerate()
             .map(|(layer_idx, layer)| self.generate_layer_toolpath(layer, layer_idx, &centroidal_axis, mesh))
@@ -72,6 +94,47 @@ impl ToolpathGenerator {
         }
 
         toolpaths
+    }
+
+    /// Reorder contours to minimize travel distance using nearest-neighbor greedy heuristic.
+    fn optimize_contour_order(contours: &mut Vec<crate::geometry::Contour>, start_pos: Point3D) {
+        if contours.len() <= 1 { return; }
+        let mut remaining: Vec<usize> = (0..contours.len()).collect();
+        let mut ordered: Vec<usize> = Vec::with_capacity(contours.len());
+        let mut cur_x = start_pos.x;
+        let mut cur_y = start_pos.y;
+
+        while !remaining.is_empty() {
+            // Find nearest contour by XY distance to its first point
+            let best_idx = remaining.iter().enumerate()
+                .min_by(|(_, &a), (_, &b)| {
+                    let pa = &contours[a].points;
+                    let pb = &contours[b].points;
+                    let da = if pa.is_empty() { f64::MAX } else {
+                        (pa[0].x - cur_x).powi(2) + (pa[0].y - cur_y).powi(2)
+                    };
+                    let db = if pb.is_empty() { f64::MAX } else {
+                        (pb[0].x - cur_x).powi(2) + (pb[0].y - cur_y).powi(2)
+                    };
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(ri, _)| ri)
+                .unwrap();
+
+            let ci = remaining.remove(best_idx);
+            // Update current position to last point of chosen contour
+            if let Some(last_p) = contours[ci].points.last() {
+                cur_x = last_p.x;
+                cur_y = last_p.y;
+            }
+            ordered.push(ci);
+        }
+
+        // Reorder in-place: build new vec in ordered sequence, then replace
+        let reordered: Vec<crate::geometry::Contour> = ordered.into_iter()
+            .map(|i| std::mem::replace(&mut contours[i], crate::geometry::Contour { points: Vec::new(), closed: false }))
+            .collect();
+        *contours = reordered;
     }
 
     fn generate_layer_toolpath(&self, layer: &Layer, layer_idx: usize, centroidal_axis: &CentroidalAxis, mesh: Option<&Mesh>) -> Toolpath {
