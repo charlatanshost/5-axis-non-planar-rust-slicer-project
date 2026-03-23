@@ -207,25 +207,34 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                                 app.s4_max_rotation_degrees = 35.0;
                                 app.s4_smoothing_iterations = 40;
                                 app.s4_smoothness_weight = 0.6;
+                                app.s4_auto_z_bias = false;
+                                app.s4_multi_axis = true;
                             }
                             ui.label(egui::RichText::new("(bunny, complex overhangs)").weak());
                         });
 
                         ui.separator();
 
+                        // Z-bias with auto toggle
                         ui.horizontal(|ui| {
-                            ui.label("Z-bias:");
-                            ui.add(egui::Slider::new(&mut app.s4_z_bias, 0.0..=1.0)
-                                .step_by(0.05))
-                                .on_hover_text("Controls how the layer-ordering field is computed.\n\
-                                    0.0 = pure Euclidean graph distance (original — connects ears, back to head).\n\
-                                    0.8 = mostly Z-height (recommended — ears and back separate correctly).\n\
-                                    1.0 = pure |ΔZ| distance (maximally height-tracking).");
+                            ui.checkbox(&mut app.s4_auto_z_bias, "Auto Z-bias")
+                                .on_hover_text("Automatically compute Z-bias from mesh geometry.\nTall meshes get higher bias, flat meshes get lower bias.");
+                        });
+                        ui.add_enabled_ui(!app.s4_auto_z_bias, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Z-bias:");
+                                ui.add(egui::Slider::new(&mut app.s4_z_bias, 0.0..=1.0)
+                                    .step_by(0.05))
+                                    .on_hover_text("Controls how the layer-ordering field is computed.\n\
+                                        0.0 = pure Euclidean graph distance.\n\
+                                        0.8 = mostly Z-height (recommended).\n\
+                                        1.0 = pure |ΔZ| distance.");
+                            });
                         });
 
                         ui.horizontal(|ui| {
                             ui.label("Overhang threshold:");
-                            ui.add(egui::Slider::new(&mut app.s4_overhang_threshold, 30.0..=60.0)
+                            ui.add(egui::Slider::new(&mut app.s4_overhang_threshold, 20.0..=80.0)
                                 .suffix("°"))
                                 .on_hover_text("Surface faces steeper than this angle get rotated to reduce overhangs.\nLower = catch more overhangs (more aggressive deformation).");
                         });
@@ -237,7 +246,14 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                                 .step_by(1.0))
                                 .on_hover_text("Maximum rotation per tet to fix overhangs.\n\
                                     15° = gentle (safe default).\n\
-                                    35° = support-free printing of complex models (bunny, etc.).");
+                                    35° = support-free printing of complex models.");
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut app.s4_multi_axis, "Multi-axis overhangs")
+                                .on_hover_text("Detect overhangs facing multiple directions.\n\
+                                    Off: single dominant rotation axis (more robust).\n\
+                                    On: cluster-based multi-axis (better for complex models).");
                         });
 
                         ui.separator();
@@ -245,31 +261,67 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
 
                         ui.horizontal(|ui| {
                             ui.label("Smoothing iterations:");
-                            ui.add(egui::Slider::new(&mut app.s4_smoothing_iterations, 5..=50))
-                                .on_hover_text("SLERP smoothing passes over the rotation field.\nMore = smoother transitions between tets (25 recommended).");
+                            ui.add(egui::Slider::new(&mut app.s4_smoothing_iterations, 5..=100))
+                                .on_hover_text("Diffusion passes spreading surface rotations inward.\nMore = wider spread, smoother transitions (25 default).");
                         });
 
                         ui.horizontal(|ui| {
                             ui.label("Smoothness weight:");
-                            ui.add(egui::Slider::new(&mut app.s4_smoothness_weight, 0.0..=1.0))
-                                .on_hover_text("How much to blend with neighbors per iteration.\n0.0 = no smoothing, 1.0 = heavy smoothing.");
+                            ui.add(egui::Slider::new(&mut app.s4_smoothness_weight, 0.0..=1.0)
+                                .step_by(0.05))
+                                .on_hover_text("SLERP blend factor per iteration.\n0.0 = preserve originals, 1.0 = heavy averaging.");
                         });
 
                         ui.separator();
-                        ui.label(egui::RichText::new("ASAP Deformation").weak());
+                        ui.label(egui::RichText::new("Deformation Method").weak());
 
                         ui.horizontal(|ui| {
-                            ui.label("ASAP iterations:");
-                            ui.add(egui::Slider::new(&mut app.s4_asap_max_iterations, 3..=20))
-                                .on_hover_text("Iterations for the As-Rigid-As-Possible deformation solver.\nMore = better shape preservation (10 recommended).");
+                            ui.checkbox(&mut app.s4_use_asap, "Use ASAP deformation")
+                                .on_hover_text("Use full As-Rigid-As-Possible solver instead of direct vertex rotation.\n\
+                                    Smoother results but slower and can cause mesh collapse on complex models.");
+                        });
+
+                        ui.add_enabled_ui(app.s4_use_asap, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("ASAP iterations:");
+                                ui.add(egui::Slider::new(&mut app.s4_asap_max_iterations, 3..=20))
+                                    .on_hover_text("ASAP solver iterations (10 recommended).");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Convergence:");
+                                ui.add(egui::Slider::new(&mut app.s4_asap_convergence, 1e-5..=1e-3)
+                                    .logarithmic(true)
+                                    .custom_formatter(|n, _| format!("{:.1e}", n)))
+                                    .on_hover_text("ASAP convergence threshold (lower = more precise).");
+                            });
+                        });
+
+                        ui.separator();
+                        ui.label(egui::RichText::new("Advanced").weak());
+
+                        ui.horizontal(|ui| {
+                            ui.label("Base detection:");
+                            ui.add(egui::Slider::new(&mut app.s4_base_detection_threshold, 0.01..=0.20)
+                                .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)))
+                                .on_hover_text("Z-threshold for build-plate tet detection.\n\
+                                    Bottom N% of mesh height is considered 'base'.\n\
+                                    5% default, increase for meshes not sitting flat.");
                         });
 
                         ui.horizontal(|ui| {
-                            ui.label("Convergence:");
-                            ui.add(egui::Slider::new(&mut app.s4_asap_convergence, 1e-5..=1e-3)
-                                .logarithmic(true)
-                                .custom_formatter(|n, _| format!("{:.1e}", n)))
-                                .on_hover_text("ASAP solver convergence threshold (lower = more precise)");
+                            ui.label("Edge filter:");
+                            ui.add(egui::Slider::new(&mut app.s4_edge_filter_multiplier, 5.0..=30.0)
+                                .step_by(1.0))
+                                .on_hover_text("Triangles with edges > median × this value are removed.\n\
+                                    Lower = more aggressive filtering (cleaner surface, may lose detail).");
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Jump split:");
+                            ui.add(egui::Slider::new(&mut app.s4_jump_split_multiplier, 5.0..=30.0)
+                                .step_by(1.0))
+                                .on_hover_text("Contour points separated by > layer_height × this are split.\n\
+                                    Lower = more splitting (catches more artifacts, may fragment contours).");
                         });
 
                         ui.separator();

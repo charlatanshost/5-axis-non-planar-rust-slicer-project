@@ -525,6 +525,12 @@ pub struct SlicerApp {
     pub s4_asap_max_iterations: usize,     // 3-20
     pub s4_asap_convergence: f64,          // 1e-5 to 1e-3
     pub s4_z_bias: f64,                    // Dijkstra Z-bias (0.0 = Euclidean, 1.0 = pure |ΔZ|)
+    pub s4_auto_z_bias: bool,              // Auto-compute z_bias from mesh geometry
+    pub s4_use_asap: bool,                 // Use full ASAP deformation instead of direct vertex rotation
+    pub s4_base_detection_threshold: f64,  // Z-threshold percentage for base tet detection (0.01-0.20)
+    pub s4_edge_filter_multiplier: f64,    // Edge length filter multiplier (5-30)
+    pub s4_jump_split_multiplier: f64,     // Jump-split threshold as multiple of layer_height (5-30)
+    pub s4_multi_axis: bool,               // Multi-axis overhang detection
 
     // Conical slicing configuration
     pub conical_angle_degrees: f64,        // Cone half-angle (5-60)
@@ -696,6 +702,12 @@ impl Default for SlicerApp {
             s4_asap_max_iterations: 10,
             s4_asap_convergence: 1e-4,
             s4_z_bias: 0.8,
+            s4_auto_z_bias: true,
+            s4_use_asap: false,
+            s4_base_detection_threshold: 0.05,
+            s4_edge_filter_multiplier: 15.0,
+            s4_jump_split_multiplier: 10.0,
+            s4_multi_axis: false,
 
             // Conical slicing defaults
             conical_angle_degrees: 45.0,
@@ -2173,6 +2185,12 @@ impl SlicerApp {
         let asap_max_iterations = self.s4_asap_max_iterations;
         let asap_convergence = self.s4_asap_convergence;
         let z_bias = self.s4_z_bias;
+        let auto_z_bias = self.s4_auto_z_bias;
+        let use_asap = self.s4_use_asap;
+        let base_detection_threshold = self.s4_base_detection_threshold;
+        let edge_filter_multiplier = self.s4_edge_filter_multiplier;
+        let jump_split_multiplier = self.s4_jump_split_multiplier;
+        let multi_axis = self.s4_multi_axis;
 
         let (tx, rx) = mpsc::channel();
         self.layers_receiver = Some(rx);
@@ -2189,7 +2207,7 @@ impl SlicerApp {
             let pipeline_config = S3PipelineConfig {
                 objective: FabricationObjective::SupportFree,
                 layer_height,
-                optimization_iterations: smoothing_iterations * 2, // maps to S4 smoothing iterations
+                optimization_iterations: smoothing_iterations * 2,
                 overhang_threshold,
                 smoothness_weight,
                 max_rotation_degrees,
@@ -2197,6 +2215,12 @@ impl SlicerApp {
                 asap_max_iterations,
                 asap_convergence_threshold: asap_convergence,
                 z_bias,
+                auto_z_bias,
+                use_asap,
+                base_detection_threshold,
+                edge_filter_multiplier,
+                jump_split_multiplier,
+                multi_axis,
             };
 
             {
@@ -2303,6 +2327,7 @@ impl SlicerApp {
         let data = (**data).clone();
         let original_mesh = mesh.clone();
         let layer_height = self.config.layer_height;
+        let jump_split_multiplier = self.s4_jump_split_multiplier;
         let progress = self.slicing_progress.clone();
 
         let (tx, rx) = mpsc::channel();
@@ -2316,7 +2341,7 @@ impl SlicerApp {
                 p.percentage = 10.0;
                 p.message = "Untransforming layers to original mesh space...".to_string();
             }
-            let layers = execute_s4_untransform(planar_layers, &data, &original_mesh, layer_height);
+            let layers = execute_s4_untransform(planar_layers, &data, &original_mesh, layer_height, jump_split_multiplier);
             let n = layers.len();
             log::info!("S4 untransform complete: {} layers", n);
             let _ = tx.send(layers);
@@ -2667,6 +2692,12 @@ impl SlicerApp {
                     asap_max_iterations: self.s4_asap_max_iterations,
                     asap_convergence_threshold: self.s4_asap_convergence,
                     z_bias: self.s4_z_bias,
+                    auto_z_bias: self.s4_auto_z_bias,
+                    use_asap: self.s4_use_asap,
+                    base_detection_threshold: self.s4_base_detection_threshold,
+                    edge_filter_multiplier: self.s4_edge_filter_multiplier,
+                    jump_split_multiplier: self.s4_jump_split_multiplier,
+                    multi_axis: self.s4_multi_axis,
                 }
             } else {
                 S3PipelineConfig {
@@ -2680,6 +2711,7 @@ impl SlicerApp {
                     asap_max_iterations: self.s3_asap_max_iterations,
                     asap_convergence_threshold: self.s3_asap_convergence,
                     z_bias: 0.8,
+                    ..S3PipelineConfig::default()
                 }
             };
 

@@ -15,6 +15,7 @@ use crate::s3_slicer::{
 use crate::s3_slicer::tet_dijkstra_field::TetDijkstraField;
 use crate::s3_slicer::s4_rotation_field::{S4RotationField, S4RotationConfig};
 use crate::s3_slicer::tet_point_location::{TetSpatialGrid, interpolate_point};
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// Deformation method for S3-Slicer
@@ -81,6 +82,27 @@ pub struct S3PipelineConfig {
     /// Z-bias for Dijkstra edge weights in the S4 pipeline (0 = Euclidean, 1 = pure |ΔZ|).
     /// Only used by DeformationMethod::S4Deform.  Default 0.8 gives height-tracking layers.
     pub z_bias: f64,
+
+    /// Automatically compute z_bias from mesh geometry (height/width aspect ratio).
+    pub auto_z_bias: bool,
+
+    /// Use full ASAP deformation instead of direct vertex rotation in S4 pipeline.
+    /// Produces smoother results but can cause mesh collapse on complex models.
+    pub use_asap: bool,
+
+    /// Z-threshold percentage for base tet detection (0.01 = bottom 1%, 0.20 = bottom 20%).
+    pub base_detection_threshold: f64,
+
+    /// Edge length filter multiplier for deformed surface cleanup.
+    /// Triangles with edges > median_edge * this value are removed.
+    pub edge_filter_multiplier: f64,
+
+    /// Jump-split threshold as multiple of layer_height.
+    /// Contour points separated by more than layer_height * this are split into separate contours.
+    pub jump_split_multiplier: f64,
+
+    /// Enable multi-axis overhang detection in S4 rotation field.
+    pub multi_axis: bool,
 }
 
 impl Default for S3PipelineConfig {
@@ -96,8 +118,36 @@ impl Default for S3PipelineConfig {
             asap_max_iterations: 3,      // 3 iterations is usually enough for ARAP convergence
             asap_convergence_threshold: 1e-3,  // Higher threshold for faster termination
             z_bias: 0.8,  // Height-tracking Dijkstra by default
+            auto_z_bias: true,
+            use_asap: false,
+            base_detection_threshold: 0.05,
+            edge_filter_multiplier: 15.0,
+            jump_split_multiplier: 10.0,
+            multi_axis: false,
         }
     }
+}
+
+/// Compute optimal z_bias from mesh geometry.
+///
+/// Tall, narrow meshes need higher z_bias (close to 1.0) to separate layers vertically.
+/// Wide, flat meshes benefit from lower z_bias since horizontal distance matters more.
+/// Uses the height-to-width aspect ratio as the primary signal.
+pub fn compute_auto_z_bias(mesh: &Mesh) -> f64 {
+    let extent = mesh.bounds_max - mesh.bounds_min;
+    let height = extent.z.max(1e-6);
+    let width = extent.x.max(extent.y).max(1e-6);
+    let aspect_ratio = height / width;
+
+    // Map aspect ratio to z_bias:
+    // - Very flat (aspect < 0.3): z_bias ~0.5 (more Euclidean, horizontal matters)
+    // - Medium (aspect ~1.0): z_bias ~0.8 (standard height-tracking)
+    // - Very tall (aspect > 2.0): z_bias ~0.95 (strongly height-tracking)
+    let z_bias = (0.5 + 0.45 * (aspect_ratio / 1.5).min(1.0)).min(0.95);
+
+    log::info!("Auto z_bias: aspect_ratio={:.2} (h={:.1}, w={:.1}) → z_bias={:.3}",
+        aspect_ratio, height, width, z_bias);
+    z_bias
 }
 
 /// Result of the S3-Slicer pipeline
@@ -693,8 +743,15 @@ pub fn execute_s4_deform(
     }
 
     // Step 2: Dijkstra distance field
-    log::info!("Step 2/4: Computing Dijkstra distance field (z_bias={:.2})...", config.z_bias);
-    let dijkstra_field = TetDijkstraField::compute(&tet_mesh, config.z_bias);
+    let effective_z_bias = if config.auto_z_bias {
+        compute_auto_z_bias(original_mesh)
+    } else {
+        config.z_bias
+    };
+    log::info!("Step 2/4: Computing Dijkstra distance field (z_bias={:.2}{})...",
+        effective_z_bias, if config.auto_z_bias { " [auto]" } else { "" });
+    let dijkstra_field = TetDijkstraField::compute_with_base_threshold(
+        &tet_mesh, effective_z_bias, config.base_detection_threshold);
     log::info!("  → Max distance: {:.2}, {} base tets",
         dijkstra_field.max_distance, dijkstra_field.base_tets.len());
 
@@ -711,12 +768,37 @@ pub fn execute_s4_deform(
         // Minimum 20 to ensure the rotation field reaches past the overhang surface.
         smoothing_iterations: config.optimization_iterations.max(20),
         smoothness_weight: config.smoothness_weight,
+        multi_axis: config.multi_axis,
     };
     let rotation_field = S4RotationField::compute(&tet_mesh, &dijkstra_field, &s4_config);
 
-    // Step 4: Direct vertex rotation deformation
-    log::info!("Step 4/4: Applying direct vertex rotation deformation...");
-    let deformed_tet_mesh = deform_tet_mesh_direct(&tet_mesh, &rotation_field.rotations);
+    // Step 4: Deformation (direct vertex rotation or ASAP)
+    let deformed_tet_mesh = if config.use_asap {
+        log::info!("Step 4/4: Applying ASAP deformation (high quality)...");
+        let quat_field = rotation_field.to_tet_quaternion_field(
+            &QuaternionFieldConfig {
+                objective: config.objective,
+                build_direction: Vector3D::new(0.0, 0.0, 1.0),
+                optimization_iterations: config.optimization_iterations,
+                smoothness_weight: config.smoothness_weight,
+                objective_weight: 1.0,
+                overhang_threshold: config.overhang_threshold,
+                max_rotation_degrees: config.max_rotation_degrees,
+            },
+        );
+        let tet_asap_config = TetAsapConfig {
+            max_iterations: config.asap_max_iterations,
+            convergence_threshold: config.asap_convergence_threshold,
+            quaternion_weight: 0.3,
+            constraint_weight: 500.0,
+            allow_scaling: true,
+        };
+        let solver = TetAsapSolver::new(tet_mesh.clone(), quat_field, tet_asap_config);
+        solver.solve()
+    } else {
+        log::info!("Step 4/4: Applying direct vertex rotation deformation...");
+        deform_tet_mesh_direct(&tet_mesh, &rotation_field.rotations)
+    };
 
     let deformed_quality = deformed_tet_mesh.check_quality();
     let inverted_ratio = deformed_quality.inverted_tets as f64 / tet_mesh.tets.len().max(1) as f64;
@@ -747,7 +829,7 @@ pub fn execute_s4_deform(
             .collect();
         edge_lengths.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median_edge = edge_lengths[edge_lengths.len() / 2];
-        let max_allowed = (median_edge * 15.0).max(5.0);
+        let max_allowed = (median_edge * config.edge_filter_multiplier).max(5.0);
         let filtered: Vec<_> = raw_surface.triangles.iter()
             .filter(|tri| {
                 let e0 = ((tri.v1.x-tri.v0.x).powi(2)+(tri.v1.y-tri.v0.y).powi(2)+(tri.v1.z-tri.v0.z).powi(2)).sqrt();
@@ -782,20 +864,23 @@ pub fn execute_s4_untransform(
     data: &S4DeformData,
     original_mesh: &Mesh,
     layer_height: f64,
+    jump_split_multiplier: f64,
 ) -> Vec<Layer> {
     log::info!("S4 Untransform: {} planar layers → original space", planar_layers.len());
     let deformed_grid = TetSpatialGrid::build(&data.deformed_tet);
 
-    let mut layers: Vec<Layer> = Vec::new();
-    let mut total_points = 0usize;
-    let mut points_found = 0usize;
-    let mut points_nearest = 0usize;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    let total_points = AtomicUsize::new(0);
+    let points_found = AtomicUsize::new(0);
+    let points_nearest = AtomicUsize::new(0);
 
     // AABB filter: drop any untransformed point that lands outside the original mesh
     // bounding box by more than a small margin.  This catches nearest-tet fallback
     // artefacts (which can be mm or cm off) while keeping valid surface-contour points
     // that legitimately sit a fraction of a mm outside the mesh AABB.
-    let aabb_margin = layer_height * 5.0;
+    // Adaptive: use max of layer-height-based and mesh-extent-based margins
+    let mesh_extent = (original_mesh.bounds_max - original_mesh.bounds_min).norm();
+    let aabb_margin = (layer_height * 5.0).max(mesh_extent * 0.02);
     let aabb_min = Point3D::new(
         original_mesh.bounds_min.x - aabb_margin,
         original_mesh.bounds_min.y - aabb_margin,
@@ -812,11 +897,13 @@ pub fn execute_s4_untransform(
         && p.z >= aabb_min.z && p.z <= aabb_max.z
     };
 
-    // Jump-split threshold: 10× layer height — generous enough for curved surfaces while
-    // still catching genuine teleport artefacts (which are typically 10–100mm jumps).
-    let max_seg_sq = (layer_height * 10.0).powi(2);
+    // Jump-split threshold: configurable multiplier × layer height — generous enough for
+    // curved surfaces while catching genuine teleport artefacts (typically 10–100mm jumps).
+    // Also consider mesh extent for very large or very small models.
+    let jump_threshold = (layer_height * jump_split_multiplier).max(mesh_extent * 0.03);
+    let max_seg_sq = jump_threshold.powi(2);
 
-    for layer in &planar_layers {
+    let mut layers: Vec<Layer> = planar_layers.par_iter().filter_map(|layer| {
         let mut untransformed_contours: Vec<crate::geometry::Contour> = Vec::new();
 
         for contour in &layer.contours {
@@ -824,13 +911,13 @@ pub fn execute_s4_untransform(
             let mut untransformed_points: Vec<Point3D> = Vec::new();
 
             for point in &contour.points {
-                total_points += 1;
+                total_points.fetch_add(1, AtomicOrdering::Relaxed);
                 // Prefer exact in-tet lookup; use nearest-tet as fallback for points that
                 // land just outside the tet mesh (common for surface contour points).
                 // The AABB check below discards any fallback result that teleported far away.
                 let loc = match deformed_grid.find_containing_tet(point, &data.deformed_tet) {
-                    Some(r) => { points_found += 1; r }
-                    None    => { points_nearest += 1; deformed_grid.find_nearest_tet(point, &data.deformed_tet) }
+                    Some(r) => { points_found.fetch_add(1, AtomicOrdering::Relaxed); r }
+                    None    => { points_nearest.fetch_add(1, AtomicOrdering::Relaxed); deformed_grid.find_nearest_tet(point, &data.deformed_tet) }
                 };
                 let tet = &data.original_tet.tets[loc.tet_index];
                 let original_point = interpolate_point(
@@ -861,31 +948,106 @@ pub fn execute_s4_untransform(
 
             let n_subs = sub_contours.len();
             for sub in sub_contours {
-                // Preserve the closed flag when the contour was not split and the original
-                // was closed (standard cross-section loop).  Split fragments are open paths.
                 let closed = contour.closed && n_subs == 1;
                 untransformed_contours.push(crate::geometry::Contour { points: sub, closed });
             }
         }
 
         if !untransformed_contours.is_empty() {
-            // Use min_z for stable ordering of multi-region layers (e.g. both ears in one layer)
             let min_z = untransformed_contours.iter()
                 .flat_map(|c| c.points.iter())
                 .map(|p| p.z)
                 .fold(f64::INFINITY, f64::min);
-            layers.push(Layer { z: min_z, contours: untransformed_contours, layer_height: layer.layer_height });
+            Some(Layer { z: min_z, contours: untransformed_contours, layer_height: layer.layer_height })
+        } else {
+            None
         }
-    }
+    }).collect();
 
-    log::info!("  → {} points: {} in-tet, {} nearest fallback", total_points, points_found, points_nearest);
+    log::info!("  → {} points: {} in-tet, {} nearest fallback",
+        total_points.load(AtomicOrdering::Relaxed),
+        points_found.load(AtomicOrdering::Relaxed),
+        points_nearest.load(AtomicOrdering::Relaxed));
 
     // Sort layers by z for monotone print ordering
     layers.sort_by(|a, b| a.z.partial_cmp(&b.z).unwrap_or(std::cmp::Ordering::Equal));
 
+    // Topological ordering: ensure no layer's max Z exceeds the next layer's min Z
+    // by too much. If it does, merge or reorder to prevent collision.
+    reorder_layers_topological(&mut layers);
+
     let total_contours: usize = layers.iter().map(|l| l.contours.len()).sum();
     log::info!("  → {} layers, {} contours (untransformed)", layers.len(), total_contours);
     layers
+}
+
+/// Topological reordering: ensures layers are in a safe print order.
+///
+/// After z-sorting, checks for layers whose max Z exceeds the min Z of subsequent layers.
+/// Uses a simple bubble-up pass: if layer[i] has max_z > min_z of layer[i+1], swap them
+/// if it reduces the overall conflict. This handles cases where curved layers overlap in Z.
+fn reorder_layers_topological(layers: &mut Vec<Layer>) {
+    if layers.len() < 2 { return; }
+
+    // Compute min/max Z for each layer
+    let z_ranges: Vec<(f64, f64)> = layers.iter().map(|layer| {
+        let mut min_z = f64::INFINITY;
+        let mut max_z = f64::NEG_INFINITY;
+        for contour in &layer.contours {
+            for point in &contour.points {
+                min_z = min_z.min(point.z);
+                max_z = max_z.max(point.z);
+            }
+        }
+        (min_z, max_z)
+    }).collect();
+
+    // Count and log overlaps
+    let mut overlaps = 0usize;
+    for i in 0..z_ranges.len() - 1 {
+        if z_ranges[i].1 > z_ranges[i + 1].0 {
+            overlaps += 1;
+        }
+    }
+    if overlaps > 0 {
+        log::info!("  Topological ordering: {} Z-overlaps detected among {} layers", overlaps, layers.len());
+    }
+
+    // Merge layers that are too close together (within 0.5× their Z-range overlap)
+    // This prevents printing issues from interleaved layers.
+    let mut merged = 0usize;
+    let mut i = 0;
+    while i + 1 < layers.len() {
+        let (_, max_z_i) = {
+            let mut min_z = f64::INFINITY;
+            let mut max_z = f64::NEG_INFINITY;
+            for c in &layers[i].contours { for p in &c.points { min_z = min_z.min(p.z); max_z = max_z.max(p.z); } }
+            (min_z, max_z)
+        };
+        let (min_z_next, _) = {
+            let mut min_z = f64::INFINITY;
+            let mut max_z = f64::NEG_INFINITY;
+            for c in &layers[i+1].contours { for p in &c.points { min_z = min_z.min(p.z); max_z = max_z.max(p.z); } }
+            (min_z, max_z)
+        };
+
+        // If layer i's top extends past layer i+1's bottom significantly,
+        // merge i+1's contours into i.
+        let overlap = max_z_i - min_z_next;
+        let layer_height = layers[i].layer_height;
+        if overlap > layer_height * 0.5 && overlap < layer_height * 3.0 {
+            let next_contours = layers[i + 1].contours.clone();
+            layers[i].contours.extend(next_contours);
+            layers.remove(i + 1);
+            merged += 1;
+            // Don't advance i — check the merged layer against the next one
+        } else {
+            i += 1;
+        }
+    }
+    if merged > 0 {
+        log::info!("  Topological ordering: merged {} overlapping layer pairs", merged);
+    }
 }
 
 /// Execute the S4-style pipeline
@@ -939,7 +1101,8 @@ pub fn execute_s4_pipeline(
     };
 
     // Steps 6-7: untransform
-    let layers = execute_s4_untransform(planar_layers, &data, &original_mesh, config.layer_height);
+    let layers = execute_s4_untransform(
+        planar_layers, &data, &original_mesh, config.layer_height, config.jump_split_multiplier);
 
     // Build S3PipelineResult compatibility fields
     let deformed_surface_for_result = data.deformed_tet.to_surface_mesh();

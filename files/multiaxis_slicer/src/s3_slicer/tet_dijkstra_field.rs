@@ -11,6 +11,7 @@
 use crate::geometry::{Point3D, Vector3D};
 use crate::s3_slicer::tet_mesh::TetMesh;
 use ordered_float::OrderedFloat;
+use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -46,6 +47,13 @@ impl TetDijkstraField {
     /// which prevents topologically-close but geometrically-separated features
     /// (e.g. both ears of the Stanford Bunny) from ending up on the same layer.
     pub fn compute(tet_mesh: &TetMesh, z_bias: f64) -> Self {
+        Self::compute_with_base_threshold(tet_mesh, z_bias, 0.05)
+    }
+
+    /// Compute Dijkstra distance field with configurable base detection threshold.
+    ///
+    /// `base_threshold` is the fraction of mesh height considered "base" (e.g. 0.05 = bottom 5%).
+    pub fn compute_with_base_threshold(tet_mesh: &TetMesh, z_bias: f64, base_threshold: f64) -> Self {
         let num_tets = tet_mesh.tets.len();
         log::info!("Computing Dijkstra field on {} tets...", num_tets);
 
@@ -66,7 +74,7 @@ impl TetDijkstraField {
             .collect();
 
         // Find base tets
-        let base_tets = find_base_tets(tet_mesh);
+        let base_tets = find_base_tets(tet_mesh, base_threshold);
         log::info!("  Found {} base tets (touching build plate)", base_tets.len());
 
         if base_tets.is_empty() {
@@ -128,10 +136,10 @@ impl TetDijkstraField {
 /// Identify base tets: those with boundary faces in the bottom Z region.
 ///
 /// A boundary face is one where `tet_neighbors[ti][fi] == None`.
-/// We check if the face vertices are in the bottom 5% of the Z range.
-fn find_base_tets(tet_mesh: &TetMesh) -> Vec<usize> {
+/// We check if the face vertices are in the bottom `base_threshold` fraction of the Z range.
+fn find_base_tets(tet_mesh: &TetMesh, base_threshold: f64) -> Vec<usize> {
     let z_range = tet_mesh.bounds_max.z - tet_mesh.bounds_min.z;
-    let z_threshold = tet_mesh.bounds_min.z + z_range * 0.05;
+    let z_threshold = tet_mesh.bounds_min.z + z_range * base_threshold;
 
     let mut base_tets = Vec::new();
 
@@ -154,9 +162,9 @@ fn find_base_tets(tet_mesh: &TetMesh) -> Vec<usize> {
         }
     }
 
-    // If too few base tets found, relax threshold
+    // If too few base tets found, relax threshold to 2x the original
     if base_tets.len() < 2 && tet_mesh.tets.len() > 10 {
-        let z_threshold_relaxed = tet_mesh.bounds_min.z + z_range * 0.10;
+        let z_threshold_relaxed = tet_mesh.bounds_min.z + z_range * (base_threshold * 2.0).min(0.25);
         base_tets.clear();
 
         for (ti, tet) in tet_mesh.tets.iter().enumerate() {
@@ -243,7 +251,7 @@ fn run_dijkstra(
     (distances, max_distance)
 }
 
-/// Compute per-tet gradient of the distance field.
+/// Compute per-tet gradient of the distance field (parallelized with rayon).
 ///
 /// For each tet, uses a weighted average of distance differences with neighbors:
 ///   gradient = sum_i( (dist[ni] - dist[ti]) * (centroid[ni] - centroid[ti]) / |centroid[ni] - centroid[ti]|^2 )
@@ -254,9 +262,8 @@ fn compute_gradients(
     distances: &[f64],
 ) -> Vec<Vector3D> {
     let num_tets = tet_mesh.tets.len();
-    let mut gradients = Vec::with_capacity(num_tets);
 
-    for ti in 0..num_tets {
+    (0..num_tets).into_par_iter().map(|ti| {
         let mut grad = Vector3D::zeros();
 
         for fi in 0..4 {
@@ -272,14 +279,11 @@ fn compute_gradients(
 
         let norm = grad.norm();
         if norm > 1e-10 {
-            gradients.push(grad / norm);
+            grad / norm
         } else {
-            // Default to upward for tets with no meaningful gradient
-            gradients.push(Vector3D::new(0.0, 0.0, 1.0));
+            Vector3D::new(0.0, 0.0, 1.0)
         }
-    }
-
-    gradients
+    }).collect()
 }
 
 #[cfg(test)]
@@ -314,7 +318,7 @@ mod tests {
     #[test]
     fn test_find_base_tets() {
         let mesh = make_two_tet_stack();
-        let base = find_base_tets(&mesh);
+        let base = find_base_tets(&mesh, 0.05);
         // Tet 0 has boundary face [0,1,2] at z=0, should be a base tet
         assert!(!base.is_empty(), "Should find at least one base tet");
         assert!(base.contains(&0), "Tet 0 should be a base tet (bottom face at z=0)");

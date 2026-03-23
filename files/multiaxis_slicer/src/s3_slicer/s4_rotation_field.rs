@@ -39,6 +39,12 @@ pub struct S4RotationConfig {
 
     /// Smoothing weight (0..1) — how much to blend with neighbors per iteration
     pub smoothness_weight: f64,
+
+    /// Enable multi-axis overhang detection.
+    /// When true, instead of forcing all Phase 1 rotations onto a single dominant axis,
+    /// clusters overhangs by axis direction and handles up to 2 dominant directions.
+    /// Better for models with overhangs facing multiple directions (e.g. bunny ears + belly).
+    pub multi_axis: bool,
 }
 
 impl Default for S4RotationConfig {
@@ -50,6 +56,7 @@ impl Default for S4RotationConfig {
             z_bias: 0.8,
             smoothing_iterations: 25,
             smoothness_weight: 0.5,
+            multi_axis: false,
         }
     }
 }
@@ -254,10 +261,28 @@ fn compute_initial_rotations(
     log::info!("  Phase 1: {} surface overhang tets, max: {:.2}°",
         phase1_count, phase1_max.to_degrees());
 
-    // ── Dominant axis normalization ───────────────────────────────────────────
-    // Find the most-severe Phase 1 tet and use its axis for ALL Phase 1 tets.
-    // This guarantees that every rotation in the field shares the same axis →
-    // SLERP averages and upward propagation are numerically stable (no collapse).
+    // ── Axis normalization ──────────────────────────────────────────────────
+    if config.multi_axis {
+        // Multi-axis mode: cluster Phase 1 rotations by axis direction,
+        // keep up to 2 dominant clusters, normalize within each cluster.
+        normalize_multi_axis(&mut rotations, num_tets);
+    } else {
+        // Single-axis mode: force all Phase 1 rotations onto the dominant axis.
+        normalize_single_axis(&mut rotations, num_tets);
+    }
+
+    // Phase 2 (upward propagation) removed — it caused a sharp rotation cliff at
+    // the boundary between propagated and non-propagated tets, which combined with
+    // the global anchor in deform_tet_mesh_direct to create a shear tear.
+    // Diffusion in S4RotationField::compute() spreads the Phase 1 values smoothly.
+
+    let magnitudes: Vec<f64> = rotations.iter().map(|q| q.angle()).collect();
+    (rotations, magnitudes)
+}
+
+/// Single-axis normalization: force all Phase 1 rotations onto the dominant axis.
+/// This guarantees stable SLERP averaging at the cost of multi-directional accuracy.
+fn normalize_single_axis(rotations: &mut [UnitQuaternion<f64>], num_tets: usize) {
     let dominant_axis: Option<Vector3D> = (0..num_tets)
         .filter(|&ti| rotations[ti].angle() > 1e-6)
         .max_by(|&a, &b| {
@@ -282,14 +307,111 @@ fn compute_initial_rotations(
     } else {
         log::info!("  No overhang tets found in Phase 1 — field will be identity.");
     }
+}
 
-    // Phase 2 (upward propagation) removed — it caused a sharp rotation cliff at
-    // the boundary between propagated and non-propagated tets, which combined with
-    // the global anchor in deform_tet_mesh_direct to create a shear tear.
-    // Diffusion in S4RotationField::compute() spreads the Phase 1 values smoothly.
+/// Multi-axis normalization: cluster Phase 1 rotation axes into groups,
+/// keep the top 2 clusters, and normalize within each cluster to its centroid axis.
+/// This handles models with overhangs facing different directions better than
+/// single-axis mode, while still preventing degenerate SLERP from too many axes.
+fn normalize_multi_axis(rotations: &mut [UnitQuaternion<f64>], num_tets: usize) {
+    // Collect all non-identity rotation axes with their magnitudes
+    let mut axes: Vec<(usize, Vector3D, f64)> = Vec::new();
+    for ti in 0..num_tets {
+        let mag = rotations[ti].angle();
+        if mag > 1e-6 {
+            if let Some(ax) = rotations[ti].axis() {
+                axes.push((ti, ax.into_inner(), mag));
+            }
+        }
+    }
 
-    let magnitudes: Vec<f64> = rotations.iter().map(|q| q.angle()).collect();
-    (rotations, magnitudes)
+    if axes.is_empty() {
+        log::info!("  No overhang tets found in Phase 1 — field will be identity.");
+        return;
+    }
+
+    if axes.len() == 1 {
+        log::info!("  Single overhang tet — no clustering needed.");
+        return;
+    }
+
+    // Simple 2-means clustering by axis direction (using dot product as similarity)
+    // Initialize with the most-severe axis and its most-different counterpart
+    let primary_idx = axes.iter().enumerate()
+        .max_by(|a, b| a.1.2.partial_cmp(&b.1.2).unwrap())
+        .map(|(i, _)| i).unwrap();
+    let primary_axis = axes[primary_idx].1;
+
+    let secondary_idx = axes.iter().enumerate()
+        .filter(|(i, _)| *i != primary_idx)
+        .min_by(|(_, (_, ax_a, _)), (_, (_, ax_b, _))| {
+            let dot_a = ax_a.dot(&primary_axis).abs();
+            let dot_b = ax_b.dot(&primary_axis).abs();
+            dot_a.partial_cmp(&dot_b).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i);
+
+    // If all axes are nearly parallel (dot > 0.8), fall back to single-axis
+    let use_two_clusters = if let Some(sec_idx) = secondary_idx {
+        let dot = axes[sec_idx].1.dot(&primary_axis).abs();
+        dot < 0.8 // Only use 2 clusters if axes are sufficiently different
+    } else {
+        false
+    };
+
+    if !use_two_clusters {
+        log::info!("  Multi-axis: all axes nearly parallel — using single dominant axis.");
+        normalize_single_axis(rotations, num_tets);
+        return;
+    }
+
+    let secondary_axis = axes[secondary_idx.unwrap()].1;
+
+    // Assign each tet to the closer cluster
+    let mut cluster1_sum = Vector3D::zeros();
+    let mut cluster2_sum = Vector3D::zeros();
+    let mut cluster1_count = 0usize;
+    let mut cluster2_count = 0usize;
+
+    for &(ti, ax, mag) in &axes {
+        let dot1 = ax.dot(&primary_axis).abs();
+        let dot2 = ax.dot(&secondary_axis).abs();
+        if dot1 >= dot2 {
+            cluster1_sum += ax * mag; // weight by magnitude
+            cluster1_count += 1;
+        } else {
+            cluster2_sum += ax * mag;
+            cluster2_count += 1;
+        }
+    }
+
+    // Compute cluster centroid axes
+    let c1_norm = cluster1_sum.norm();
+    let c2_norm = cluster2_sum.norm();
+    let c1_axis = if c1_norm > 1e-10 { cluster1_sum / c1_norm } else { primary_axis };
+    let c2_axis = if c2_norm > 1e-10 { cluster2_sum / c2_norm } else { secondary_axis };
+
+    let c1_unit = nalgebra::Unit::new_normalize(c1_axis);
+    let c2_unit = nalgebra::Unit::new_normalize(c2_axis);
+
+    // Normalize each tet to its cluster's axis
+    let mut normalized = 0usize;
+    for &(ti, ax, _) in &axes {
+        let mag = rotations[ti].angle();
+        let dot1 = ax.dot(&c1_axis).abs();
+        let dot2 = ax.dot(&c2_axis).abs();
+        if dot1 >= dot2 {
+            rotations[ti] = UnitQuaternion::from_axis_angle(&c1_unit, mag);
+        } else {
+            rotations[ti] = UnitQuaternion::from_axis_angle(&c2_unit, mag);
+        }
+        normalized += 1;
+    }
+
+    log::info!("  Multi-axis clustering: {} tets in cluster 1 ({:.3},{:.3},{:.3}), {} in cluster 2 ({:.3},{:.3},{:.3})",
+        cluster1_count, c1_axis.x, c1_axis.y, c1_axis.z,
+        cluster2_count, c2_axis.x, c2_axis.y, c2_axis.z);
+    log::info!("  Normalized {} tets across 2 clusters", normalized);
 }
 
 /// Smooth a single tet's rotation by SLERP with face-adjacent neighbors.
