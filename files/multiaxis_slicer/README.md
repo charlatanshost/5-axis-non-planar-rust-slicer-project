@@ -24,7 +24,10 @@ High-performance multi-axis non-planar 3D printing slicer written in Rust with a
 - **Conical axis orientations** — analytical tilt from cone-surface normal: n = (−sinα·dx/r, −sinα·dy/r, cosα) for outward cone
 - **Voxel reconstruction** — SDF + Marching Cubes repairs self-intersecting STL files in 2–5 seconds
 - **S4 Z-biased Dijkstra** — edge weights blend `|ΔZ|` and Euclidean distance so the distance field tracks actual print height; prevents topologically-close features (e.g. bunny ears) from merging onto the same layer
+- **S4 auto z_bias** — optimal z_bias from mesh aspect ratio; multi-axis overhang detection (2-cluster axis normalization); configurable base tet detection, edge filter, and jump-split thresholds; optional ASAP deformation toggle; topological layer ordering; rayon parallelization
 - **Support-Free Preset** — one-click configuration for complex organic models (35° overhang / 35° max rotation / z_bias 0.85)
+- **6 infill patterns** — Rectilinear, Grid, Triangles, Concentric, Gyroid, Adaptive Cubic
+- **Collision avoidance pipeline** — HeightMap-aware travel Z-lift (corridor sampling), nearest-neighbor contour reordering, bidirectional SLERP orientation smoothing, look-ahead collision scoring, Dijkstra graph-based path planner, singularity avoidance
 - **Adaptive layer height** — per-layer height set by local surface slope; viewport tube diameter scales to match
 - **Multi-scale geodesic** — heat diffusion at several doubling timesteps, fused for fine detail + full coverage
 - **Anisotropic geodesic diffusion** — curvature-aligned, print-direction biased, or custom vector field modes
@@ -34,8 +37,8 @@ High-performance multi-axis non-planar 3D printing slicer written in Rust with a
 - **Capsule-vs-mesh collision detection** — parry3d capsule tested against every triangle with AABB pre-filter
 - **Conical floating-contour filter** — 2D bin grid defers unsupported contours until the print surface below has been deposited
 - **Interactive 3D GUI** — egui sidebar with live parameter controls, three-d viewport, G-code preview panel
-- **Parallel processing** — Rayon used throughout slicing and field computation
-- **113 unit tests** passing (3 pre-existing failures unrelated to current work)
+- **Parallel processing** — Rayon used throughout slicing, field computation, gradient computation, and per-layer untransform
+- **122 unit tests** passing (3 pre-existing failures unrelated to current work)
 
 ## Quick Start
 
@@ -81,7 +84,10 @@ src/
 │   ├── marching_tet.rs      Isosurface extraction via marching tetrahedra
 │   └── tet_point_location.rs   Spatial bin grid + barycentric coordinates
 ├── motion_planning/
-│   └── collision.rs         Capsule-vs-mesh collision detection (parry3d)
+│   ├── collision.rs         Capsule-vs-mesh collision detection (parry3d)
+│   ├── graph_search.rs      Dijkstra graph-based path planner
+│   ├── singularity.rs       Singularity avoidance (manipulability penalty)
+│   └── variable_filament.rs Variable filament utilities
 ├── support_generation/
 │   ├── overhang_detection.rs
 │   ├── tree_skeleton.rs
@@ -99,7 +105,7 @@ src/
 ```
 Planar:      Flat planes at constant Z
 Conical:     Z-shift by r·tan(angle) → planar slice → reverse shift
-S4:          TetMesh → Z-biased Dijkstra → overhang rotations → ASAP deform → slice → bary untransform
+S4:          TetMesh → Z-biased Dijkstra (auto z_bias) → multi-axis rotations → ASAP/direct deform → slice → bary untransform → topological ordering
 S3:          TetMesh → quaternion field → ASAP deform → scalar field → marching tets
 Geodesic:    Cotangent Laplacian → heat diffusion → gradient normalize → Poisson → level sets
 Cylindrical: (x,y,z) → (θ, z, r) → planar slice → inverse transform
@@ -109,7 +115,7 @@ Spherical:   (x,y,z) → (θ, φ, r) → planar slice → inverse transform
 ## Testing
 
 ```bash
-# Run all library tests (113 pass, 3 pre-existing failures)
+# Run all library tests (122 pass, 3 pre-existing failures)
 cargo test --lib
 
 # Run specific module

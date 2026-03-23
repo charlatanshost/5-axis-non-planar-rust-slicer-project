@@ -1,6 +1,6 @@
 # Known Issues, Bugs, and Todo List
 
-Last updated: 2026-03-15
+Last updated: 2026-03-22
 
 ---
 
@@ -42,16 +42,18 @@ None of these were introduced by recent work. All three need fresh test geometry
 
 ### [BUG] S4 — misplaced contour fragments / gaps in some layers
 **Symptom:** The viewport shows floating path fragments or incomplete loops on some layers, most visibly near the neck/transition regions of complex organic models (e.g. Stanford Bunny).
-**Root cause (partial fix applied 2026-03-15):**
+**Root cause (improvements applied 2026-03-15 and 2026-03-22):**
 - Points that fall just outside the tet mesh surface are mapped via `find_nearest_tet()` with clamped barycentric coordinates. When the clamped result lands far from the correct location it produces teleporting path segments.
-- Contours were previously split at 20× layer height (too lenient); now split at 10×.
-- Out-of-bounds points now filtered by AABB ± 5× layer height instead of the original loose sphere (1.5× diagonal from center).
+- Jump-split threshold now adaptive: `max(layer_height × jump_split_multiplier, mesh_extent × 0.03)` — scales with both layer height (configurable 5–30×, default 10×) and overall mesh size.
+- AABB filter now adaptive: `max(5 × layer_height, 2% × mesh_extent)` instead of fixed ± 5× layer height.
 - Closed contour flag now preserved when the contour survives untransform intact.
+- Edge filter multiplier now configurable (5–30×, default 15×) to remove degenerate triangles from deformed surface.
 **Remaining issue:** The nearest-tet clamped coords are inherently inaccurate for points far outside the mesh. Better fix: walk from the nearest tet face toward the query point rather than clamping bary coords.
 
-### [BUG] S4 — layer ordering after untransform is approximate
+### [BUG] S4 — layer ordering after untransform is approximate (partially fixed)
 **Symptom:** After barycentric untransform, each layer's `z` is set to the minimum Z of all its untransformed points. For strongly-deformed models this can cause layers from different regions to interleave in Z order, leading to non-monotone toolpath sequences.
-**Fix:** After untransform, sort all layers by their true mean Z, then re-verify contour support using the conical-style 2D grid filter (or at minimum sort and warn).
+**Partial fix (2026-03-22):** `reorder_layers_topological()` now detects overlapping layers where `max_z[i] > min_z[i+1]` and merges them when the overlap is between 0.5× and 3× layer height. This handles most cases but extreme deformations may still produce non-monotone ordering.
+**Remaining:** Full conical-style 2D grid filter for re-verification of contour support.
 
 ### [BUG] Conical — floating contour filter misses very thin isolated features
 **Symptom:** Features with XY footprint < ~2% of total object footprint may fall into a single bin cell alongside the main body and be marked "supported" prematurely.
@@ -109,6 +111,36 @@ Multi-scale mode is silently ignored when `diffusion_mode = CustomVectorField`. 
 
 ---
 
+## Recently Fixed (2026-03-22)
+
+### ✅ [FIXED] S4 — manual z_bias tuning required for each model
+**Was:** z_bias was a single manual slider (default 0.8). Users had to experiment per model.
+**Fix:** `compute_auto_z_bias()` computes optimal z_bias from mesh aspect ratio. Enabled by default; manual slider still available.
+
+### ✅ [FIXED] S4 — single dominant axis mishandles multi-directional overhangs
+**Was:** All overhang rotation axes were forced onto a single dominant axis, causing incorrect rotations on models with overhangs in multiple directions.
+**Fix:** Optional multi-axis mode with 2-cluster normalization. Clusters overhangs by direction similarity, normalizes each cluster independently.
+
+### ✅ [FIXED] Travel Z-lift — crashes into tall features along travel corridor
+**Was:** `apply_travel_lifts()` lifted by a flat clearance above `last_extrude_z`. A travel from (0,0) to (100,0) would crash into a tall tower at (50,0).
+**Fix:** `HeightMap` tracks deposited material along the XY travel corridor. Travel Z is lifted above the maximum deposited Z encountered along the path.
+
+### ✅ [FIXED] Sharp orientation jumps between consecutive segments
+**Was:** After collision avoidance, consecutive segments could have sharp orientation jumps (e.g., 0° to 30° in one segment). Causes jerky axis motion and mechanical wear.
+**Fix:** Bidirectional SLERP smoothing pass (`smooth_toolpath_orientations()`) with configurable angular velocity limit (default 15°/mm).
+
+### ✅ [FIXED] Collision avoidance scoring was greedy with no look-ahead
+**Was:** `apply_tilt_collision_avoidance()` scored each segment independently. Changing segment N's orientation could create a bad transition to N+1.
+**Fix:** Look-ahead window (default 3 segments, configurable 1–5) in the scoring function penalizes candidates that create large angular jumps to future orientations.
+
+### ✅ [FIXED] Contours printed in arbitrary order within a layer
+**Was:** Contours were printed in whatever order they appeared from the slicer. Travel between distant contours was unnecessarily long.
+**Fix:** Nearest-neighbor greedy reordering of contours before toolpath generation (`optimize_contour_order()`).
+
+### ✅ [FIXED] Only rectilinear infill pattern available
+**Was:** Only rectilinear and zigzag infill patterns were implemented.
+**Fix:** Added Grid, Triangles, Concentric, Gyroid, and Adaptive Cubic infill patterns, all selectable from the GUI.
+
 ## Recently Fixed (2026-03-15)
 
 ### ✅ [FIXED] Machine simulation — 180° bed flip at start of playback
@@ -151,6 +183,39 @@ Update both example files to compile cleanly with the current `S3PipelineConfig`
 
 ### [ENH] Verify and tune S4 support-free preset on real hardware
 The Support-Free Preset values (z_bias 0.85, 35° overhang, 35° max rotation) were determined analytically. Real print testing on the Stanford Bunny will reveal whether the deformation is sufficient for specific problem areas (underside belly, inner ear concavity, tail). Likely needs per-region tuning or a higher `max_rotation_degrees`.
+
+### [ENH] ✅ S4 — auto z_bias tuning — COMPLETE (2026-03-22)
+Optimal z_bias computed from mesh aspect ratio. Manual slider override still available.
+
+### [ENH] ✅ S4 — multi-axis overhang detection — COMPLETE (2026-03-22)
+2-cluster axis normalization for models with overhangs in multiple directions.
+
+### [ENH] ✅ S4 — configurable base tet detection — COMPLETE (2026-03-22)
+Z-threshold configurable 1–20% of mesh height (was hardcoded 5%).
+
+### [ENH] ✅ S4 — topological layer ordering — COMPLETE (2026-03-22)
+Detects and merges overlapping layers after untransform.
+
+### [ENH] ✅ S4 — rayon parallelization — COMPLETE (2026-03-22)
+Gradient computation and per-layer untransform now use rayon par_iter.
+
+### [ENH] ✅ HeightMap-aware travel Z-lift — COMPLETE (2026-03-22)
+Samples deposited material along travel corridor; lifts above maximum encountered Z.
+
+### [ENH] ✅ Contour order optimization — COMPLETE (2026-03-22)
+Nearest-neighbor greedy reordering reduces travel distance.
+
+### [ENH] ✅ Orientation smoothing — COMPLETE (2026-03-22)
+Bidirectional SLERP smoothing with configurable angular rate (15°/mm default).
+
+### [ENH] ✅ Collision avoidance look-ahead — COMPLETE (2026-03-22)
+Look-ahead window (1–5 segments) in collision scoring function.
+
+### [ENH] ✅ Singularity avoidance — COMPLETE (2026-03-22)
+Manipulability-based penalty biases optimizer away from gimbal-lock configurations.
+
+### [ENH] ✅ Additional infill patterns — COMPLETE (2026-03-22)
+Added Grid, Triangles, Concentric, Gyroid, and Adaptive Cubic patterns.
 
 ### [ENH] S4 — better nearest-tet fallback for untransform
 Current `find_nearest_tet()` clamps negative barycentric coordinates, which can place out-of-mesh points on the face of the nearest tet (potentially wrong side of the mesh). Better approach: project the query point onto the nearest tet's closest face and use proper face bary coords, or use a gradient-descent walk from the nearest tet toward the query point.

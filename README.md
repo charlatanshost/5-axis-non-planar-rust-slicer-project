@@ -44,6 +44,9 @@ The output is standard G-code extended with A/B rotation axes for 5-axis machine
 - **Multi-scale geodesic** — runs heat diffusion at several doubling timesteps and fuses results, giving both fine local detail and full-mesh coverage simultaneously
 - **Anisotropic diffusion** — curvature-aligned, print-direction biased, or custom vector field modes shape how geodesic layers follow the geometry
 - **S4 Z-biased Dijkstra** — edge weights blend |ΔZ| and Euclidean distance so the distance field tracks actual print height, not graph path length; includes a one-click "Support-Free Preset" (35° overhang, 35° max rotation, z_bias 0.85) tuned for complex organic models
+- **S4 auto z_bias** — automatically computes optimal z_bias from mesh aspect ratio (tall narrow meshes get higher bias); multi-axis overhang detection with 2-cluster axis normalization; configurable base tet detection threshold, edge filter multiplier, and jump-split threshold; optional full ASAP deformation toggle; topological layer ordering after untransform; rayon-parallelized gradient computation and per-layer untransform
+- **6 infill patterns** — Rectilinear, Grid, Triangles, Concentric, Gyroid, Adaptive Cubic — selectable from the GUI with live preview
+- **Collision avoidance pipeline** — HeightMap-aware travel Z-lift (samples deposited material along the travel corridor), nearest-neighbor contour reordering to minimize travel, bidirectional SLERP orientation smoothing (configurable angular rate), look-ahead window for collision scoring, Dijkstra graph-based path planner, singularity avoidance penalty for near-gimbal-lock configurations
 - **Adaptive layer height** — per-layer height set by local surface slope; viewport tube diameter scales to match actual layer height
 - **Mesh-mapped gap filling** — `MeshRayCaster` projects infill and wall loop Z onto the actual surface; slope-adaptive scanline insertion fills 3D coverage gaps on steep curved surfaces
 - **Wall seam transitions** — optional ruled-surface zigzag paths between consecutive curved layers to fill the staircase gap at the outer wall
@@ -52,8 +55,8 @@ The output is standard G-code extended with A/B rotation axes for 5-axis machine
 - **Machine simulation collision detection** — per-segment bed Z travel correctly tracked; head OBB checked in bed's local frame to avoid AABB-expansion false positives from tilted bed geometry
 - **Conical floating-contour filter** — 2D per-XY bin grid tracks maximum printed Z at each location; defers unsupported contours until the print surface below them has been deposited
 - **Interactive 3D GUI** — egui sidebar with live parameter controls, three-d viewport with layer-height-scaled tube rendering, G-code preview panel; viewport renders machine geometry even without a loaded mesh
-- **Parallel processing** — Rayon used throughout slicing and field computation
-- **113 unit tests** passing (3 pre-existing failures unrelated to current work)
+- **Parallel processing** — Rayon used throughout slicing, field computation, gradient computation, and per-layer untransform
+- **122 unit tests** passing (3 pre-existing failures unrelated to current work)
 
 ---
 
@@ -95,10 +98,14 @@ files/multiaxis_slicer/src/
 │   ├── tet_asap_deformation.rs  Volumetric ASAP deformation (SVD)
 │   ├── tet_quaternion_field.rs  Per-tet quaternion field optimization
 │   ├── tet_dijkstra_field.rs    Multi-source Dijkstra for S4
+│   ├── s4_rotation_field.rs     Overhang-based rotation field for S4
 │   ├── marching_tet.rs      Isosurface extraction via marching tetrahedra
 │   └── tet_point_location.rs   Spatial bin grid + barycentric coordinates
 ├── motion_planning/
-│   └── collision.rs         Capsule-vs-mesh collision detection (parry3d)
+│   ├── collision.rs         Capsule-vs-mesh collision detection (parry3d)
+│   ├── graph_search.rs      Dijkstra graph-based path planner
+│   ├── singularity.rs       Singularity avoidance (manipulability penalty)
+│   └── variable_filament.rs Variable filament utilities
 ├── support_generation/
 │   ├── overhang_detection.rs
 │   └── tree_skeleton.rs

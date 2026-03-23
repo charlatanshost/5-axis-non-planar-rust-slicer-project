@@ -189,14 +189,31 @@ Inspired by [jyjblrd/S4_Slicer](https://github.com/jyjblrd/S4_Slicer). The key i
 A regular grid covers the mesh bounding box. Each cube is split into 6 tetrahedra using Freudenthal decomposition. Tets with all 4 vertices outside the mesh are discarded. This bypasses TetGen entirely and works on any mesh.
 
 **Step 2 — Dijkstra distance field** (`tet_dijkstra_field.rs`)
-Multi-source Dijkstra from "base" tets (those touching the bottom of the mesh). Edge weights use a **Z-biased blend**:
+Multi-source Dijkstra from "base" tets (those touching the bottom of the mesh). Base tet detection uses a configurable Z-threshold (`base_detection_threshold`, default 5% of mesh height, range 1–20%). If too few base tets are found, the threshold is relaxed to 2× the configured value (capped at 25%). Edge weights use a **Z-biased blend**:
 ```
 weight = |ΔZ| × z_bias  +  Euclidean × (1 − z_bias)
 ```
 `z_bias` defaults to 0.8. At 0.0 the field is pure Euclidean graph distance (original behaviour), which causes topologically-adjacent but geometrically-separated features — e.g. the two ears of the Stanford Bunny, which share the neck as a common path — to end up at the same distance and therefore on the same layer. At 0.8 the distance field strongly tracks actual vertical height, so each ear is correctly on its own set of layers. The Euclidean floor (via the `1 − z_bias` term) ensures horizontal adjacencies still cost something so gradient directions remain valid.
 
+**Auto z_bias** (`compute_auto_z_bias` in `pipeline.rs`): When `auto_z_bias` is enabled (default), the z_bias is computed from the mesh's aspect ratio:
+```
+aspect_ratio = height / max(width, depth)
+z_bias = (0.5 + 0.45 × (aspect_ratio / 1.5).min(1.0)).min(0.95)
+```
+Tall narrow meshes (aspect_ratio > 1.5) get z_bias ≈ 0.95; flat wide meshes get z_bias ≈ 0.5. This eliminates the need for manual tuning on most models.
+
+Gradient computation is parallelized with `rayon::par_iter()`.
+
 **Step 3 — Rotation field** (`s4_rotation_field.rs`)
 For each surface tet (those with at least one boundary face), compute the overhang angle. If it exceeds `overhang_threshold` (default 45°, preset 35°), compute a rotation about the horizontal axis perpendicular to the overhang normal to reduce the overhang to threshold. Clamp by `max_rotation_degrees` (default 15°, preset 35°). Interior tets copy a damped average of their surface neighbours. Apply SLERP smoothing over the tet graph for `smoothing_iterations` passes to prevent discontinuities. The result is a per-tet quaternion.
+
+**Multi-axis overhang detection** (optional, `multi_axis` flag): Instead of forcing all Phase 1 rotation axes onto a single dominant axis, the 2-cluster algorithm:
+1. Finds the primary axis (most severe overhang tet's rotation axis).
+2. Finds the secondary axis (rotation axis of the tet most different from primary, by dot product).
+3. If `dot(primary, secondary) > 0.8`, falls back to single-axis normalization (axes are too similar to separate).
+4. Otherwise, clusters all tets by which axis they are closer to (dot product similarity).
+5. Computes centroid axis per cluster, normalizes each tet to its cluster's axis.
+This is useful for models with overhangs in multiple directions (e.g. ears and belly of the Stanford Bunny).
 
 **Support-Free Preset** (★ button in GUI, tuned for complex organic models like the Stanford Bunny):
 
@@ -208,22 +225,28 @@ For each surface tet (those with at least one boundary face), compute the overha
 | `smoothing_iterations` | 25 | 40 |
 | `smoothness_weight` | 0.5 | 0.6 |
 
-**Step 4 — ASAP deformation** (`tet_asap_deformation.rs`)
-Apply the quaternion field as a volumetric deformation. Each tet's vertices are moved according to its rotation. "As-Rigid-As-Possible" minimizes distortion. See §3.4 for ASAP details.
+**Step 4 — Deformation** (`tet_asap_deformation.rs`)
+Two deformation strategies, selectable via `use_asap`:
+- **Direct vertex rotation** (default, `use_asap = false`): Each tet's vertices are directly rotated by its quaternion. Simpler and more robust; avoids the iterative solve and its potential for mesh collapse.
+- **Full ASAP deformation** (`use_asap = true`): "As-Rigid-As-Possible" minimizes the distortion energy. See §3.4 for ASAP details. Produces smoother results but can cause mesh collapse on complex models.
+
+The deformed surface mesh is extracted and filtered: triangles with edges longer than `median_edge × edge_filter_multiplier` (configurable 5–30×, default 15×) are removed. This eliminates degenerate triangles at mesh boundaries.
 
 **Step 5 — Planar slice**
-The deformed surface mesh is extracted and given to the standard planar slicer.
+The filtered deformed surface mesh is given to the standard planar slicer.
 
 **Step 6 — Barycentric untransform** (`tet_point_location.rs`)
 For each contour point in deformed space:
 1. `find_containing_tet()` — spatial bin grid lookup for the tet that encloses the point.
 2. If not found (point just outside tet mesh surface), `find_nearest_tet()` fallback — finds the closest tet and uses clamped barycentric coordinates (imprecise but usually close enough for surface-boundary points).
 3. Interpolate the same barycentric coordinates in the *original* tet mesh → original-space point.
-4. **AABB filter:** drop any result that falls outside `mesh.bounds ± 5×layer_height`. This rejects nearest-tet fallback results that teleport to wrong mesh regions, while keeping valid surface-boundary points.
-5. **Jump split:** if consecutive untransformed points are more than `10×layer_height` apart, split the contour at that gap. Each sub-contour must have ≥ 2 points to be kept.
+4. **AABB filter:** drop any result that falls outside `mesh.bounds ± adaptive_margin` where `adaptive_margin = max(5 × layer_height, 2% × mesh_extent)`. This rejects nearest-tet fallback results that teleport to wrong mesh regions, while keeping valid surface-boundary points.
+5. **Jump split:** if consecutive untransformed points are more than `adaptive_threshold` apart, split the contour at that gap. `adaptive_threshold = max(layer_height × jump_split_multiplier, mesh_extent × 0.03)` — scales with both layer height and overall mesh size. Default `jump_split_multiplier` is 10, configurable 5–30. Each sub-contour must have ≥ 2 points to be kept.
 6. **Closed flag:** preserved when the contour was unsplit and the original planar contour was closed (normal cross-section loop). Split fragments are marked open.
 
-Layers are sorted by min-Z after untransform for monotone print ordering.
+Per-layer untransform is parallelized with `rayon::par_iter()` and atomic counters for progress tracking.
+
+Layers are sorted by min-Z after untransform, then **topologically reordered**: the `reorder_layers_topological()` pass detects overlapping layers where `max_z[i] > min_z[i+1]` and merges them when the overlap is between 0.5× and 3× layer height. This produces monotone print ordering even on strongly deformed models.
 
 ### 3.4 S3 Curved Layer
 
@@ -476,13 +499,18 @@ After slicing produces `Vec<Layer>`, toolpaths are generated per-layer.
 
 For non-planar layers, wall loop points are post-projected onto the original mesh surface using `MeshRayCaster::project_z()` after the 2D offset is computed — this corrects the Z values which would otherwise be approximated from boundary point interpolation.
 
-### Infill (`toolpath_patterns.rs`)
-- **Rectilinear** — alternating horizontal/vertical lines
-- **Zigzag** — single connected zigzag path
-- **Concentric** — shrinking copies of the outer contour
-- **Spiral** — continuous Archimedean spiral
+### Contour Order Optimization (`toolpath.rs`)
+Before generating toolpaths for each layer, contours are reordered using a greedy nearest-neighbor algorithm: starting from the last print position (or origin for the first layer), pick the contour whose first point is closest in XY distance, print it, and repeat. This reduces total travel distance and minimizes travel over already-printed features.
 
-Infill density is the line spacing as a fraction of the bounding box.
+### Infill (`toolpath_patterns.rs`)
+- **Rectilinear** — alternating horizontal/vertical lines (default)
+- **Grid** — cross-hatching at 0° and 90° on alternating layers
+- **Triangles** — cross-hatching at 0°, 60°, and 120° on alternating layers
+- **Concentric** — shrinking copies of the outer contour
+- **Gyroid** — sine-wave pattern approximating TPMS gyroid geometry; alternates X and Y wave directions between layers
+- **Adaptive Cubic** — cubic grid pattern with 3-layer rotation cycle (0°/60°/120°) for isotropic strength
+
+Infill density is the line spacing as a fraction of the bounding box. All patterns support mesh-mapped Z projection for curved layers.
 
 ### Mesh-Mapped Z Projection (`MeshRayCaster`)
 A 2D spatial bin grid (64×64 default) indexes all mesh triangles by XY bounding box. For any XY query point, a vertical ray is cast and the hit with Z nearest to the layer's nominal Z is returned (correctly handles multi-shell objects).
@@ -534,8 +562,14 @@ Inward cone (sign = +1):
 ```
 where α is the cone angle, r = sqrt(dx²+dy²), and (dx, dy) = point center relative to cone axis.
 
-### Travel Z-Lift (`apply_travel_lifts` in `app.rs`)
-For travel moves (extrusion ≈ 0) with XY distance ≥ 1 mm, the destination Z is raised to `max(Z, last_extrude_z + lift)`. Default lift = 2 mm, configurable in the "Rotary Axes & Collision Avoidance" panel.
+### Travel Z-Lift — HeightMap-Aware (`apply_travel_lifts` in `app.rs`)
+For travel moves (extrusion ≈ 0) with XY distance ≥ 1 mm, a `HeightMap` tracks the maximum deposited Z at every XY location using a 2D grid (cell size = `nozzle_diameter × 3`, clamped to [2.0, 10.0] mm). As extrusion segments are encountered in print order, the HeightMap is updated with `update_circle(x, y, z, bead_r)`.
+
+For each travel, the HeightMap is sampled along the XY travel corridor using `max_z_along_line()` (walking in cell-sized steps). The travel destination Z is raised to:
+```
+lifted_z = max(seg.z, corridor_max_z + travel_z_lift)
+```
+This replaces the previous `max(seg.z, last_extrude_z + lift)` — the nozzle now clears tall features along the travel path, not just the last extrusion height.
 
 Additionally, a **non-extruding descent segment** is inserted before the first extrusion segment that follows a lifted travel. This clone of the extrusion segment has `extrusion = 0.0` so the nozzle descends to contact height without depositing material, then the actual extrusion begins.
 
@@ -545,6 +579,47 @@ Note: the current implementation does not insert an explicit Z-only departure mo
 After toolpaths are generated, each segment's capsule (body_height tall, along the tool orientation from the nozzle tip) is tested against the full unprinted mesh. If a collision is detected, the orientation is swept radially outward from 0° to `max_tilt_deg` in 5° steps until a clear orientation is found.
 
 **Key behaviour:** If no tilt angle clears the mesh (common at the bottom of a print, where the capsule is necessarily inside the mesh interior), the original slicing-direction orientation is kept. The new orientation is only committed when `found_clear == true`. This prevents the bottom layers from being forced to max-tilt (90°) which would drive the nozzle into the build plate.
+
+**Look-ahead scoring** (`look_ahead_window`, default 3, range 1–5): For each candidate `(theta, phi)`, the scoring function also checks angular distance to segments `i+1` through `i+k`. Candidates that create large angular jumps to future orientations are penalized:
+```
+penalty = sum over j in i+1..i+k of:
+  max(0, angle(candidate, orient[j]) - 15°/mm × dist(i,j))
+```
+The penalty is weighted at 0.5× relative to collision clearance.
+
+### Orientation Smoothing (`smooth_toolpath_orientations` in `app.rs`)
+After collision avoidance, a bidirectional SLERP smoothing pass limits angular velocity between consecutive extrusion segments. Configurable `orientation_smoothing_rate` (default 15.0°/mm, range 1–45):
+
+1. **Forward pass:** For each consecutive pair, if `actual_angle > rate_rad × distance`, SLERP orient[i+1] toward orient[i] by `max_angle / actual_angle`.
+2. **Backward pass:** Same, iterating last→first.
+3. **Merge:** Average forward and backward results via midpoint SLERP.
+
+Uses `nalgebra::UnitQuaternion` for SLERP operations. Enabled by default.
+
+### Singularity Avoidance (`singularity.rs` + `app.rs`)
+For AB axes: `manipulability = |sin(A)|`. For BC axes: `manipulability = |sin(B)|`. Singular when manipulability < `singularity_threshold` (default 0.1, range 0.01–0.5). When enabled, adds a penalty to the orientation scoring in collision avoidance:
+```
+singularity_penalty = max(0, threshold - manipulability) × 10.0
+```
+Biases the optimizer away from gimbal-lock configurations. Disabled by default.
+
+### Graph-Based Path Planning (`motion_planning/graph_search.rs`)
+Dijkstra over a segment-orientation graph for globally optimal orientation sequences. Nodes are `(segment_index, candidate_index)`, edges are transitions between consecutive segments with weight = `angular_distance + collision_penalty`. Returns the optimal candidate index for each segment.
+
+### Pipeline Order
+```
+generate_toolpaths():
+  1. ToolpathGenerator::generate()
+     └─ optimize_contour_order()                  (nearest-neighbor reordering)
+  2. apply_conical_orientations()
+  3. apply_surface_normal_orientations()
+  4. optimize_toolpath_orientations_for_mesh()     (collision avoidance + look-ahead)
+  5. apply_tilt_collision_avoidance()
+  6. smooth_toolpath_orientations()                (bidirectional SLERP)
+  7. apply_travel_lifts()                          (HeightMap-aware)
+  8. generate_supports()                           (if enabled)
+  9. compute_all_collisions()
+```
 
 ---
 
@@ -674,7 +749,7 @@ Dark theme with custom accent colors applied to egui's `Visuals`.
 | `mesh` | `mesh.rs` | `Mesh` struct, STL I/O, bounding box computation |
 | `slicing` | `slicing.rs` | Planar slicer, `Layer`, `SlicingConfig` |
 | `toolpath` | `toolpath.rs` | `ToolpathGenerator`, wall loops, infill dispatch |
-| `toolpath_patterns` | `toolpath_patterns.rs` | Rectilinear, zigzag, concentric, spiral infill |
+| `toolpath_patterns` | `toolpath_patterns.rs` | Rectilinear, grid, triangles, concentric, gyroid, adaptive cubic infill |
 | `contour_offset` | `contour_offset.rs` | 2D polygon inset for perimeters |
 | `gcode` | `gcode.rs` | `GCodeGenerator`, `MachineKinematics`, TCP compensation |
 | `geodesic` | `geodesic.rs` | Full geodesic pipeline, all diffusion modes, CG solver |
@@ -696,7 +771,9 @@ Dark theme with custom accent colors applied to egui's `Visuals`.
 | `s3_slicer::tet_scalar_field` | `s3_slicer/tet_scalar_field.rs` | Volume scalar field with Laplacian smoothing |
 | `s3_slicer::isotropic_remesh` | `s3_slicer/isotropic_remesh.rs` | Botsch & Kobbelt 2004 (legacy, not primary) |
 | `motion_planning::collision` | `motion_planning/collision.rs` | Capsule-vs-mesh collision, platform AABB |
-| `motion_planning::graph_search` | `motion_planning/graph_search.rs` | Graph-based path planning |
+| `motion_planning::graph_search` | `motion_planning/graph_search.rs` | Dijkstra graph-based path planner |
+| `motion_planning::singularity` | `motion_planning/singularity.rs` | Singularity avoidance, manipulability computation |
+| `motion_planning::variable_filament` | `motion_planning/variable_filament.rs` | Variable filament utilities |
 | `support_generation::overhang_detection` | `support_generation/overhang_detection.rs` | Overhang angle classification |
 | `support_generation::tree_skeleton` | `support_generation/tree_skeleton.rs` | Tree support structure generation |
 | `gui::app` | `gui/app.rs` | `SlicerApp`, background thread dispatch, surface normals, travel lift |
@@ -712,16 +789,19 @@ Dark theme with custom accent colors applied to egui's `Visuals`.
 
 Run with: `cargo test --lib`
 
-**Passing: 113** (3 pre-existing failures unrelated to current work)
+**Passing: 122** (3 pre-existing failures unrelated to current work)
 
 | Module | Tests |
 |---|---|
 | `geodesic` | 6 — CG solver, topology welding, boundary detection, distance field, level sets |
 | `contour_offset` | polygon inset correctness |
-| `toolpath` | wall loop and infill generation |
+| `toolpath` | wall loop and infill generation, contour reordering |
+| `toolpath_patterns` | infill pattern generation (all 6 patterns) |
 | `voxel_remesh` | SDF construction, MC output, manifold check |
 | `tet_mesh` | TetGen integration, grid fallback |
 | `tet_asap_deformation` | SVD deformation, inversion detection |
+| `tet_dijkstra_field` | base tet detection, distance computation, gradient normalization |
+| `ruled_surface` | ruled surface detection and transition path generation |
 | `motion_planning::collision` | platform hit, platform miss, mesh hit, mesh miss |
 
 **Pre-existing failures (not caused by current work):**

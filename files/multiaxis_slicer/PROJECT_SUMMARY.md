@@ -25,10 +25,11 @@ A fully-implemented Rust slicer for multi-axis non-planar 3D printing. All major
 - **Mesh loading** — STL (ASCII and binary), bounds computation, triangle adjacency
 - **Voxel reconstruction** — SDF + Marching Cubes repairs self-intersecting meshes in 2–5 seconds
 - **Tetrahedral mesh generation** — TetGen (via `tritet`) with 4-strategy cascade: direct, voxel reconstruction, vertex clustering, convex hull
-- **Toolpath generation** — wall loops (contour offset), rectilinear infill, adaptive layer height
+- **Toolpath generation** — wall loops (contour offset), 6 infill patterns (Rectilinear, Grid, Triangles, Concentric, Gyroid, Adaptive Cubic), adaptive layer height, nearest-neighbor contour reordering
 - **MeshRayCaster** — 2D bin grid + vertical ray casting; projects wall loop and infill Z onto the actual mesh surface for curved layers
 - **Coverage gap fill** — slope-adaptive scanline insertion fills 3D coverage gaps where infill spacing exceeds 2× nominal on steep surfaces
 - **Wall seam transitions** — ruled-surface zigzag path between consecutive curved layer contours; fills staircase gap on the outer wall
+- **Collision avoidance pipeline** — HeightMap-aware travel Z-lift (samples deposited material along travel corridor), bidirectional SLERP orientation smoothing (configurable angular rate), look-ahead window for collision scoring, Dijkstra graph-based path planner, singularity avoidance penalty
 - **5-axis G-code** — A/B or B/C rotary axis output with TCP (tool-centre-point) compensation
 - **Capsule collision detection** — parry3d capsule vs mesh triangles with AABB pre-filter
 - **Conical floating-contour filter** — 2D per-XY bin grid; defers unsupported contours until the bed below is printed
@@ -42,6 +43,12 @@ A fully-implemented Rust slicer for multi-axis non-planar 3D printing. All major
 ### S4 Non-Planar — Key Details
 
 - **Z-biased Dijkstra** (`tet_dijkstra_field.rs`): edge weight = `|ΔZ| × z_bias + Euclidean × (1 − z_bias)`. Prevents topologically-close features (e.g. two ears of the Stanford Bunny) from merging onto the same layer because they have the same graph path length.
+- **Auto z_bias**: computes optimal z_bias from mesh aspect ratio: `z_bias = (0.5 + 0.45 × (aspect_ratio / 1.5).min(1.0)).min(0.95)`. Tall narrow meshes get higher bias (~0.95), flat meshes get lower bias (~0.5). Enabled by default; can be overridden with manual slider.
+- **Multi-axis overhang detection**: 2-cluster axis normalization. Clusters overhangs by axis direction (dot product similarity), keeps top 2 clusters if sufficiently different (dot < 0.8), normalizes within each cluster. Off by default; enable for models with overhangs in multiple directions.
+- **ASAP deformation toggle**: choose between fast direct vertex rotation (default, simpler/more robust) and full TetAsapSolver deformation (smoother results but can cause mesh collapse on complex models).
+- **Configurable thresholds**: base tet detection (1–20% of mesh height, default 5%), edge filter multiplier (5–30×, default 15×), jump-split threshold (5–30× layer height, default 10×).
+- **Topological layer ordering**: after z-sorting untransformed layers, detects overlapping layers where max_z[i] > min_z[i+1] and merges them when overlap is between 0.5× and 3× layer height.
+- **Rayon parallelization**: gradient computation in Dijkstra field and per-layer untransform processing use `par_iter()` with atomic counters.
 - **Support-Free Preset**: z_bias=0.85, overhang_threshold=35°, max_rotation_degrees=35°, smoothing_iterations=40, smoothness_weight=0.6
 - **Quality check**: if ASAP deformation produces >30% inverted tets or >5× bounding-box growth, the pipeline silently falls back to VirtualScalarField
 
@@ -59,7 +66,7 @@ A fully-implemented Rust slicer for multi-axis non-planar 3D printing. All major
 
 - **Language**: Rust (stable 1.75+)
 - **Build target**: `cargo run --bin gui --release`
-- **Test count**: 113 passing, 3 pre-existing failures (unrelated to current features)
+- **Test count**: 122 passing, 3 pre-existing failures (unrelated to current features)
 - **Key source files**: ~25 `.rs` files in `src/`, ~15 in `src/s3_slicer/`, ~7 in `src/gui/`
 
 ---
@@ -98,7 +105,10 @@ files/multiaxis_slicer/
 │   │   ├── tet_scalar_field.rs  Per-vertex scalar field, Laplacian smoothing
 │   │   └── isotropic_remesh.rs  Legacy isotropic remeshing (no longer active path)
 │   ├── motion_planning/
-│   │   └── collision.rs         check_collision_with_mesh() — capsule vs triangles (parry3d)
+│   │   ├── collision.rs         check_collision_with_mesh() — capsule vs triangles (parry3d)
+│   │   ├── graph_search.rs      Dijkstra graph-based path planner
+│   │   ├── singularity.rs       Singularity avoidance (manipulability penalty)
+│   │   └── variable_filament.rs Variable filament utilities
 │   ├── support_generation/
 │   │   ├── overhang_detection.rs
 │   │   ├── tree_skeleton.rs
