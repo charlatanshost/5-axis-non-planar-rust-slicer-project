@@ -807,26 +807,33 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                         ui.label("Infill pattern:");
                         use crate::toolpath_patterns::InfillPattern;
                         egui::ComboBox::from_id_salt("infill_pattern")
-                            .selected_text(match app.infill_pattern {
-                                InfillPattern::Rectilinear => "Rectilinear",
-                            })
+                            .selected_text(app.infill_pattern.name())
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut app.infill_pattern, InfillPattern::Rectilinear, "Rectilinear")
                                     .on_hover_text("Alternating-direction horizontal lines");
+                                ui.selectable_value(&mut app.infill_pattern, InfillPattern::Grid, "Grid")
+                                    .on_hover_text("Two perpendicular sets of lines (0° + 90°)\nStronger than rectilinear in both directions");
+                                ui.selectable_value(&mut app.infill_pattern, InfillPattern::Triangles, "Triangles")
+                                    .on_hover_text("Three sets of lines at 0°/60°/120°\nBest isotropic strength — equal in all directions");
+                                ui.selectable_value(&mut app.infill_pattern, InfillPattern::Concentric, "Concentric")
+                                    .on_hover_text("Inward offsets of the boundary contour\nNaturally follows surface curvature — ideal for geodesic layers");
+                                ui.selectable_value(&mut app.infill_pattern, InfillPattern::Gyroid, "Gyroid")
+                                    .on_hover_text("Sinusoidal wave pattern\nGood strength-to-weight ratio, continuous extrusion paths");
+                                ui.selectable_value(&mut app.infill_pattern, InfillPattern::AdaptiveCubic, "Adaptive Cubic")
+                                    .on_hover_text("Grid pattern with adaptive density — dense near walls,\nsparser in the interior. Saves material on larger parts");
                             });
                     });
                 }
 
-                // Force-infill override for curved/surface modes
-                let is_curved_mode = matches!(
+                // Force-infill override for coordinate-transform modes (geodesic has infill by default)
+                let is_coord_transform_mode = matches!(
                     app.slicing_mode,
-                    crate::gui::app::SlicingMode::Geodesic
-                    | crate::gui::app::SlicingMode::CoordTransformCylindrical
+                    crate::gui::app::SlicingMode::CoordTransformCylindrical
                     | crate::gui::app::SlicingMode::CoordTransformSpherical
                 );
-                if is_curved_mode {
+                if is_coord_transform_mode {
                     ui.checkbox(&mut app.force_nonplanar_infill, "Force infill on curved layers")
-                        .on_hover_text("Enable XY scanline infill for surface-following modes.\nInfill Z is interpolated from the contour (IDW).\nWorks best on roughly-horizontal layers.\nMay print in air on highly curved geometry — use with care.");
+                        .on_hover_text("Enable XY scanline infill for coordinate-transform modes.\nInfill Z is interpolated from the contour (IDW).\nWorks best on roughly-horizontal layers.\nMay print in air on highly curved geometry — use with care.");
                 }
 
                 // Wall seam transitions: ruled-surface zigzag bridging consecutive curved layers

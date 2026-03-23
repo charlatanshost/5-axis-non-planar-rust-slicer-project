@@ -2882,21 +2882,19 @@ impl SlicerApp {
             self.toolpath_pattern.name(), self.layers.len(), total_contours));
 
         use crate::toolpath_patterns::ToolpathConfig;
-        // Geodesic and coordinate-transform contours are 3D surface curves whose XY projection
-        // covers the full cross-section — naive scanline infill may penetrate the shell.
-        // The user can override this with force_nonplanar_infill (uses IDW Z interpolation).
+        // Geodesic mode: infill is enabled by default with mesh raycaster for accurate Z.
+        // Coordinate-transform modes still skip infill unless forced (no analytic back-transform
+        // and raycaster Z would corrupt their coordinate-transformed paths).
         let skip_infill = matches!(
             self.slicing_mode,
-            SlicingMode::Geodesic
-            | SlicingMode::CoordTransformCylindrical
+            SlicingMode::CoordTransformCylindrical
             | SlicingMode::CoordTransformSpherical
         ) && !self.force_nonplanar_infill;
-        // Mesh ray-cast Z projection is only geometrically correct for geodesic slicing, where
-        // the toolpath should lie on the mesh surface.  All transform-based methods (conical, S4,
-        // cylindrical, spherical, S3) compute their own Z via back-transforms; using the raw mesh
-        // surface Z would corrupt those paths.
-        let use_mesh_raycaster = self.force_nonplanar_infill
-            && matches!(self.slicing_mode, SlicingMode::Geodesic);
+        // Mesh ray-cast Z projection is always used for geodesic slicing — the toolpath should
+        // lie on the mesh surface and there's no analytic formula.  Must NOT be enabled for
+        // transform-based methods (conical, S4, cylindrical, spherical) whose Z comes from
+        // back-transforms.
+        let use_mesh_raycaster = matches!(self.slicing_mode, SlicingMode::Geodesic);
 
         // For conical mode, provide the analytic back-transform formula so the toolpath
         // generator can compute exact Z values for every infill and wall-loop point.

@@ -237,11 +237,10 @@ impl ToolpathGenerator {
     ) {
         use crate::contour_offset::generate_wall_loops;
 
-        // For geodesic / coordinate-transform modes (skip_infill=true), 2D inward offset doesn't
-        // make sense for 3D surface curves: the XY projection of a surface contour is often
-        // concave or non-convex, and the offset can push vertices outside the actual mesh boundary,
-        // creating stray extrusion paths visible in the toolpath view.
-        // In these modes just extrude the original contours directly.
+        // For coordinate-transform modes (skip_infill=true), 2D inward offset doesn't make sense
+        // for 3D surface curves: the XY projection is often non-convex and the offset can push
+        // vertices outside the mesh boundary. In these modes just extrude original contours.
+        // (Geodesic mode now uses mesh raycaster for accurate Z on walls and infill.)
         if self.pattern_config.skip_infill {
             for contour in &layer.contours {
                 if contour.points.len() >= 2 {
@@ -261,10 +260,10 @@ impl ToolpathGenerator {
         });
 
         // Build raycaster once per layer (64×64 bin grid, ~2–5 ms on typical meshes).
-        // ONLY when use_mesh_raycaster is explicitly enabled — this flag is correct only for
-        // geodesic force-infill.  Conical / S4 / cylindrical / spherical paths have their own
-        // geometrically-correct Z from back-transforms; applying mesh surface Z here would corrupt them.
-        let raycaster_storage: Option<MeshRayCaster> = if has_curved_z_layer && self.pattern_config.use_mesh_raycaster {
+        // For geodesic mode (use_mesh_raycaster=true), always build — even near-flat geodesic
+        // layers sit on the mesh surface and need accurate Z projection for walls and infill.
+        // For other modes with curved Z, the raycaster is not used (they have their own Z).
+        let raycaster_storage: Option<MeshRayCaster> = if self.pattern_config.use_mesh_raycaster {
             mesh.map(|m| MeshRayCaster::new(m, 64))
         } else {
             None

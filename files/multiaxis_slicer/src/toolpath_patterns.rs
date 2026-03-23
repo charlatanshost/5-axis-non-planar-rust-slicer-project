@@ -22,6 +22,29 @@ pub enum ToolpathPattern {
 pub enum InfillPattern {
     /// Alternating-direction parallel lines (rectilinear)
     Rectilinear,
+    /// Two perpendicular sets of lines (0° + 90°)
+    Grid,
+    /// Three sets of lines at 0°/60°/120° for isotropic strength
+    Triangles,
+    /// Inward offsets of the boundary contour
+    Concentric,
+    /// Sinusoidal wave pattern — continuous extrusion, good strength-to-weight
+    Gyroid,
+    /// Low density interior, high density near walls
+    AdaptiveCubic,
+}
+
+impl InfillPattern {
+    pub fn name(&self) -> &'static str {
+        match self {
+            InfillPattern::Rectilinear => "Rectilinear",
+            InfillPattern::Grid => "Grid",
+            InfillPattern::Triangles => "Triangles",
+            InfillPattern::Concentric => "Concentric",
+            InfillPattern::Gyroid => "Gyroid",
+            InfillPattern::AdaptiveCubic => "Adaptive Cubic",
+        }
+    }
 }
 
 impl ToolpathPattern {
@@ -530,6 +553,377 @@ fn scanline_x_at_y(pts: &[Point3D], closed: bool, y: f64) -> Vec<f64> {
     xs
 }
 
+// ─── Rotated scanline helper ──────────────────────────────────────────────────
+
+/// Generate scanlines at a given angle (radians), clipped to the boundary contour.
+/// Rotates the boundary into a frame where the scanlines are horizontal, generates
+/// scanlines, then rotates back. Reuses the same emit + clip logic as rectilinear.
+fn generate_rotated_scanlines(
+    boundary: &Contour,
+    outer_boundary: Option<&Contour>,
+    config: &ToolpathConfig,
+    layer_z: f64,
+    angle_rad: f64,
+    compute_z: &dyn Fn(f64, f64) -> f64,
+) -> Vec<Vec<Point3D>> {
+    let pts = &boundary.points;
+    if pts.len() < 3 { return Vec::new(); }
+
+    let cos_a = angle_rad.cos();
+    let sin_a = angle_rad.sin();
+
+    // Rotate boundary into scanline-aligned frame
+    let rotated: Vec<Point3D> = pts.iter()
+        .map(|p| Point3D::new(p.x * cos_a + p.y * sin_a, -p.x * sin_a + p.y * cos_a, p.z))
+        .collect();
+
+    let rotated_outer: Option<Vec<Point3D>> = outer_boundary.map(|ob| {
+        ob.points.iter()
+            .map(|p| Point3D::new(p.x * cos_a + p.y * sin_a, -p.x * sin_a + p.y * cos_a, p.z))
+            .collect()
+    });
+
+    let (_, _, min_y, max_y) = calculate_bounds(&rotated);
+    let line_spacing = config.line_width / config.infill_density;
+    let margin = config.line_width * 0.1;
+
+    let mut lines: Vec<Vec<Point3D>> = Vec::new();
+    let mut direction_forward = true;
+    let mut y = min_y + line_spacing / 2.0;
+
+    while y < max_y {
+        let inner_xs = scanline_x_at_y(&rotated, true, y);
+        let outer_xs: Vec<f64> = match &rotated_outer {
+            Some(ro) => scanline_x_at_y(ro, true, y),
+            None => Vec::new(),
+        };
+
+        let mut ii = 0;
+        while ii + 1 < inner_xs.len() {
+            let xi_s = inner_xs[ii] + margin;
+            let xi_e = inner_xs[ii + 1] - margin;
+
+            let pairs: Vec<(f64, f64)> = if outer_xs.len() >= 2 {
+                let mut p = Vec::new();
+                let mut oi = 0;
+                while oi + 1 < outer_xs.len() {
+                    let x_start = xi_s.max(outer_xs[oi] + margin);
+                    let x_end = xi_e.min(outer_xs[oi + 1] - margin);
+                    if x_end > x_start + config.line_width {
+                        p.push((x_start, x_end));
+                    }
+                    oi += 2;
+                }
+                p
+            } else if xi_e > xi_s + config.line_width {
+                vec![(xi_s, xi_e)]
+            } else {
+                Vec::new()
+            };
+
+            for (x_start, x_end) in pairs {
+                let mut line_pts = Vec::new();
+                let step = config.node_distance;
+                if direction_forward {
+                    let mut x = x_start;
+                    while x <= x_end {
+                        // Rotate back to world space
+                        let wx = x * cos_a - y * sin_a;
+                        let wy = x * sin_a + y * cos_a;
+                        line_pts.push(Point3D::new(wx, wy, compute_z(wx, wy)));
+                        x += step;
+                    }
+                    let wx = x_end * cos_a - y * sin_a;
+                    let wy = x_end * sin_a + y * cos_a;
+                    if line_pts.last().map(|p| ((wx - p.x).powi(2) + (wy - p.y).powi(2)).sqrt() > step * 0.3).unwrap_or(true) {
+                        line_pts.push(Point3D::new(wx, wy, compute_z(wx, wy)));
+                    }
+                } else {
+                    let mut x = x_end;
+                    while x >= x_start {
+                        let wx = x * cos_a - y * sin_a;
+                        let wy = x * sin_a + y * cos_a;
+                        line_pts.push(Point3D::new(wx, wy, compute_z(wx, wy)));
+                        x -= step;
+                    }
+                    let wx = x_start * cos_a - y * sin_a;
+                    let wy = x_start * sin_a + y * cos_a;
+                    if line_pts.last().map(|p| ((wx - p.x).powi(2) + (wy - p.y).powi(2)).sqrt() > step * 0.3).unwrap_or(true) {
+                        line_pts.push(Point3D::new(wx, wy, compute_z(wx, wy)));
+                    }
+                }
+                if line_pts.len() >= 2 {
+                    lines.push(line_pts);
+                }
+            }
+
+            ii += 2;
+        }
+        direction_forward = !direction_forward;
+        y += line_spacing;
+    }
+    lines
+}
+
+// ─── Concentric infill ───────────────────────────────────────────────────────
+
+/// Generate concentric infill by repeatedly offsetting the boundary contour inward.
+fn generate_concentric_infill(
+    boundary: &Contour,
+    config: &ToolpathConfig,
+    compute_z: &dyn Fn(f64, f64) -> f64,
+) -> Vec<Vec<Point3D>> {
+    use crate::contour_offset::offset_contour;
+
+    let line_spacing = config.line_width / config.infill_density;
+    let mut lines: Vec<Vec<Point3D>> = Vec::new();
+    let mut current = boundary.clone();
+    let mut offset = line_spacing;
+
+    loop {
+        match offset_contour(&current, offset) {
+            Some(ring) if ring.points.len() >= 3 => {
+                // Project Z for each point
+                let projected: Vec<Point3D> = ring.points.iter()
+                    .map(|p| Point3D::new(p.x, p.y, compute_z(p.x, p.y)))
+                    .collect();
+                lines.push(projected);
+                // Continue offsetting from the original boundary (not the result)
+                // to avoid cumulative offset errors
+                offset += line_spacing;
+            }
+            _ => break,
+        }
+    }
+    lines
+}
+
+// ─── Gyroid infill ───────────────────────────────────────────────────────────
+
+/// Generate gyroid-inspired infill: sinusoidal wave paths clipped to the boundary.
+/// Approximates a gyroid cross-section with sin(x) + sin(y) = 0 isolines.
+fn generate_gyroid_infill(
+    boundary: &Contour,
+    outer_boundary: Option<&Contour>,
+    config: &ToolpathConfig,
+    layer_z: f64,
+    compute_z: &dyn Fn(f64, f64) -> f64,
+) -> Vec<Vec<Point3D>> {
+    let pts = &boundary.points;
+    if pts.len() < 3 { return Vec::new(); }
+
+    let (min_x, max_x, min_y, max_y) = calculate_bounds(pts);
+    let line_spacing = config.line_width / config.infill_density;
+    // Gyroid period = line_spacing * 2 (two waves per period)
+    let period = line_spacing * 2.0;
+    let amplitude = line_spacing / 2.0;
+    let step = config.node_distance.min(period / 16.0); // At least 16 samples per period
+
+    let mut lines: Vec<Vec<Point3D>> = Vec::new();
+
+    // Generate horizontal waves: for each Y band, trace a sinusoidal path
+    let mut y = min_y + line_spacing / 2.0;
+    let mut wave_idx = 0usize;
+    while y < max_y {
+        let mut line_pts: Vec<Point3D> = Vec::new();
+        let mut x = min_x;
+
+        // Phase shift alternates per row for interlocking
+        let phase = if wave_idx % 2 == 0 { 0.0 } else { std::f64::consts::PI };
+
+        while x <= max_x {
+            let wave_y = y + amplitude * (2.0 * std::f64::consts::PI * x / period + phase).sin();
+            let pt = Point3D::new(x, wave_y, 0.0);
+
+            if is_point_in_contour(&pt, boundary) {
+                let skip = outer_boundary.map(|ob| !is_point_in_contour(&pt, ob)).unwrap_or(false);
+                if !skip {
+                    line_pts.push(Point3D::new(x, wave_y, compute_z(x, wave_y)));
+                } else if line_pts.len() >= 2 {
+                    lines.push(std::mem::take(&mut line_pts));
+                } else {
+                    line_pts.clear();
+                }
+            } else if line_pts.len() >= 2 {
+                lines.push(std::mem::take(&mut line_pts));
+            } else {
+                line_pts.clear();
+            }
+
+            x += step;
+        }
+        if line_pts.len() >= 2 {
+            lines.push(line_pts);
+        }
+
+        y += line_spacing;
+        wave_idx += 1;
+    }
+    lines
+}
+
+// ─── Adaptive Cubic infill ───────────────────────────────────────────────────
+
+/// Generate adaptive cubic infill: denser near walls, sparser in the interior.
+/// Uses a grid pattern where lines closer to the boundary are at full density
+/// and lines far from the boundary are at reduced density (every 2nd or 4th line skipped).
+fn generate_adaptive_cubic_infill(
+    boundary: &Contour,
+    outer_boundary: Option<&Contour>,
+    config: &ToolpathConfig,
+    layer_z: f64,
+    compute_z: &dyn Fn(f64, f64) -> f64,
+) -> Vec<Vec<Point3D>> {
+    let pts = &boundary.points;
+    if pts.len() < 3 { return Vec::new(); }
+
+    let (min_x, max_x, min_y, max_y) = calculate_bounds(pts);
+    let base_spacing = config.line_width / config.infill_density;
+    // Dense zone = 3× line_width from the boundary
+    let dense_margin = config.line_width * 3.0;
+    let margin = config.line_width * 0.1;
+
+    // Distance from point to nearest boundary edge (XY only)
+    let dist_to_boundary = |x: f64, y: f64| -> f64 {
+        let n = pts.len();
+        let mut best = f64::MAX;
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let (ax, ay) = (pts[i].x, pts[i].y);
+            let (bx, by) = (pts[j].x, pts[j].y);
+            let dx = bx - ax;
+            let dy = by - ay;
+            let len2 = dx * dx + dy * dy;
+            if len2 < 1e-12 { continue; }
+            let t = ((x - ax) * dx + (y - ay) * dy) / len2;
+            let t = t.clamp(0.0, 1.0);
+            let cx = ax + t * dx;
+            let cy = ay + t * dy;
+            let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+            if d < best { best = d; }
+        }
+        best
+    };
+
+    let mut lines: Vec<Vec<Point3D>> = Vec::new();
+
+    // Generate lines in two directions (0° and 90°) like Grid, but skip interior lines
+    for angle_idx in 0..2 {
+        let angle_rad = if angle_idx == 0 { 0.0 } else { std::f64::consts::FRAC_PI_2 };
+        let cos_a = angle_rad.cos();
+        let sin_a = angle_rad.sin();
+
+        let rotated: Vec<Point3D> = pts.iter()
+            .map(|p| Point3D::new(p.x * cos_a + p.y * sin_a, -p.x * sin_a + p.y * cos_a, p.z))
+            .collect();
+        let rotated_outer: Option<Vec<Point3D>> = outer_boundary.map(|ob| {
+            ob.points.iter()
+                .map(|p| Point3D::new(p.x * cos_a + p.y * sin_a, -p.x * sin_a + p.y * cos_a, p.z))
+                .collect()
+        });
+
+        let (_, _, r_min_y, r_max_y) = calculate_bounds(&rotated);
+
+        // Use finest spacing (base_spacing) but skip lines in interior
+        let fine_spacing = base_spacing;
+        let mut y = r_min_y + fine_spacing / 2.0;
+        let mut line_idx = 0usize;
+        let mut direction_forward = angle_idx == 0;
+
+        while y < r_max_y {
+            // Check if the midpoint of this scanline is near the boundary
+            let inner_xs = scanline_x_at_y(&rotated, true, y);
+            if inner_xs.len() >= 2 {
+                let mid_rx = (inner_xs[0] + inner_xs[inner_xs.len() - 1]) / 2.0;
+                let mid_wx = mid_rx * cos_a - y * sin_a;
+                let mid_wy = mid_rx * sin_a + y * cos_a;
+                let dist = dist_to_boundary(mid_wx, mid_wy);
+
+                // Adaptive skip: near boundary → every line; mid → every 2nd; far → every 4th
+                let keep = if dist < dense_margin {
+                    true
+                } else if dist < dense_margin * 3.0 {
+                    line_idx % 2 == 0
+                } else {
+                    line_idx % 4 == 0
+                };
+
+                if keep {
+                    let outer_xs: Vec<f64> = match &rotated_outer {
+                        Some(ro) => scanline_x_at_y(ro, true, y),
+                        None => Vec::new(),
+                    };
+
+                    let mut ii = 0;
+                    while ii + 1 < inner_xs.len() {
+                        let xi_s = inner_xs[ii] + margin;
+                        let xi_e = inner_xs[ii + 1] - margin;
+
+                        let pairs: Vec<(f64, f64)> = if outer_xs.len() >= 2 {
+                            let mut p = Vec::new();
+                            let mut oi = 0;
+                            while oi + 1 < outer_xs.len() {
+                                let x_start = xi_s.max(outer_xs[oi] + margin);
+                                let x_end = xi_e.min(outer_xs[oi + 1] - margin);
+                                if x_end > x_start + config.line_width {
+                                    p.push((x_start, x_end));
+                                }
+                                oi += 2;
+                            }
+                            p
+                        } else if xi_e > xi_s + config.line_width {
+                            vec![(xi_s, xi_e)]
+                        } else {
+                            Vec::new()
+                        };
+
+                        for (x_start, x_end) in pairs {
+                            let mut line_pts = Vec::new();
+                            let step = config.node_distance;
+                            if direction_forward {
+                                let mut x = x_start;
+                                while x <= x_end {
+                                    let wx = x * cos_a - y * sin_a;
+                                    let wy = x * sin_a + y * cos_a;
+                                    line_pts.push(Point3D::new(wx, wy, compute_z(wx, wy)));
+                                    x += step;
+                                }
+                                let wx = x_end * cos_a - y * sin_a;
+                                let wy = x_end * sin_a + y * cos_a;
+                                if line_pts.last().map(|p| ((wx - p.x).powi(2) + (wy - p.y).powi(2)).sqrt() > step * 0.3).unwrap_or(true) {
+                                    line_pts.push(Point3D::new(wx, wy, compute_z(wx, wy)));
+                                }
+                            } else {
+                                let mut x = x_end;
+                                while x >= x_start {
+                                    let wx = x * cos_a - y * sin_a;
+                                    let wy = x * sin_a + y * cos_a;
+                                    line_pts.push(Point3D::new(wx, wy, compute_z(wx, wy)));
+                                    x -= step;
+                                }
+                                let wx = x_start * cos_a - y * sin_a;
+                                let wy = x_start * sin_a + y * cos_a;
+                                if line_pts.last().map(|p| ((wx - p.x).powi(2) + (wy - p.y).powi(2)).sqrt() > step * 0.3).unwrap_or(true) {
+                                    line_pts.push(Point3D::new(wx, wy, compute_z(wx, wy)));
+                                }
+                            }
+                            if line_pts.len() >= 2 {
+                                lines.push(line_pts);
+                            }
+                        }
+                        ii += 2;
+                    }
+                }
+            }
+
+            direction_forward = !direction_forward;
+            y += fine_spacing;
+            line_idx += 1;
+        }
+    }
+    lines
+}
+
 /// Generate infill lines clipped to the interior of a boundary contour.
 /// Uses scanline approach: horizontal lines at spacing, clipped to boundary edges.
 ///
@@ -612,55 +1006,72 @@ pub fn generate_clipped_infill(
         if pts_out.len() >= 2 { Some(pts_out) } else { None }
     };
 
-    let mut infill_lines: Vec<Vec<Point3D>> = Vec::new();
-    let mut direction_forward = true;
-
-    // Generate scanlines
-    let mut y = min_y + line_spacing / 2.0;
-    while y < max_y {
-        // Intersections with inner boundary (innermost wall loop)
-        let inner_xs = scanline_x_at_y(pts, true, y);
-
-        // Intersections with outer boundary (original contour) — used for dual-clipping.
-        // If no outer boundary, fall back to inner only.
-        let outer_xs: Vec<f64> = match outer_boundary {
-            Some(outer) => scanline_x_at_y(&outer.points, outer.closed, y),
-            None => Vec::new(),
-        };
-
-        let mut ii = 0;
-        while ii + 1 < inner_xs.len() {
-            let xi_s = inner_xs[ii] + margin;
-            let xi_e = inner_xs[ii + 1] - margin;
-
-            if outer_xs.len() >= 2 {
-                // Dual-clip: intersect the inner pair against every outer pair.
-                // For convex outer boundaries there is only one pair; non-convex boundaries
-                // may have multiple pairs (holes, concavities).
-                let mut oi = 0;
-                while oi + 1 < outer_xs.len() {
-                    let xo_s = outer_xs[oi] + margin;
-                    let xo_e = outer_xs[oi + 1] - margin;
-                    let x_start = xi_s.max(xo_s);
-                    let x_end   = xi_e.min(xo_e);
-                    if let Some(line) = emit_line(x_start, x_end, y, direction_forward, &compute_z) {
-                        infill_lines.push(line);
+    // Dispatch to pattern-specific generator
+    let mut infill_lines: Vec<Vec<Point3D>> = match config.infill_pattern {
+        InfillPattern::Rectilinear => {
+            let mut lines: Vec<Vec<Point3D>> = Vec::new();
+            let mut direction_forward = true;
+            let mut y = min_y + line_spacing / 2.0;
+            while y < max_y {
+                let inner_xs = scanline_x_at_y(pts, true, y);
+                let outer_xs: Vec<f64> = match outer_boundary {
+                    Some(outer) => scanline_x_at_y(&outer.points, outer.closed, y),
+                    None => Vec::new(),
+                };
+                let mut ii = 0;
+                while ii + 1 < inner_xs.len() {
+                    let xi_s = inner_xs[ii] + margin;
+                    let xi_e = inner_xs[ii + 1] - margin;
+                    if outer_xs.len() >= 2 {
+                        let mut oi = 0;
+                        while oi + 1 < outer_xs.len() {
+                            let xo_s = outer_xs[oi] + margin;
+                            let xo_e = outer_xs[oi + 1] - margin;
+                            let x_start = xi_s.max(xo_s);
+                            let x_end   = xi_e.min(xo_e);
+                            if let Some(line) = emit_line(x_start, x_end, y, direction_forward, &compute_z) {
+                                lines.push(line);
+                            }
+                            oi += 2;
+                        }
+                    } else {
+                        if let Some(line) = emit_line(xi_s, xi_e, y, direction_forward, &compute_z) {
+                            lines.push(line);
+                        }
                     }
-                    oi += 2;
+                    ii += 2;
                 }
-            } else {
-                // No outer boundary — clip to inner only (original behaviour)
-                if let Some(line) = emit_line(xi_s, xi_e, y, direction_forward, &compute_z) {
-                    infill_lines.push(line);
-                }
+                direction_forward = !direction_forward;
+                y += line_spacing;
             }
-
-            ii += 2;
+            lines
         }
-
-        direction_forward = !direction_forward;
-        y += line_spacing;
-    }
+        InfillPattern::Grid => {
+            // Two perpendicular sets of scanlines (0° and 90°)
+            let mut lines = generate_rotated_scanlines(boundary, outer_boundary, config, layer_z, 0.0, &compute_z);
+            lines.extend(generate_rotated_scanlines(boundary, outer_boundary, config, layer_z,
+                std::f64::consts::FRAC_PI_2, &compute_z));
+            lines
+        }
+        InfillPattern::Triangles => {
+            // Three sets of scanlines at 0°, 60°, 120°
+            let mut lines = generate_rotated_scanlines(boundary, outer_boundary, config, layer_z, 0.0, &compute_z);
+            lines.extend(generate_rotated_scanlines(boundary, outer_boundary, config, layer_z,
+                std::f64::consts::PI / 3.0, &compute_z));
+            lines.extend(generate_rotated_scanlines(boundary, outer_boundary, config, layer_z,
+                2.0 * std::f64::consts::PI / 3.0, &compute_z));
+            lines
+        }
+        InfillPattern::Concentric => {
+            generate_concentric_infill(boundary, config, &compute_z)
+        }
+        InfillPattern::Gyroid => {
+            generate_gyroid_infill(boundary, outer_boundary, config, layer_z, &compute_z)
+        }
+        InfillPattern::AdaptiveCubic => {
+            generate_adaptive_cubic_infill(boundary, outer_boundary, config, layer_z, &compute_z)
+        }
+    };
 
     // Coverage gap fill: insert midpoint scanlines where 3D slope creates gaps > 2× target.
     // Only runs when the mesh raycaster is available (curved layers).
