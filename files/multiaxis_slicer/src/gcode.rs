@@ -179,7 +179,7 @@ impl GCodeGenerator {
 
             for segment in &toolpath.paths {
                 let axis_angles = self.compute_axis_angles(&segment.orientation);
-                let pos = self.tcp_compensate(&segment.position, &axis_angles);
+                let pos = self.tcp_compensate(&segment.position, &segment.orientation);
                 let rot_str = self.format_all_axes(&axis_angles);
 
                 if segment.extrusion < 1e-8 {
@@ -277,7 +277,7 @@ impl GCodeGenerator {
         prev_angles: &[(String, f64)],
     ) -> io::Result<(crate::geometry::Point3D, Vec<(String, f64)>)> {
         let axis_angles = self.compute_axis_angles(&segment.orientation);
-        let pos = self.tcp_compensate(&segment.position, &axis_angles);
+        let pos = self.tcp_compensate(&segment.position, &segment.orientation);
         let rot_str = self.format_all_axes(&axis_angles);
 
         if segment.extrusion < 1e-8 {
@@ -431,41 +431,51 @@ impl GCodeGenerator {
     /// the head's pivot point.  When the head tilts, the pivot must shift so that
     /// the nozzle tip still lands at `position`.
     ///
-    /// Only **head** axes contribute to TCP compensation (bed axes move the part,
-    /// not the nozzle tip).  The first two head axes supply the pitch (a) and
-    /// roll (b) angles used in the standard 5-axis TCP formula:
+    /// The nozzle tip sits a distance `L` = `tcp_offset` from the pivot, along
+    /// the tool axis.  Working from the tool direction directly avoids routing
+    /// through joint angles, which cannot express this correctly: `a` and `b`
+    /// are independent pitch and roll joints, not a polar/azimuth pair.
+    ///
+    /// With `n̂` the unit tool direction, the tip displacement relative to the
+    /// untilted case is exactly `L · (n̂ − ẑ)`:
     ///
     /// ```text
-    ///   Δx =  L · sin(a) · cos(b)
-    ///   Δy =  L · sin(a) · sin(b)
-    ///   Δz =  L · (1 − cos(a))
+    ///   Δx =  L · n.x
+    ///   Δy =  L · n.y
+    ///   Δz =  L · (n.z − 1)
     /// ```
     ///
-    /// where L = `tcp_offset`.  If `tcp_offset ≈ 0`, the position is returned
-    /// unchanged.
+    /// # Sign convention
+    ///
+    /// This assumes:
+    /// - `orientation` points from the nozzle tip toward the pivot, so it is
+    ///   `+Z` when the head is vertical (matching the rest of the crate);
+    /// - the controller has no built-in RTCP, so G-code XYZ commands the
+    ///   **pivot**, and the compensation is *added*;
+    /// - machine zero is set such that with the head vertical, commanded XYZ
+    ///   already coincides with the nozzle tip.
+    ///
+    /// A machine that compensates internally, or whose tool vector points the
+    /// other way, needs the sign flipped.  Verify on a real or simulated move
+    /// before trusting this on hardware.
+    ///
+    /// If `tcp_offset ≈ 0`, the position is returned unchanged.
     pub fn tcp_compensate(
         &self,
         position: &crate::geometry::Point3D,
-        axis_angles: &[(String, f64)],
+        orientation: &crate::geometry::Vector3D,
     ) -> crate::geometry::Point3D {
         let offset = self.kinematics.tcp_offset;
         if offset.abs() < 1e-6 { return *position; }
 
-        // Collect angles for the first two head axes
-        let head_angles: Vec<f64> = self.kinematics.axes.iter()
-            .zip(axis_angles.iter())
-            .filter(|(ax, _)| ax.is_head)
-            .take(2)
-            .map(|(_, (_, deg))| deg.to_radians())
-            .collect();
-
-        let a = head_angles.first().copied().unwrap_or(0.0);
-        let b = head_angles.get(1).copied().unwrap_or(0.0);
+        let len = orientation.norm();
+        if !len.is_finite() || len < 1e-9 { return *position; }
+        let n = orientation / len;
 
         crate::geometry::Point3D::new(
-            position.x + offset * a.sin() * b.cos(),
-            position.y + offset * a.sin() * b.sin(),
-            position.z + offset * (1.0 - a.cos()),
+            position.x + offset * n.x,
+            position.y + offset * n.y,
+            position.z + offset * (n.z - 1.0),
         )
     }
 
@@ -573,11 +583,93 @@ mod tests {
     fn test_tcp_compensation_disabled_at_zero_offset() {
         let gen = GCodeGenerator::new();
         let pos = Point3D::new(10.0, 20.0, 5.0);
-        let angles = gen.compute_axis_angles(&Vector3D::new(0.0, 0.0, 1.0));
-        let compensated = gen.tcp_compensate(&pos, &angles);
+        let compensated = gen.tcp_compensate(&pos, &Vector3D::new(0.0, 0.0, 1.0));
         assert!((compensated.x - pos.x).abs() < 1e-9);
         assert!((compensated.y - pos.y).abs() < 1e-9);
         assert!((compensated.z - pos.z).abs() < 1e-9);
+    }
+
+    /// Machine with a 40 mm pivot-to-tip offset.
+    fn tcp_generator(offset: f64) -> GCodeGenerator {
+        GCodeGenerator {
+            kinematics: MachineKinematics { tcp_offset: offset, ..MachineKinematics::default() },
+            ..GCodeGenerator::default()
+        }
+    }
+
+    #[test]
+    fn test_tcp_vertical_tool_needs_no_compensation() {
+        let gen = tcp_generator(40.0);
+        let pos = Point3D::new(10.0, 20.0, 5.0);
+        let out = gen.tcp_compensate(&pos, &Vector3D::new(0.0, 0.0, 1.0));
+        assert!((out.x - pos.x).abs() < 1e-9, "x moved: {}", out.x);
+        assert!((out.y - pos.y).abs() < 1e-9, "y moved: {}", out.y);
+        assert!((out.z - pos.z).abs() < 1e-9, "z moved: {}", out.z);
+    }
+
+    /// Regression test for T-03. The previous formula treated the two head
+    /// joint angles as a polar/azimuth pair, so a pure tilt toward +Y produced
+    /// `Δx = L·sin(a), Δy = 0` -- the whole displacement landed on the wrong
+    /// axis, with the Z term inverted as well.
+    #[test]
+    fn test_tcp_tilt_toward_y_displaces_along_y() {
+        let l = 40.0;
+        let gen = tcp_generator(l);
+        let tilt = 30_f64.to_radians();
+        let n = Vector3D::new(0.0, tilt.sin(), tilt.cos());
+
+        let pos = Point3D::new(10.0, 20.0, 5.0);
+        let out = gen.tcp_compensate(&pos, &n);
+
+        assert!(
+            (out.x - pos.x).abs() < 1e-9,
+            "a tilt in the Y-Z plane must not displace X, got {}",
+            out.x - pos.x
+        );
+        assert!(
+            ((out.y - pos.y) - l * tilt.sin()).abs() < 1e-9,
+            "expected Y displacement of {}, got {}",
+            l * tilt.sin(),
+            out.y - pos.y
+        );
+        assert!(
+            ((out.z - pos.z) - l * (tilt.cos() - 1.0)).abs() < 1e-9,
+            "expected Z displacement of {}, got {}",
+            l * (tilt.cos() - 1.0),
+            out.z - pos.z
+        );
+    }
+
+    /// Applying the compensation and then the forward relation must put the
+    /// nozzle tip back on the originally commanded point.
+    #[test]
+    fn test_tcp_round_trip_recovers_tip() {
+        let l = 40.0;
+        let gen = tcp_generator(l);
+        let target = Point3D::new(12.0, -7.0, 3.5);
+
+        for n in [
+            Vector3D::new(0.0, 0.0, 1.0),
+            Vector3D::new(0.0, 0.5, 3_f64.sqrt() / 2.0),
+            Vector3D::new(0.5, 0.0, 3_f64.sqrt() / 2.0),
+            Vector3D::new(-0.3, 0.4, 0.866_025_403_784_44),
+        ] {
+            let n = n / n.norm();
+            let commanded = gen.tcp_compensate(&target, &n);
+            // Forward: tip = commanded - L·(n̂ - ẑ)
+            let tip = Point3D::new(
+                commanded.x - l * n.x,
+                commanded.y - l * n.y,
+                commanded.z - l * (n.z - 1.0),
+            );
+            assert!(
+                (tip - target).norm() < 1e-9,
+                "tip {:?} did not return to target {:?} for n {:?}",
+                tip,
+                target,
+                n
+            );
+        }
     }
 
     #[test]
