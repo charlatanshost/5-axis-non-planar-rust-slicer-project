@@ -1294,7 +1294,12 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                     ui.label(egui::RichText::new("⏳ Running motion planning...").italics());
                 }
 
-                if ui.add_enabled(can_motion_plan && !app.is_motion_planning, egui::Button::new("🤖 Run Motion Planning").min_size(egui::vec2(ui.available_width(), 30.0))).clicked() {
+                if ui.add_enabled(can_motion_plan && !app.is_motion_planning, egui::Button::new("🤖 Run Motion Planning (experimental)").min_size(egui::vec2(ui.available_width(), 30.0)))
+                    .on_hover_text(
+                        "Experimental. Singularity detection and graph search are still \
+                         scaffolding and report success without doing the work. Extrusion \
+                         values computed during slicing are now passed through unchanged.")
+                    .clicked() {
                     app.run_motion_planning();
                 }
 
