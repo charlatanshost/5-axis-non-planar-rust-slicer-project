@@ -213,11 +213,14 @@ mod tests {
 
     #[test]
     fn test_overhang_detection_vertical() {
-        // Create a simple triangle pointing down
+        // A downward-facing triangle: the winding is chosen so the normal has a
+        // negative Z component. The previous winding gave a normal of
+        // (0, 0.707, 0.707) -- an upward-facing 45 degree slope, which is not an
+        // overhang at all and could never satisfy the assertion below.
         let triangle = Triangle::new(
             Point3D::new(0.0, 0.0, 10.0),
-            Point3D::new(10.0, 0.0, 10.0),
             Point3D::new(5.0, 5.0, 5.0),
+            Point3D::new(10.0, 0.0, 10.0),
         );
 
         let normal = triangle.normal();

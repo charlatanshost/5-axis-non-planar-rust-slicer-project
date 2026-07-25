@@ -37,6 +37,7 @@ fn main() -> Result<()> {
         max_layer_height: 0.3,
         adaptive: false,
         tolerance: 1e-6,
+        ..Default::default()
     };
     log::info!("  Layer height: {} mm", config.layer_height);
     log::info!("  Tolerance: {}\n", config.tolerance);
@@ -56,7 +57,7 @@ fn main() -> Result<()> {
     // Step 5: Generate toolpaths
     log::info!("Step 5: Generating toolpaths");
     let toolpath_gen = toolpath::ToolpathGenerator::new(0.4, 0.2);
-    let toolpaths = toolpath_gen.generate(&layers);
+    let toolpaths = toolpath_gen.generate(&layers, Some(&mesh));
     
     let total_moves: usize = toolpaths.iter().map(|tp| tp.paths.len()).sum();
     log::info!("  Total toolpath moves: {}\n", total_moves);

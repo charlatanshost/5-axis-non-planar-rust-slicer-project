@@ -531,14 +531,17 @@ mod tests {
     use crate::geometry::Triangle;
 
     #[test]
-    fn test_global_unfold_rotation() {
-        let normal = Vector3D::new(1.0, 0.0, 0.0); // Horizontal surface (vertical wall)
+    fn test_vertical_wall_needs_no_unfold() {
+        let normal = Vector3D::new(1.0, 0.0, 0.0); // Vertical wall (horizontal normal)
         let build_dir = Vector3D::new(0.0, 0.0, 1.0); // Vertical build
 
         let rotation = compute_global_unfold_rotation(&normal, &build_dir, 45.0, 15.0);
 
-        // Vertical surfaces should get some rotation to unfold
-        assert!(rotation.angle() > 0.0);
+        // The S3 constraint is d . n + sin(alpha) >= 0. Here that is
+        // 0 + sin(45) = 0.707 >= 0, so the wall is already self-supporting and
+        // must not be rotated. Overhangs are covered by
+        // test_downward_facing_rotation.
+        assert_eq!(rotation.angle(), 0.0);
     }
 
     #[test]

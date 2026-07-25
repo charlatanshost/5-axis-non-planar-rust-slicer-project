@@ -1163,19 +1163,28 @@ mod tests {
     use super::*;
     use crate::geometry::{Point3D, Triangle};
 
+    /// A closed tetrahedron with outward-facing winding.
+    ///
+    /// The pipeline needs a watertight solid: a single triangle has no interior,
+    /// so tetrahedralization yields nothing and no layers can be extracted.
+    fn test_tetrahedron() -> Mesh {
+        let v0 = Point3D::new(0.0, 0.0, 0.0);
+        let v1 = Point3D::new(10.0, 0.0, 0.0);
+        let v2 = Point3D::new(5.0, 10.0, 0.0);
+        let v3 = Point3D::new(5.0, 3.33, 10.0);
+
+        Mesh::new(vec![
+            Triangle::new(v0, v2, v1), // base, normal -Z
+            Triangle::new(v0, v1, v3), // front, normal -Y
+            Triangle::new(v1, v2, v3), // right
+            Triangle::new(v2, v0, v3), // left
+        ])
+        .expect("tetrahedron is a valid mesh")
+    }
+
     #[test]
     fn test_s3_pipeline() {
-        let triangle = Triangle::new(
-            Point3D::new(0.0, 0.0, 0.0),
-            Point3D::new(10.0, 0.0, 0.0),
-            Point3D::new(5.0, 10.0, 5.0),
-        );
-
-        let mesh = Mesh {
-            triangles: vec![triangle],
-            bounds_min: Point3D::new(0.0, 0.0, 0.0),
-            bounds_max: Point3D::new(10.0, 10.0, 5.0),
-        };
+        let mesh = test_tetrahedron();
 
         let config = S3PipelineConfig::default();
         let result = execute_s3_pipeline(mesh, config);
