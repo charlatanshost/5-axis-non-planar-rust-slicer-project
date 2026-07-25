@@ -19,10 +19,22 @@ fn default_layer_height() -> f64 { 0.2 }
 
 /// A segment of a toolpath with position and orientation
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// A single machine move.
+///
+/// # Contract
+///
+/// `position` is the **destination** of this move, and `extrusion` is the
+/// filament volume extruded *while travelling to it* from the previous
+/// segment's position. A segment with `extrusion == 0` is a travel move.
+///
+/// This matters because [`crate::gcode`] emits `G1 X Y Z E` where `E` is the
+/// extrusion accumulated **at the segment's own position**. Producers that
+/// attach flow to the point being departed from will emit it one move early
+/// and drop the final point of every path.
 pub struct ToolpathSegment {
     pub position: Point3D,
     pub orientation: Vector3D, // Tool orientation (for 5-axis)
-    pub extrusion: f64,        // Amount to extrude
+    pub extrusion: f64,        // Volume extruded while moving to `position`
     pub feedrate: f64,         // Movement speed
 }
 
@@ -207,8 +219,9 @@ impl ToolpathGenerator {
                 let distance = (p2 - p1).norm();
                 let extrusion = self.calculate_extrusion_volume(distance, self.extrusion_width, layer.layer_height);
 
+                // `position` is the destination of the move (see ToolpathSegment).
                 paths.push(ToolpathSegment {
-                    position: p1,
+                    position: p2,
                     orientation,
                     extrusion,
                     feedrate: self.pattern_config.print_speed,
@@ -419,8 +432,9 @@ impl ToolpathGenerator {
                         let distance = (p2 - p1).norm();
                         let extrusion = self.calculate_extrusion_volume(distance, self.extrusion_width, layer.layer_height);
 
+                        // `position` is the destination of the move (see ToolpathSegment).
                         paths.push(ToolpathSegment {
-                            position: p1,
+                            position: p2,
                             orientation,
                             extrusion,
                             feedrate: self.pattern_config.infill_speed,
@@ -474,8 +488,12 @@ impl ToolpathGenerator {
             let distance = (p2 - p1).norm();
             let extrusion = self.calculate_extrusion_volume(distance, self.extrusion_width, layer_height);
 
+            // `position` is the DESTINATION of the move (see ToolpathSegment).
+            // Attaching the flow to p1 would emit it one move early and would
+            // drop contour_points.last() entirely -- for a closed contour that
+            // is the duplicated start point, leaving a visible seam gap.
             paths.push(ToolpathSegment {
-                position: p1,
+                position: p2,
                 orientation,
                 extrusion,
                 feedrate: self.pattern_config.print_speed,
@@ -545,8 +563,9 @@ impl ToolpathGenerator {
                     let p2 = transition_pts[j + 1];
                     let dist = (p2 - p1).norm();
                     let extrusion = self.calculate_extrusion_volume(dist, self.extrusion_width, self.layer_height);
+                    // `position` is the destination of the move (see ToolpathSegment).
                     toolpaths[i].paths.push(ToolpathSegment {
-                        position: p1,
+                        position: p2,
                         orientation,
                         extrusion,
                         feedrate: self.pattern_config.print_speed,
@@ -596,5 +615,78 @@ mod tests {
         let toolpath = generator.generate_layer_toolpath(&layer, 0, &centroidal_axis, None);
 
         assert!(!toolpath.paths.is_empty());
+    }
+
+    /// Regression test for the `ToolpathSegment` contract (T-02).
+    ///
+    /// Flow used to be attached to the point being departed from, which both
+    /// applied it one move early and dropped the final point of every path --
+    /// for a closed contour that is the duplicated start point, so every loop
+    /// ended one `node_distance` short of closing.
+    #[test]
+    fn test_closed_contour_closes_and_flow_matches_path_length() {
+        let side = 10.0;
+        let contour = Contour::new(
+            vec![
+                Point3D::new(0.0, 0.0, 0.0),
+                Point3D::new(side, 0.0, 0.0),
+                Point3D::new(side, side, 0.0),
+                Point3D::new(0.0, side, 0.0),
+            ],
+            true,
+        );
+
+        let generator = ToolpathGenerator::new(0.4, 0.2);
+        let layer_height = 0.2;
+        let mut paths: Vec<ToolpathSegment> = Vec::new();
+        generator.extrude_contour(
+            &contour,
+            &|p: Point3D| p,
+            Vector3D::new(0.0, 0.0, 1.0),
+            &mut paths,
+            layer_height,
+        );
+
+        // Leading segment positions the head and must not extrude.
+        assert!(paths.len() >= 3, "expected a travel plus extruding moves");
+        assert_eq!(paths[0].extrusion, 0.0, "lead-in must be a travel move");
+
+        let start = paths[0].position;
+        let end = paths.last().unwrap().position;
+        assert!(
+            (end - start).norm() < 1e-9,
+            "closed contour must return to its start; ended {:.6} mm away",
+            (end - start).norm()
+        );
+
+        // Walking the destinations must reproduce the true perimeter, and the
+        // flow booked against those moves must match it.
+        let mut traversed = 0.0;
+        let mut total_flow = 0.0;
+        let mut prev = start;
+        for seg in &paths[1..] {
+            traversed += (seg.position - prev).norm();
+            total_flow += seg.extrusion;
+            prev = seg.position;
+        }
+
+        assert!(
+            (traversed - 4.0 * side).abs() < 1e-6,
+            "expected a {} mm perimeter, walked {:.6}",
+            4.0 * side,
+            traversed
+        );
+
+        let expected_flow = generator.calculate_extrusion_volume(
+            traversed,
+            generator.extrusion_width,
+            layer_height,
+        );
+        assert!(
+            (total_flow - expected_flow).abs() / expected_flow < 1e-3,
+            "flow {:.6} deviates from length-derived {:.6} by more than 0.1%",
+            total_flow,
+            expected_flow
+        );
     }
 }

@@ -108,8 +108,11 @@ fn generate_layer_toolpath(
                 config.filament_diameter,
             );
 
+            // `position` is the destination of the move (see ToolpathSegment).
+            // The loop wraps with `%`, so using p2 still emits every point of
+            // the circle -- it just attributes the flow to the correct move.
             paths.push(ToolpathSegment {
-                position: p1,
+                position: p2,
                 orientation: Vector3D::new(0.0, 0.0, 1.0),  // Vertical for supports
                 extrusion,
                 feedrate: config.feedrate,
