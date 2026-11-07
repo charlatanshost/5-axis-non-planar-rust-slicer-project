@@ -1864,21 +1864,20 @@ impl SlicerApp {
                     (1.0_f64, 0.0_f64)
                 };
 
-                // Sweep tilt from 0° to max_tilt_deg in tilt_step_deg increments.
-                // We try the full outward tilt first (fastest escape), then reduce.
+                // Search outward from the CURRENT orientation in order of
+                // increasing angular deviation, accepting the first candidate
+                // that clears. This nudges a good surface-normal orientation
+                // minimally instead of snapping it back to vertical, which is
+                // what sweeping up from 0° used to do.
                 let mut best_orient = seg.orientation;
                 let mut found_clear = false;
-                for step in 0..=steps {
-                    let tilt_deg = (step as f64) * tilt_step_deg;
-                    let tilt_rad = tilt_deg.min(max_tilt_deg).to_radians();
-                    let sin_t = tilt_rad.sin();
-                    let cos_t = tilt_rad.cos();
-                    let nx = ex * sin_t;
-                    let ny = ey * sin_t;
-                    let nz = cos_t;
-                    let len = (nx * nx + ny * ny + nz * nz).sqrt();
-                    let trial = crate::geometry::Vector3D::new(nx / len, ny / len, nz / len);
-
+                for trial in collision_escape_candidates(
+                    seg.orientation,
+                    (ex, ey),
+                    tilt_step_deg,
+                    max_tilt_deg,
+                    steps,
+                ) {
                     if !detector.check_collision_with_mesh_oriented(&seg.position, &trial) {
                         best_orient = trial;
                         found_clear = true;
@@ -3649,4 +3648,197 @@ pub struct SlicingStats {
     pub total_moves: usize,
     pub has_sliced: bool,
     pub has_toolpaths: bool,
+}
+
+/// Candidate tool orientations for escaping a collision, ordered by increasing
+/// angular deviation from `current`.
+///
+/// Each candidate tilts `current` toward the radially-outward direction
+/// `escape_xy` by a multiple of `tilt_step_deg`. Searching outward from the
+/// *current* orientation is the point: the previous sweep ran from vertical
+/// upward, so its first candidate was always `(0, 0, 1)` and the first
+/// collision-free hit usually threw away whatever
+/// `apply_surface_normal_orientations` had computed.
+///
+/// Candidates whose tilt away from vertical would exceed `max_tilt_deg` are
+/// skipped, because that -- not the deviation from `current` -- is what the
+/// machine's rotary axes have to achieve. `current` itself is never returned:
+/// the caller has already established that it collides.
+///
+/// Lives here next to its only caller; T-16 should move it into the library
+/// alongside the rest of the orientation logic.
+pub(crate) fn collision_escape_candidates(
+    current: crate::geometry::Vector3D,
+    escape_xy: (f64, f64),
+    tilt_step_deg: f64,
+    max_tilt_deg: f64,
+    steps: usize,
+) -> Vec<crate::geometry::Vector3D> {
+    use crate::geometry::Vector3D;
+
+    let cur_len = current.norm();
+    let cur = if cur_len > 1e-9 {
+        current / cur_len
+    } else {
+        Vector3D::new(0.0, 0.0, 1.0)
+    };
+
+    let escape_raw = Vector3D::new(escape_xy.0, escape_xy.1, 0.0);
+    let esc_len = escape_raw.norm();
+    let escape = if esc_len > 1e-9 {
+        escape_raw / esc_len
+    } else {
+        Vector3D::new(1.0, 0.0, 0.0)
+    };
+
+    // Axis that rotates `cur` toward `escape`.
+    let cross = cur.cross(&escape);
+    let axis = if cross.norm() > 1e-9 {
+        nalgebra::Unit::new_normalize(cross)
+    } else {
+        // `cur` already lies along the escape direction (or exactly opposite),
+        // so the cross product is degenerate. Any axis perpendicular to the
+        // escape direction still tilts it; take one in the XY plane.
+        let alt = Vector3D::new(-escape.y, escape.x, 0.0);
+        if alt.norm() > 1e-9 {
+            nalgebra::Unit::new_normalize(alt)
+        } else {
+            nalgebra::Unit::new_normalize(Vector3D::new(1.0, 0.0, 0.0))
+        }
+    };
+
+    let max_tilt_rad = max_tilt_deg.to_radians();
+    let mut out = Vec::with_capacity(steps);
+
+    for step in 1..=steps {
+        let deviation = (step as f64) * tilt_step_deg.to_radians();
+        let rot = nalgebra::UnitQuaternion::from_axis_angle(&axis, deviation);
+        let trial = rot * cur;
+
+        // Tilt from vertical is the quantity the rotary axes must reach, and it
+        // is not monotonic in `deviation` when `current` leans away from the
+        // escape direction -- so skip rather than stop.
+        if trial.z.clamp(-1.0, 1.0).acos() > max_tilt_rad + 1e-9 {
+            continue;
+        }
+        out.push(trial);
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collision_escape_candidates;
+    use crate::geometry::Vector3D;
+
+    fn angle_deg(a: &Vector3D, b: &Vector3D) -> f64 {
+        (a.dot(b) / (a.norm() * b.norm()))
+            .clamp(-1.0, 1.0)
+            .acos()
+            .to_degrees()
+    }
+
+    /// Regression test for T-08.
+    ///
+    /// The sweep used to run `0..=steps` from vertical, so its first candidate
+    /// was always `(0, 0, 1)`; a colliding segment carrying a good
+    /// surface-normal orientation was therefore snapped back to vertical rather
+    /// than nudged. Candidates must now begin adjacent to the current
+    /// orientation and work outward.
+    #[test]
+    fn test_escape_candidates_start_near_current_orientation() {
+        let tilt = 30_f64.to_radians();
+        let current = Vector3D::new(tilt.sin(), 0.0, tilt.cos());
+        let vertical = Vector3D::new(0.0, 0.0, 1.0);
+
+        let candidates = collision_escape_candidates(current, (1.0, 0.0), 5.0, 45.0, 10);
+        assert!(!candidates.is_empty(), "expected candidates within the tilt limit");
+
+        let first = candidates[0];
+        assert!(
+            (angle_deg(&first, &current) - 5.0).abs() < 1e-6,
+            "first candidate should deviate by exactly one tilt step, got {:.4} deg",
+            angle_deg(&first, &current)
+        );
+        assert!(
+            angle_deg(&first, &current) < angle_deg(&first, &vertical),
+            "first candidate sits nearer vertical ({:.2} deg) than the current orientation ({:.2} deg)",
+            angle_deg(&first, &vertical),
+            angle_deg(&first, &current)
+        );
+        for c in &candidates {
+            assert!(
+                angle_deg(c, &vertical) > 1e-6,
+                "vertical must never be offered as an escape for an already-tilted segment"
+            );
+        }
+    }
+
+    #[test]
+    fn test_escape_candidates_are_unit_and_monotonic() {
+        let tilt = 10_f64.to_radians();
+        let current = Vector3D::new(0.0, tilt.sin(), tilt.cos());
+
+        let candidates = collision_escape_candidates(current, (0.0, 1.0), 5.0, 60.0, 8);
+        assert!(!candidates.is_empty());
+
+        let mut previous = 0.0;
+        for c in &candidates {
+            assert!(
+                (c.norm() - 1.0).abs() < 1e-9,
+                "candidate must be a unit vector, got norm {}",
+                c.norm()
+            );
+            let deviation = angle_deg(c, &current);
+            assert!(
+                deviation > previous - 1e-9,
+                "deviation must not decrease: {:.4} then {:.4}",
+                previous,
+                deviation
+            );
+            previous = deviation;
+        }
+    }
+
+    #[test]
+    fn test_escape_candidates_respect_max_tilt() {
+        let vertical = Vector3D::new(0.0, 0.0, 1.0);
+        let max_tilt = 20.0;
+
+        let candidates = collision_escape_candidates(vertical, (1.0, 0.0), 5.0, max_tilt, 20);
+        assert!(!candidates.is_empty());
+
+        for c in &candidates {
+            assert!(
+                angle_deg(c, &vertical) <= max_tilt + 1e-6,
+                "candidate tilted {:.4} deg from vertical, past the {} deg axis limit",
+                angle_deg(c, &vertical),
+                max_tilt
+            );
+        }
+    }
+
+    /// A vertical segment still gets the plain outward sweep, so existing
+    /// behaviour for untilted toolpaths is unchanged apart from skipping the
+    /// redundant zero-tilt probe.
+    #[test]
+    fn test_vertical_current_tilts_along_escape_direction() {
+        let vertical = Vector3D::new(0.0, 0.0, 1.0);
+        let candidates = collision_escape_candidates(vertical, (1.0, 0.0), 5.0, 45.0, 9);
+
+        let first = candidates[0];
+        let expected = 5_f64.to_radians();
+        assert!(
+            (first.x - expected.sin()).abs() < 1e-9,
+            "expected a tilt toward +X, got x={}",
+            first.x
+        );
+        assert!(first.y.abs() < 1e-9, "no Y component expected, got {}", first.y);
+        assert!(
+            (first.z - expected.cos()).abs() < 1e-9,
+            "expected z=cos(5 deg), got {}",
+            first.z
+        );
+    }
 }
