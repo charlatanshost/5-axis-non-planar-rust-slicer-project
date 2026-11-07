@@ -958,40 +958,84 @@ fn find_source_vertices(topo: &MeshTopology, source: &GeodesicSource) -> Vec<usi
 // ── Level set extraction (marching triangles) ───────────────────────
 
 /// Extract contours at a given geodesic distance value from the mesh.
+///
+/// Each crossing is computed **once per edge**, keyed by the sorted vertex
+/// index pair and interpolated in that canonical order. Both faces sharing an
+/// edge therefore read a bit-identical `Point3D`. Previously each face
+/// interpolated its own copy from its own winding -- mathematically equal but
+/// differing in the last bits -- and the 1e-4 quantization in
+/// [`chain_segments_into_contours`] could hash the two copies to different
+/// keys, breaking the chain mid-loop.
 fn extract_level_set(
     topo: &MeshTopology,
     distances: &[f64],
     level: f64,
 ) -> Vec<Contour> {
-    // For each face, find edges that the level crosses and generate a segment
-    // Key: (vertex_a, vertex_b) with a < b → interpolated point
+    // Nudge the level off any exact vertex value rather than special-casing
+    // vertices that land on it. That special case pushed a vertex from one
+    // face's perspective and could emit a duplicate segment when an entire
+    // edge lay on the level.
+    let mut d_min = f64::INFINITY;
+    let mut d_max = f64::NEG_INFINITY;
+    for &d in distances {
+        if d.is_finite() {
+            if d < d_min {
+                d_min = d;
+            }
+            if d > d_max {
+                d_max = d;
+            }
+        }
+    }
+    let level = if d_max > d_min {
+        level + 1e-9 * (d_max - d_min)
+    } else {
+        level
+    };
+
+    // Canonical per-edge crossing cache, keyed by sorted vertex pair.
+    let mut edge_crossings: HashMap<(usize, usize), Point3D> = HashMap::new();
     let mut segments: Vec<(Point3D, Point3D)> = Vec::new();
 
     for face in &topo.faces {
         let [i, j, k] = *face;
-        let di = distances[i] - level;
-        let dj = distances[j] - level;
-        let dk = distances[k] - level;
-
-        // Find edges where the level crosses (sign change)
         let mut crossings: Vec<Point3D> = Vec::new();
 
-        let check_edge = |a: usize, b: usize, da: f64, db: f64, crossings: &mut Vec<Point3D>| {
-            if (da > 0.0 && db < 0.0) || (da < 0.0 && db > 0.0) {
-                let t = da / (da - db);
-                let p = topo.vertices[a] + t * (topo.vertices[b] - topo.vertices[a]);
-                crossings.push(p);
-            } else if da.abs() < 1e-12 {
-                crossings.push(topo.vertices[a]);
+        for &(a, b) in &[(i, j), (j, k), (k, i)] {
+            // Classify each vertex onto exactly one side of the level. Because
+            // this is a consistent per-vertex predicate, a triangle always has
+            // either 0 or 2 edges with differing endpoints -- never 1 or 3 --
+            // so no crossing can be silently discarded, as taking only
+            // `crossings[0..2]` used to do.
+            let above_a = distances[a] - level > 0.0;
+            let above_b = distances[b] - level > 0.0;
+            if above_a == above_b {
+                continue;
             }
-        };
 
-        check_edge(i, j, di, dj, &mut crossings);
-        check_edge(j, k, dj, dk, &mut crossings);
-        check_edge(k, i, dk, di, &mut crossings);
+            let key = if a < b { (a, b) } else { (b, a) };
+            let p = *edge_crossings.entry(key).or_insert_with(|| {
+                let (lo, hi) = key;
+                let dlo = distances[lo] - level;
+                let dhi = distances[hi] - level;
+                // The endpoints are on opposite sides, so dlo - dhi != 0.
+                let t = dlo / (dlo - dhi);
+                topo.vertices[lo] + t * (topo.vertices[hi] - topo.vertices[lo])
+            });
+            crossings.push(p);
+        }
 
-        if crossings.len() >= 2 {
-            segments.push((crossings[0], crossings[1]));
+        match crossings.len() {
+            0 => {}
+            2 => segments.push((crossings[0], crossings[1])),
+            n => log::warn!(
+                "extract_level_set: face [{}, {}, {}] produced {} crossings, expected 0 or 2; \
+                 this indicates a mesh topology problem",
+                i,
+                j,
+                k,
+                n
+            ),
         }
     }
 
@@ -1569,5 +1613,130 @@ mod tests {
         for layer in &layers {
             assert!(!layer.contours.is_empty(), "Layer at d={:.1} has no contours", layer.z);
         }
+    }
+
+    /// Regression test for T-05.
+    ///
+    /// With `distances = z` on a closed cube, a mid-height level crosses eight
+    /// edges, every one of which is shared by exactly two faces. This pins the
+    /// invariant the per-edge cache exists to guarantee: one crossing position
+    /// per crossing edge, and therefore one closed ring.
+    ///
+    /// Note this fixture would also pass under the old per-face interpolation,
+    /// because the cube's coordinates and distances are powers of two and both
+    /// windings happen to interpolate bit-identically. It guards the invariant
+    /// against future regressions rather than reproducing the original failure,
+    /// which needed last-bit disagreement straddling a quantization boundary.
+    /// `test_level_set_through_exact_vertex_values_is_clean` is the one that
+    /// fails on the old code.
+    #[test]
+    fn test_level_set_shared_edge_crossings_agree() {
+        let mesh = make_cube_mesh();
+        let topo = MeshTopology::from_mesh(&mesh);
+        let distances: Vec<f64> = topo.vertices.iter().map(|v| v.z).collect();
+        let level = 5.0;
+
+        let contours = extract_level_set(&topo, &distances, level);
+
+        assert_eq!(
+            contours.len(),
+            1,
+            "a mid-height level on a closed cube is one ring, got {} contours of lengths {:?}",
+            contours.len(),
+            contours.iter().map(|c| c.points.len()).collect::<Vec<_>>()
+        );
+
+        let ring = &contours[0];
+        assert!(ring.closed, "the ring must come back to its start");
+
+        for p in &ring.points {
+            assert!(
+                (p.z - level).abs() < 1e-6,
+                "crossing point is off the level: {:?}",
+                p
+            );
+        }
+
+        // Eight crossing edges => eight distinct positions. If the two faces
+        // sharing an edge disagreed, this would climb toward sixteen.
+        let mut distinct: Vec<(i64, i64, i64)> = ring
+            .points
+            .iter()
+            .map(|p| {
+                (
+                    (p.x * 1e4).round() as i64,
+                    (p.y * 1e4).round() as i64,
+                    (p.z * 1e4).round() as i64,
+                )
+            })
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            8,
+            "expected 8 distinct crossing positions, got {}",
+            distinct.len()
+        );
+    }
+
+    /// Regression test for T-05's degenerate case.
+    ///
+    /// At `level = 0` with `distances = z`, all four bottom vertices sit exactly
+    /// on the level. The old exact-hit branch (`da.abs() < 1e-12`) pushed a
+    /// vertex from each incident face's perspective, so the flat bottom cap
+    /// emitted segments along its own edges -- including the diagonal
+    /// `v0 -> v2`, which is not a level set at all. That gave vertex v0 three
+    /// incident segments and fragmented the result.
+    ///
+    /// Perturbing the level instead puts the whole cap cleanly on one side, so
+    /// only the four side-face crossings remain and they collapse onto the four
+    /// bottom corners.
+    #[test]
+    fn test_level_set_through_exact_vertex_values_is_clean() {
+        let mesh = make_cube_mesh();
+        let topo = MeshTopology::from_mesh(&mesh);
+        let distances: Vec<f64> = topo.vertices.iter().map(|v| v.z).collect();
+
+        let contours = extract_level_set(&topo, &distances, 0.0);
+
+        assert_eq!(
+            contours.len(),
+            1,
+            "expected one ring around the base, got {} contours of lengths {:?}",
+            contours.len(),
+            contours.iter().map(|c| c.points.len()).collect::<Vec<_>>()
+        );
+
+        let ring = &contours[0];
+
+        // Every point must land on a bottom corner -- never on the cap's
+        // interior diagonal, whose midpoint would be (5, 5, 0).
+        let corners = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
+        for p in &ring.points {
+            assert!(p.z.abs() < 1e-6, "point off the base: z={}", p.z);
+            assert!(
+                corners
+                    .iter()
+                    .any(|&(cx, cy)| (p.x - cx).abs() < 1e-6 && (p.y - cy).abs() < 1e-6),
+                "point ({:.4}, {:.4}) is not a bottom corner; a spurious cap segment was emitted",
+                p.x,
+                p.y
+            );
+        }
+
+        let mut distinct: Vec<(i64, i64)> = ring
+            .points
+            .iter()
+            .map(|p| ((p.x * 1e4).round() as i64, (p.y * 1e4).round() as i64))
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            4,
+            "expected the four bottom corners, got {} distinct positions",
+            distinct.len()
+        );
     }
 }
