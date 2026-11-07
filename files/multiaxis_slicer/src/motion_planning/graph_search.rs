@@ -205,6 +205,7 @@ mod tests {
                     Point3D::new(200.0, 200.0, 200.0),
                 ),
                 printed_mesh: None,
+                mesh_collider: None,
             },
             singularity_optimizer: SingularityOptimizer {
                 lambda_threshold: 0.01,

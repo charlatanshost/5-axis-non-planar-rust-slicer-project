@@ -1800,7 +1800,7 @@ impl SlicerApp {
             .max(5.0);
         let body_height = self.tcp_offset + profile.head_dims[2];
 
-        let detector = crate::motion_planning::collision::CollisionDetector {
+        let mut detector = crate::motion_planning::collision::CollisionDetector {
             print_head: crate::motion_planning::collision::PrintHead {
                 nozzle_diameter: 0.4,
                 body_radius,
@@ -1811,7 +1811,10 @@ impl SlicerApp {
                 crate::geometry::Point3D::new(500.0, 500.0, 1000.0),
             ),
             printed_mesh: None,
+            mesh_collider: None,
         };
+        // Build the BVH once; the loops below query it thousands of times.
+        detector.set_collision_mesh(&mesh);
 
         // Maximum tilt each individual axis can handle (IK assigns the same magnitude to
         // head and bed, so the bottleneck is the most restricted rotary axis overall).
@@ -1846,7 +1849,7 @@ impl SlicerApp {
             for seg in &mut toolpath.paths {
                 // Skip if current orientation already clears the mesh.
                 if !detector.check_collision_with_mesh_oriented(
-                    &seg.position, &seg.orientation, &mesh,
+                    &seg.position, &seg.orientation,
                 ) {
                     continue;
                 }
@@ -1876,7 +1879,7 @@ impl SlicerApp {
                     let len = (nx * nx + ny * ny + nz * nz).sqrt();
                     let trial = crate::geometry::Vector3D::new(nx / len, ny / len, nz / len);
 
-                    if !detector.check_collision_with_mesh_oriented(&seg.position, &trial, &mesh) {
+                    if !detector.check_collision_with_mesh_oriented(&seg.position, &trial) {
                         best_orient = trial;
                         found_clear = true;
                         break;

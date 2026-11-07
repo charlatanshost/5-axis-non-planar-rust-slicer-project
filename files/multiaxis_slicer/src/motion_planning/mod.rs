@@ -37,6 +37,7 @@ impl MotionPlanner {
             print_head: config.print_head,
             platform_bounds: config.platform_bounds,
             printed_mesh: None,
+            mesh_collider: None,
         };
 
         let singularity_optimizer = SingularityOptimizer {
