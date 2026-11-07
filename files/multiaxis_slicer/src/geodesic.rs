@@ -1048,18 +1048,44 @@ fn extract_level_set(
 }
 
 /// Chain line segments into closed/open contours by matching endpoints.
+///
+/// The walk extends in **both** directions from the seed segment. Extending
+/// only forward split every open contour whose seed happened to land in the
+/// middle of the chain: everything on the seed's `a` side was left behind and
+/// later emitted as a second, separate contour.
 fn chain_segments_into_contours(segments: Vec<(Point3D, Point3D)>) -> Vec<Contour> {
     if segments.is_empty() {
         return Vec::new();
     }
 
+    type Key = (i64, i64, i64);
+
     // Quantize points for hashing
-    let quantize = |p: &Point3D| -> (i64, i64, i64) {
+    fn quantize(p: &Point3D) -> Key {
         ((p.x * 1e4).round() as i64, (p.y * 1e4).round() as i64, (p.z * 1e4).round() as i64)
-    };
+    }
+
+    /// Consume one unused segment incident to `current_key` and return its far
+    /// endpoint, or `None` when the chain dead-ends here.
+    fn advance(
+        adj: &HashMap<Key, Vec<(usize, Key)>>,
+        seg_points: &[(Point3D, Point3D)],
+        used: &mut [bool],
+        current_key: Key,
+    ) -> Option<Point3D> {
+        for &(seg_idx, _) in adj.get(&current_key)? {
+            if !used[seg_idx] {
+                used[seg_idx] = true;
+                // Find which end of the segment matches current_key
+                let (sa, sb) = seg_points[seg_idx];
+                return Some(if quantize(&sa) == current_key { sb } else { sa });
+            }
+        }
+        None
+    }
 
     // Build adjacency: point_key → list of (segment_index, other_end_key)
-    let mut adj: HashMap<(i64, i64, i64), Vec<(usize, (i64, i64, i64))>> = HashMap::new();
+    let mut adj: HashMap<Key, Vec<(usize, Key)>> = HashMap::new();
     let mut seg_points: Vec<(Point3D, Point3D)> = Vec::with_capacity(segments.len());
     let mut used = vec![false; segments.len()];
 
@@ -1080,38 +1106,42 @@ fn chain_segments_into_contours(segments: Vec<(Point3D, Point3D)>) -> Vec<Contou
         used[start_idx] = true;
 
         let (a, b) = seg_points[start_idx];
-        let mut chain = vec![a, b];
-        let mut current_key = quantize(&b);
         let start_key = quantize(&a);
 
-        // Walk forward
-        loop {
-            let mut found = false;
-            if let Some(neighbors) = adj.get(&current_key) {
-                for &(seg_idx, other_key) in neighbors {
-                    if !used[seg_idx] {
-                        used[seg_idx] = true;
-                        // Find which end of the segment matches current_key
-                        let (sa, sb) = seg_points[seg_idx];
-                        let ska = quantize(&sa);
-                        let next_pt = if ska == current_key { sb } else { sa };
-                        chain.push(next_pt);
-                        current_key = quantize(&next_pt);
-                        found = true;
-                        break;
-                    }
+        // ── Walk forward from b ──
+        let mut forward = vec![b];
+        let mut current_key = quantize(&b);
+        while current_key != start_key {
+            match advance(&adj, &seg_points, &mut used, current_key) {
+                Some(next) => {
+                    current_key = quantize(&next);
+                    forward.push(next);
                 }
-            }
-            if !found {
-                break;
-            }
-            // Check if we looped back to start
-            if current_key == start_key {
-                break;
+                None => break,
             }
         }
 
+        // Only a forward walk that returns to the seed's start closes the loop.
         let closed = current_key == start_key;
+
+        // ── Walk backward from a ──
+        // Skipped for a closed loop: the ring is already complete, and anything
+        // still incident to `a` belongs to a different contour.
+        let mut backward: Vec<Point3D> = Vec::new();
+        if !closed {
+            let mut current_key = start_key;
+            while let Some(next) = advance(&adj, &seg_points, &mut used, current_key) {
+                current_key = quantize(&next);
+                backward.push(next);
+            }
+        }
+
+        // Assemble as: backward walk reversed, the seed's own start, then forward.
+        let mut chain = Vec::with_capacity(backward.len() + 1 + forward.len());
+        chain.extend(backward.into_iter().rev());
+        chain.push(a);
+        chain.extend(forward);
+
         if chain.len() >= 3 || (chain.len() >= 2 && !closed) {
             contours.push(Contour::new(chain, closed));
         }
@@ -1738,5 +1768,101 @@ mod tests {
             "expected the four bottom corners, got {} distinct positions",
             distinct.len()
         );
+    }
+
+    /// Regression test for T-06.
+    ///
+    /// The walk used to extend only forward from the seed segment's `b` end, so
+    /// a seed landing mid-chain orphaned everything on its `a` side, which was
+    /// then emitted as a second contour. Rotating the segment order moves the
+    /// seed along the polyline; every rotation must still recover one contour.
+    #[test]
+    fn test_chainer_recovers_open_polyline_from_any_seed() {
+        let pts: Vec<Point3D> = (0..5).map(|i| Point3D::new(i as f64, 0.0, 0.0)).collect();
+        let base: Vec<(Point3D, Point3D)> =
+            (0..4).map(|i| (pts[i], pts[i + 1])).collect();
+
+        for rot in 0..base.len() {
+            let mut segs = base.clone();
+            segs.rotate_left(rot);
+
+            let contours = chain_segments_into_contours(segs);
+
+            assert_eq!(
+                contours.len(),
+                1,
+                "seed rotation {}: expected 1 contour, got {} of lengths {:?}",
+                rot,
+                contours.len(),
+                contours.iter().map(|c| c.points.len()).collect::<Vec<_>>()
+            );
+
+            let c = &contours[0];
+            assert!(!c.closed, "seed rotation {}: an open polyline is not closed", rot);
+            assert_eq!(
+                c.points.len(),
+                5,
+                "seed rotation {}: expected all 5 points, got {}",
+                rot,
+                c.points.len()
+            );
+
+            // The chain may come out in either direction, but it must run from
+            // one true end of the polyline to the other, stepping by 1 in x.
+            let xs: Vec<f64> = c.points.iter().map(|p| p.x).collect();
+            let forward = (0..5).all(|i| (xs[i] - i as f64).abs() < 1e-9);
+            let reversed = (0..5).all(|i| (xs[i] - (4 - i) as f64).abs() < 1e-9);
+            assert!(
+                forward || reversed,
+                "seed rotation {}: points are not a contiguous traversal: {:?}",
+                rot,
+                xs
+            );
+        }
+    }
+
+    /// The two-directional walk must not break closed rings: a ring is still
+    /// reported closed, and the backward walk is skipped for it.
+    #[test]
+    fn test_chainer_still_closes_rings_from_any_seed() {
+        let pts = [
+            Point3D::new(0.0, 0.0, 0.0),
+            Point3D::new(1.0, 0.0, 0.0),
+            Point3D::new(1.0, 1.0, 0.0),
+            Point3D::new(0.0, 1.0, 0.0),
+        ];
+        let base: Vec<(Point3D, Point3D)> =
+            (0..4).map(|i| (pts[i], pts[(i + 1) % 4])).collect();
+
+        for rot in 0..base.len() {
+            let mut segs = base.clone();
+            segs.rotate_left(rot);
+
+            let contours = chain_segments_into_contours(segs);
+
+            assert_eq!(
+                contours.len(),
+                1,
+                "seed rotation {}: expected 1 ring, got {}",
+                rot,
+                contours.len()
+            );
+            let c = &contours[0];
+            assert!(c.closed, "seed rotation {}: ring must be closed", rot);
+            assert_eq!(
+                c.points.len(),
+                5,
+                "seed rotation {}: expected 4 corners plus the repeated start, got {}",
+                rot,
+                c.points.len()
+            );
+            let first = c.points.first().unwrap();
+            let last = c.points.last().unwrap();
+            assert!(
+                (last - first).norm() < 1e-9,
+                "seed rotation {}: a closed ring must end where it started",
+                rot
+            );
+        }
     }
 }
