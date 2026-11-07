@@ -69,6 +69,26 @@ pub struct PrintHead {
     pub nozzle_diameter: f64,
     pub body_radius: f64,
     pub body_height: f64,
+    /// Height above the nozzle tip that is excluded from collision testing, in mm.
+    ///
+    /// This models the nozzle cone protruding below the heater block, so the
+    /// head body is not tested against the layer the nozzle is currently
+    /// printing on. Typically 1-3 mm.
+    ///
+    /// It must not be derived from `body_radius`, as it once was: a 15 mm body
+    /// produced a 7.5 mm gap, a number with nothing to do with nozzle geometry.
+    pub nozzle_clearance: f64,
+}
+
+impl Default for PrintHead {
+    fn default() -> Self {
+        Self {
+            nozzle_diameter: 0.4,
+            body_radius: 20.0,
+            body_height: 50.0,
+            nozzle_clearance: 2.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -114,11 +134,17 @@ impl CollisionDetector {
         self.check_collision_with_mesh_oriented(position, &Vector3D::new(0.0, 0.0, 1.0))
     }
 
-    /// Check if the printhead capsule (oriented along `orientation` from the nozzle tip)
-    /// intersects the cached collision mesh.
+    /// Check if the printhead body (oriented along `orientation` from the nozzle
+    /// tip) intersects the cached collision mesh.
     ///
-    /// A small clearance gap is skipped from the nozzle tip so the capsule does not
-    /// self-intersect the layer surface the nozzle is printing on.
+    /// The body is modelled as a **cylinder** spanning exactly
+    /// `[nozzle_clearance, nozzle_clearance + body_height]` along the tool axis,
+    /// at full `body_radius` throughout. A capsule was wrong for this: being a
+    /// swept sphere, its lower hemisphere reached `body_radius - clearance`
+    /// *below* the nozzle tip (7.5 mm with the old radius-derived clearance), so
+    /// it collided with the layer being printed -- precisely what the clearance
+    /// is supposed to prevent. Flat caps make the excluded gap mean what it says
+    /// while keeping full lateral coverage over the heater block.
     ///
     /// `orientation` must point from the nozzle tip toward the head base.
     /// Returns `false` when no collision mesh has been set.
@@ -128,23 +154,19 @@ impl CollisionDetector {
         orientation: &Vector3D,
     ) -> bool {
         use parry3d::query::intersection_test;
-        use parry3d::shape::Capsule;
-        use nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion, Vector3 as NaVec3};
+        use parry3d::shape::Cylinder;
+        use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3 as NaVec3};
 
         let Some(collider) = self.mesh_collider.as_ref() else {
             return false;
         };
 
-        let height = self.print_head.body_height as f32;
-        let radius = self.print_head.body_radius as f32;
+        let radius = (self.print_head.body_radius as f32).max(1e-4);
+        let height = (self.print_head.body_height as f32).max(1e-4);
+        let clearance = (self.print_head.nozzle_clearance as f32).max(0.0);
 
-        // Skip a small clearance from the tip so we don't count the print surface itself.
-        let clearance = (radius * 0.5_f32).max(1.0_f32);
-
-        // Capsule in local space: from clearance to height+clearance along +Z.
-        let a = Point3::new(0.0_f32, 0.0, clearance);
-        let b = Point3::new(0.0_f32, 0.0, height + clearance);
-        let capsule = Capsule::new(a, b, radius);
+        let half_height = height * 0.5;
+        let cylinder = Cylinder::new(half_height, radius);
 
         // Rotate local +Z to align with orientation.
         let local_z = NaVec3::new(0.0_f32, 0.0, 1.0);
@@ -166,15 +188,24 @@ impl CollisionDetector {
             })
         };
 
-        let capsule_iso = Isometry3::from_parts(
+        // Tool frame: nozzle tip at `position`, +Z along the tool axis.
+        let tool_iso = Isometry3::from_parts(
             Translation3::new(position.x as f32, position.y as f32, position.z as f32),
             rot,
         );
 
+        // parry cylinders are Y-aligned and centred on the origin, so place this
+        // one along the tool frame's +Z with its lower cap at `clearance`.
+        let body_iso = tool_iso
+            * Isometry3::from_parts(
+                Translation3::new(0.0, 0.0, clearance + half_height),
+                UnitQuaternion::from_axis_angle(&NaVec3::x_axis(), std::f32::consts::FRAC_PI_2),
+            );
+
         // One BVH-accelerated query replaces the former per-triangle loop.
         intersection_test(
-            &capsule_iso,
-            &capsule,
+            &body_iso,
+            &cylinder,
             &Isometry3::identity(),
             &collider.trimesh,
         )
@@ -193,6 +224,7 @@ mod tests {
                 nozzle_diameter: 0.4,
                 body_radius: 15.0,
                 body_height: 50.0,
+                nozzle_clearance: 2.0,
             },
             platform_bounds: (
                 Point3D::new(-150.0, -150.0, 0.0),
@@ -379,6 +411,91 @@ mod tests {
         assert!(
             det.check_collision_with_mesh(&Point3D::new(0.0, 0.0, 0.0)),
             "the one nearby triangle must still be found among 20k"
+        );
+    }
+
+    /// A small flat triangle centred at `(x, 0, z)`, used to probe exactly
+    /// where the head body's collision volume starts and stops.
+    fn small_triangle_at(x: f64, z: f64) -> crate::mesh::Mesh {
+        use crate::geometry::Triangle;
+        crate::mesh::Mesh::new(vec![Triangle::new(
+            Point3D::new(x - 0.2, -0.2, z),
+            Point3D::new(x + 0.2, -0.2, z),
+            Point3D::new(x, 0.2, z),
+        )])
+        .unwrap()
+    }
+
+    fn probe(det: &CollisionDetector) -> bool {
+        det.check_collision_with_mesh_oriented(
+            &Point3D::new(0.0, 0.0, 0.0),
+            &Vector3D::new(0.0, 0.0, 1.0),
+        )
+    }
+
+    /// Regression test for T-09.
+    ///
+    /// With body_radius 15, body_height 50 and nozzle_clearance 2, the head
+    /// body occupies exactly `z in [2, 52]`. The old capsule was a swept sphere
+    /// whose lower hemisphere reached `clearance - radius` = -7.5 mm, so it
+    /// collided with the layer the nozzle was printing on -- exactly what the
+    /// clearance is documented to prevent. The `z = -5` case fails on that
+    /// geometry.
+    #[test]
+    fn test_body_volume_spans_exactly_the_clearance_gap() {
+        let cases = [
+            (-5.0, false, "below the nozzle tip: the layer being printed"),
+            (1.0, false, "inside the nozzle-cone clearance gap"),
+            (3.0, true, "heater block, just above the clearance"),
+            (51.0, true, "top of the head body"),
+            (53.0, false, "above the head body"),
+        ];
+
+        for (z, expected, why) in cases {
+            let mut det = make_detector();
+            det.set_collision_mesh(&small_triangle_at(0.0, z));
+            assert_eq!(
+                probe(&det),
+                expected,
+                "triangle at z={}: {} (expected hit={})",
+                z,
+                why,
+                expected
+            );
+        }
+    }
+
+    /// The cylinder covers the full body radius at every height in its span.
+    /// The old capsule's lower hemisphere only reached
+    /// `sqrt(15^2 - 4.5^2)` = 14.31 mm at z = 3, so a graze at r = 14.5 mm was
+    /// missed there -- the under-detection T-09 was reaching for, though not by
+    /// the mechanism it described.
+    #[test]
+    fn test_full_lateral_coverage_over_the_heater_block() {
+        let mut det = make_detector();
+        det.set_collision_mesh(&small_triangle_at(14.5, 3.0));
+        assert!(
+            probe(&det),
+            "a heater-block graze at r=14.5 mm, z=3 mm must be detected"
+        );
+    }
+
+    /// The gap must come from `PrintHead`, not from `body_radius`.
+    #[test]
+    fn test_nozzle_clearance_is_configurable() {
+        let mut det = make_detector();
+        det.set_collision_mesh(&small_triangle_at(0.0, 5.0));
+
+        det.print_head.nozzle_clearance = 8.0;
+        assert!(
+            !probe(&det),
+            "z=5 mm must fall inside an 8 mm clearance gap"
+        );
+
+        det.print_head.nozzle_clearance = 2.0;
+        assert!(
+            probe(&det),
+            "z=5 mm must be covered when the clearance is only 2 mm"
         );
     }
 

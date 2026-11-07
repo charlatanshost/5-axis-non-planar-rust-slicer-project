@@ -253,6 +253,14 @@ pub struct PrinterProfile {
     /// the carriage so the machine simulation looks correct.
     #[serde(default = "profile_default_nozzle_length")]
     pub nozzle_length: f64,
+    /// Height above the nozzle tip excluded from collision testing (mm).
+    ///
+    /// Models the nozzle cone protruding below the heater block, so the head
+    /// body is not tested against the layer currently being printed. Typically
+    /// 1-3 mm; unrelated to `body_radius`, which is what it used to be derived
+    /// from.
+    #[serde(default = "profile_default_nozzle_clearance")]
+    pub nozzle_clearance: f64,
     /// Bed surface shape for machine simulation
     #[serde(default)]
     pub bed_shape: BedShape,
@@ -272,6 +280,7 @@ fn profile_default_bed_dims() -> [f64; 3] { [200.0, 200.0, 10.0] }
 fn profile_default_head_dims() -> [f64; 3] { [60.0, 60.0, 80.0] }
 fn profile_default_nozzle_radius() -> f64 { 5.0 }
 fn profile_default_nozzle_length() -> f64 { 20.0 }
+fn profile_default_nozzle_clearance() -> f64 { 2.0 }
 
 /// Bed surface shape used in machine simulation
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -308,6 +317,7 @@ impl Default for PrinterProfile {
             bed_shape: BedShape::Rectangle,
             nozzle_radius: 5.0,
             nozzle_length: 20.0,
+            nozzle_clearance: 2.0,
             bed_travel:  [0.0, 0.0, 200.0], // bed moves up to 200 mm in Z by default
             head_travel: [300.0, 300.0, 0.0], // head moves 300 mm in X/Y by default
         }
@@ -1805,6 +1815,7 @@ impl SlicerApp {
                 nozzle_diameter: 0.4,
                 body_radius,
                 body_height,
+                nozzle_clearance: profile.nozzle_clearance,
             },
             platform_bounds: (
                 crate::geometry::Point3D::new(-500.0, -500.0, -50.0),

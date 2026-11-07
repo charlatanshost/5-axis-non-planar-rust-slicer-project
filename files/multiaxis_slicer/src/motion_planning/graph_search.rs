@@ -195,11 +195,7 @@ mod tests {
     fn make_planner() -> PathPlanner {
         PathPlanner {
             collision_detector: CollisionDetector {
-                print_head: PrintHead {
-                    nozzle_diameter: 0.4,
-                    body_radius: 20.0,
-                    body_height: 50.0,
-                },
+                print_head: PrintHead::default(),
                 platform_bounds: (
                     Point3D::new(0.0, 0.0, 0.0),
                     Point3D::new(200.0, 200.0, 200.0),

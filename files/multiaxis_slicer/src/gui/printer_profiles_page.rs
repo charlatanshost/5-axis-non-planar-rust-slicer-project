@@ -549,6 +549,18 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
                 ).changed() { changed = true; }
             });
             ui.horizontal(|ui| {
+                ui.label("Nozzle clearance:")
+                    .on_hover_text("Height above the nozzle tip excluded from collision testing (mm). \
+                        Models the nozzle cone protruding below the heater block, so the head body is \
+                        not tested against the layer being printed. Typically 1-3 mm.");
+                if ui.add(
+                    egui::DragValue::new(&mut profile.nozzle_clearance)
+                        .range(0.0..=20.0)
+                        .speed(0.1)
+                        .suffix(" mm"),
+                ).changed() { changed = true; }
+            });
+            ui.horizontal(|ui| {
                 ui.label("Linear travel (0 = fixed):");
                 if ui.add(egui::DragValue::new(&mut profile.head_travel[0]).suffix(" mm").speed(1.0).prefix("X ")).changed() { changed = true; }
                 if ui.add(egui::DragValue::new(&mut profile.head_travel[1]).suffix(" mm").speed(1.0).prefix("Y ")).changed() { changed = true; }
