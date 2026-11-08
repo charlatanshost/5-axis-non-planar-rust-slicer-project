@@ -10,7 +10,7 @@
 // 2. Global step: Solve Laplacian system L*p' = b for new vertex positions
 // 3. Iterate until convergence
 
-use crate::geometry::{Point3D, Vector3D};
+use crate::geometry::Point3D;
 use crate::s3_slicer::tet_mesh::TetMesh;
 use crate::s3_slicer::tet_quaternion_field::TetQuaternionField;
 use nalgebra::{Matrix3, Vector3 as NVector3, SVD};

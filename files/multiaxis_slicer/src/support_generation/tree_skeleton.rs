@@ -4,7 +4,7 @@
 use crate::geometry::{Point3D, Vector3D};
 use crate::support_generation::overhang_detection::OverhangFace;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Node in the support tree
 #[derive(Debug, Clone, Serialize, Deserialize)]

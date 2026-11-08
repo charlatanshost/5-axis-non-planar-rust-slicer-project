@@ -4,7 +4,7 @@
 use crate::geometry::{Point3D, Vector3D, Triangle};
 use crate::mesh::Mesh;
 use crate::s3_slicer::scalar_field::ScalarField;
-use nalgebra::{Matrix3, Rotation3, UnitQuaternion};
+use nalgebra::UnitQuaternion;
 
 /// Configuration for mesh deformation
 #[derive(Debug, Clone)]

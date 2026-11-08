@@ -1,4 +1,4 @@
-use crate::geometry::{Contour, Point3D, Vector3D};
+use crate::geometry::{Point3D, Vector3D};
 use crate::slicing::Layer;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};

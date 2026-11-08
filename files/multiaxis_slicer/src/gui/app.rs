@@ -1,6 +1,6 @@
 // Main GUI application state and update logic
 
-use crate::{Mesh, Result};
+use crate::Mesh;
 use crate::geometry::Vector3D;
 use crate::slicing::{Slicer, SlicingConfig, Layer};
 use crate::toolpath::{Toolpath, ToolpathGenerator};

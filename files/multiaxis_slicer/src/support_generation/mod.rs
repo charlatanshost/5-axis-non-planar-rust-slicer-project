@@ -11,7 +11,6 @@ pub use support_toolpath::{SupportToolpathConfig, generate_support_toolpaths};
 
 use crate::mesh::Mesh;
 use crate::centroidal_axis::CentroidalAxis;
-use crate::geometry::Point3D;
 
 /// Complete support generation pipeline
 pub struct SupportGenerator {

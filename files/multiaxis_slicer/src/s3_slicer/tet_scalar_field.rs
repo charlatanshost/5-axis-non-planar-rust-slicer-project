@@ -10,7 +10,6 @@
 
 use crate::geometry::{Point3D, Vector3D};
 use crate::s3_slicer::tet_mesh::TetMesh;
-use sprs::TriMat;
 use std::collections::HashMap;
 
 /// Scalar field defined on tet mesh vertices

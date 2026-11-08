@@ -1,7 +1,7 @@
 // Overhang detection for automatic support generation
 // Based on SIGGRAPH Asia 2022: Support Generation for Curved RoboFDM
 
-use crate::geometry::{Point3D, Vector3D, Triangle};
+use crate::geometry::{Point3D, Vector3D};
 use crate::mesh::Mesh;
 use crate::centroidal_axis::CentroidalAxis;
 use serde::{Deserialize, Serialize};
@@ -201,6 +201,7 @@ pub fn cluster_overhangs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::Triangle;
 
     #[test]
     fn test_angle_calculation() {

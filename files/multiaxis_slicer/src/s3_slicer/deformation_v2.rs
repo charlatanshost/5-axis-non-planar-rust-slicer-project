@@ -10,9 +10,6 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use nalgebra::UnitQuaternion;
 
-// Import heat method for geodesic distance computation
-use crate::s3_slicer::heat_method;
-
 /// Complete S3-Slicer virtual deformation system
 /// Note: This computes a VIRTUAL deformation (scalar field) without physically rotating the mesh
 pub struct S3SlicerDeformation {
@@ -626,7 +623,7 @@ fn compute_bounds(triangles: &[Triangle]) -> (Point3D, Point3D) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::s3_slicer::quaternion_field::{QuaternionFieldConfig, FabricationObjective};
+    use crate::s3_slicer::quaternion_field::QuaternionFieldConfig;
 
     #[test]
     fn test_deformation_system() {

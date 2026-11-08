@@ -6,7 +6,7 @@ use crate::slicing::{Layer, Slicer, SlicingConfig};
 use crate::geometry::{Point3D, Vector3D, LineSegment};
 use crate::s3_slicer::{
     QuaternionField, QuaternionFieldConfig, FabricationObjective,
-    S3SlicerDeformation, ScalarField, ScalarFieldConfig, FieldType,
+    S3SlicerDeformation, ScalarField, ScalarFieldConfig,
     IsosurfaceConfig, extract_curved_layers, CurvedLayer,
     AsapSolver, AsapConfig,
     TetMesh, TetQuaternionField, TetAsapSolver, TetAsapConfig,
@@ -16,7 +16,6 @@ use crate::s3_slicer::tet_dijkstra_field::TetDijkstraField;
 use crate::s3_slicer::s4_rotation_field::{S4RotationField, S4RotationConfig};
 use crate::s3_slicer::tet_point_location::{TetSpatialGrid, interpolate_point};
 use rayon::prelude::*;
-use std::collections::HashMap;
 
 /// Deformation method for S3-Slicer
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -2,7 +2,7 @@
 // Per-tetrahedron rotation field optimized for fabrication objectives
 // Uses tet face adjacency for smoothness (shared faces instead of shared edges)
 
-use crate::geometry::{Point3D, Vector3D};
+use crate::geometry::Vector3D;
 use crate::s3_slicer::tet_mesh::TetMesh;
 use crate::s3_slicer::quaternion_field::{QuaternionFieldConfig, FabricationObjective};
 use nalgebra::UnitQuaternion;
@@ -362,6 +362,7 @@ fn compute_field_energy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::Point3D;
     use crate::s3_slicer::tet_mesh::Tetrahedron;
 
     fn make_simple_tet_mesh() -> TetMesh {

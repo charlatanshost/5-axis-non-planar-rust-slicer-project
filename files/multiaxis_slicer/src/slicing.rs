@@ -1,4 +1,4 @@
-use crate::geometry::{Contour, LineSegment, Point3D, Vector3D};
+use crate::geometry::{Contour, LineSegment, Point3D};
 use crate::mesh::Mesh;
 use crate::Result;
 use rayon::prelude::*;

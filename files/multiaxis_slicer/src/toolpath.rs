@@ -2,7 +2,7 @@ use crate::geometry::{Point3D, Vector3D};
 use crate::mesh::Mesh;
 use crate::slicing::Layer;
 use crate::centroidal_axis::CentroidalAxis;
-use crate::toolpath_patterns::{ToolpathPattern, ToolpathConfig, generate_spiral_pattern, generate_zigzag_pattern, generate_contour_pattern, generate_clipped_infill, resample_contour, MeshRayCaster, is_point_in_contour};
+use crate::toolpath_patterns::{ToolpathPattern, ToolpathConfig, generate_spiral_pattern, generate_zigzag_pattern, generate_clipped_infill, resample_contour, MeshRayCaster, is_point_in_contour};
 use serde::{Deserialize, Serialize};
 
 /// Toolpath for a single layer

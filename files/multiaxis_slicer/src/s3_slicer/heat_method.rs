@@ -6,7 +6,7 @@
 // 2. Vector Field: Compute normalized gradients X = -∇u / |∇u|
 // 3. Distance Recovery: Solve Poisson equation Δφ = ∇·X
 
-use crate::geometry::{Point3D, Vector3D, Triangle};
+use crate::geometry::{Point3D, Vector3D};
 use crate::mesh::Mesh;
 use sprs::{CsMat, TriMat};
 use rayon::prelude::*;

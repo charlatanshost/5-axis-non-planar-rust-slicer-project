@@ -3,7 +3,6 @@
 use crate::gui::app::{SlicerApp, BedShape};
 use crate::Mesh as SlicerMesh;
 use egui;
-use eframe::glow;
 use std::sync::Arc;
 use three_d::*;
 

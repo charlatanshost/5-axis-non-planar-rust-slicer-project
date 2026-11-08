@@ -1,7 +1,7 @@
 // Advanced toolpath pattern generation
 // Based on algorithms from SIGGRAPH Asia 2022 paper
 
-use crate::geometry::{Point3D, Vector3D, Contour, Triangle};
+use crate::geometry::{Point3D, Contour, Triangle};
 use crate::mesh::Mesh;
 use crate::slicing::Layer;
 use serde::{Deserialize, Serialize};

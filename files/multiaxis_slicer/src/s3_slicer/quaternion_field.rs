@@ -4,7 +4,7 @@
 
 use crate::geometry::{Point3D, Vector3D};
 use crate::mesh::Mesh;
-use nalgebra::{UnitQuaternion, Vector3};
+use nalgebra::UnitQuaternion;
 use std::collections::HashMap;
 use rayon::prelude::*;
 

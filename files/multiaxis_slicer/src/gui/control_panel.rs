@@ -2,7 +2,6 @@
 
 use crate::gui::app::SlicerApp;
 use egui;
-use std::path::PathBuf;
 
 pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
     egui::SidePanel::left("control_panel")
