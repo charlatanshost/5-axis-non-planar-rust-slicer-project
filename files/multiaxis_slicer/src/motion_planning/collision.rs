@@ -125,6 +125,15 @@ impl CollisionDetector {
         self.mesh_collider = MeshCollider::from_mesh(mesh).map(Arc::new);
     }
 
+    /// Whether a collision mesh has been installed.
+    ///
+    /// While this is false, the mesh checks are no-ops and only the platform
+    /// bounds are enforced -- so callers must not report that the part
+    /// geometry was checked.
+    pub fn has_collision_mesh(&self) -> bool {
+        self.mesh_collider.is_some()
+    }
+
     /// Check if the printhead (modeled as a vertical capsule above the nozzle)
     /// intersects the cached collision mesh.
     ///

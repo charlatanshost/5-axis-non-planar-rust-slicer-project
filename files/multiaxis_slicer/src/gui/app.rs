@@ -3151,8 +3151,38 @@ impl SlicerApp {
                 self.log("✓ Motion planning complete!".to_string());
                 self.log(format!("  - Waypoints: {}", motion_plan.waypoints.len()));
                 self.log(format!("  - Path segments: {}", motion_plan.path.len()));
-                self.log("  - Singularities avoided".to_string());
-                self.log("  - Collisions checked".to_string());
+
+                // Report what the planner actually achieved. These two lines
+                // used to be unconditional claims; both are false in the
+                // common case -- a vertical tool is scored as singular, so a
+                // planar print leaves no waypoint with a usable solution, and
+                // no collision mesh is installed on the detector at all.
+                let diag = motion_plan.diagnostics;
+                if diag.fell_back_to_greedy {
+                    self.log(
+                        "  - ⚠ No waypoint had a non-singular, collision-free solution; \
+                         orientations were left as sliced (no search performed)"
+                            .to_string(),
+                    );
+                } else {
+                    self.log(format!(
+                        "  - Singularity check: {} of {} waypoints had a usable solution",
+                        diag.waypoints_with_solutions,
+                        diag.waypoints_with_solutions + diag.waypoints_without_solutions
+                    ));
+                    if diag.waypoints_without_solutions > 0 {
+                        self.log(format!(
+                            "  - ⚠ {} waypoints kept their sliced orientation (no alternative found)",
+                            diag.waypoints_without_solutions
+                        ));
+                    }
+                }
+                self.log(if diag.mesh_collision_checked {
+                    "  - Collisions checked against platform bounds and part mesh".to_string()
+                } else {
+                    "  - Collisions checked against platform bounds only (no part mesh installed)"
+                        .to_string()
+                });
                 self.log("💡 Ready to generate G-code".to_string());
             }
             Err(e) => {

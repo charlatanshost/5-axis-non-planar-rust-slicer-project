@@ -74,7 +74,15 @@ impl MotionPlanner {
         let path = self.path_planner.plan_path_from_solutions(&valid_solutions, &waypoints)?;
 
         log::info!("Step 5: Motion plan complete");
-        Ok(MotionPlan { waypoints, path })
+
+        let diagnostics = MotionPlanDiagnostics {
+            waypoints_with_solutions: valid_solutions.iter().filter(|s| !s.is_empty()).count(),
+            waypoints_without_solutions: valid_solutions.iter().filter(|s| s.is_empty()).count(),
+            fell_back_to_greedy: valid_solutions.iter().all(|s| s.is_empty()),
+            mesh_collision_checked: self.collision_detector.has_collision_mesh(),
+        };
+
+        Ok(MotionPlan { waypoints, path, diagnostics })
     }
 
     /// Step 1 of the pipeline.
@@ -189,10 +197,36 @@ impl Default for MotionPlanningConfig {
     }
 }
 
+/// What the planner actually managed to do, so callers can report it instead
+/// of guessing.
+///
+/// The GUI used to log "Singularities avoided" and "Collisions checked"
+/// unconditionally on success. Neither is reliably true: this kinematic model
+/// scores a *vertical* tool as singular (gimbal lock -- the secondary rotary
+/// axis cannot change the tool direction), so on an ordinary planar print
+/// every waypoint is filtered out, `plan_path_from_solutions` finds no
+/// candidates at all, and it falls back to picking solution 0 everywhere.
+/// Mesh collision is likewise only tested when a collision mesh has been
+/// installed on the detector, which `MotionPlanner::new` does not do.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MotionPlanDiagnostics {
+    /// Waypoints that had at least one non-singular, collision-free solution.
+    pub waypoints_with_solutions: usize,
+    /// Waypoints with no usable solution; the planner guessed for these.
+    pub waypoints_without_solutions: usize,
+    /// No waypoint had a usable solution, so the returned path is the greedy
+    /// "solution 0 everywhere" fallback rather than a searched result.
+    pub fell_back_to_greedy: bool,
+    /// Whether collision checking included the part mesh, or only the
+    /// platform bounds.
+    pub mesh_collision_checked: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct MotionPlan {
     pub waypoints: Vec<Waypoint>,
     pub path: Vec<(usize, usize)>,  // (waypoint_idx, solution_idx)
+    pub diagnostics: MotionPlanDiagnostics,
 }
 
 impl MotionPlan {
@@ -245,6 +279,81 @@ mod tests {
                 wp.extrusion
             );
         }
+    }
+
+    /// Regression test for D-02. The GUI reported "Singularities avoided" and
+    /// "Collisions checked" on every success. For a plain vertical-tool print
+    /// -- which is what every planar slice produces -- neither holds: the
+    /// vertical pose is gimbal-locked, so no waypoint survives filtering and
+    /// the planner silently returns the greedy fallback.
+    #[test]
+    fn test_vertical_print_reports_the_greedy_fallback() {
+        let planner = MotionPlanner::new(MotionPlanningConfig::default());
+        let waypoints = sample_waypoints();
+        let n = waypoints.len();
+
+        let plan = planner.plan_complete_path(waypoints).unwrap();
+        let diag = plan.diagnostics;
+
+        assert!(
+            diag.fell_back_to_greedy,
+            "a vertical-tool print should find no usable solution, but reported {:?}",
+            diag
+        );
+        assert_eq!(diag.waypoints_with_solutions, 0);
+        assert_eq!(diag.waypoints_without_solutions, n);
+        assert!(
+            !diag.mesh_collision_checked,
+            "MotionPlanner::new installs no collision mesh"
+        );
+
+        // The returned path really is "solution 0 everywhere", not a search.
+        assert_eq!(plan.path, (0..n).map(|i| (i, 0)).collect::<Vec<_>>());
+    }
+
+    /// The counterpart: tilted waypoints do clear the singularity filter, so
+    /// the diagnostics must not be hardwired to the pessimistic answer.
+    #[test]
+    fn test_tilted_print_reports_real_solution_counts() {
+        let planner = MotionPlanner::new(MotionPlanningConfig::default());
+        // ~30 deg off vertical in both rotary axes keeps |sin| well above the
+        // 0.01 lambda threshold, and the positions sit inside the platform.
+        let tilted = Vector3D::new(0.5, 0.5, 0.707);
+        let waypoints = vec![
+            Waypoint { position: Point3D::new(50.0, 50.0, 10.0), orientation: tilted, layer_idx: 0, extrusion: 0.0 },
+            Waypoint { position: Point3D::new(60.0, 50.0, 10.0), orientation: tilted, layer_idx: 0, extrusion: 1.0 },
+        ];
+
+        let plan = planner.plan_complete_path(waypoints).unwrap();
+        let diag = plan.diagnostics;
+
+        assert!(!diag.fell_back_to_greedy, "tilted poses should be solvable: {:?}", diag);
+        assert_eq!(diag.waypoints_with_solutions, 2);
+        assert_eq!(diag.waypoints_without_solutions, 0);
+    }
+
+    #[test]
+    fn test_diagnostics_report_mesh_coverage() {
+        use crate::geometry::Triangle;
+
+        let mut planner = MotionPlanner::new(MotionPlanningConfig::default());
+        assert!(!planner.collision_detector.has_collision_mesh());
+
+        // A triangle far outside the print area: installed, but not in the way.
+        let mesh = crate::mesh::Mesh::new(vec![Triangle::new(
+            Point3D::new(500.0, 500.0, 0.0),
+            Point3D::new(501.0, 500.0, 0.0),
+            Point3D::new(500.0, 501.0, 0.0),
+        )])
+        .expect("single triangle is a valid mesh");
+        planner.collision_detector.set_collision_mesh(&mesh);
+        assert!(planner.collision_detector.has_collision_mesh());
+
+        let plan = planner.plan_complete_path(sample_waypoints()).unwrap();
+        assert!(
+            plan.diagnostics.mesh_collision_checked,
+            "diagnostics should reflect the installed mesh"
+        );
     }
 
     #[test]
