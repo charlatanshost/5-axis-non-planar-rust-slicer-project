@@ -186,10 +186,18 @@ fn generate_support_infill(
             config.filament_diameter,
         );
 
+        // `position` is the destination of the move and `extrusion` is the
+        // volume laid down *reaching* it (see ToolpathSegment). Both segments
+        // used to carry the full scan-line extrusion, so every line was
+        // extruded twice: once on the connector hop in from the previous
+        // line's end, and again along the line itself.
+        //
+        // The hop to p1 crosses the column at `line_spacing` (0.4 / 0.15 is
+        // ~2.7 mm at the default density), so it is a travel, not a bridge.
         segments.push(ToolpathSegment {
             position: p1,
             orientation: Vector3D::new(0.0, 0.0, 1.0),
-            extrusion,
+            extrusion: 0.0,
             feedrate: config.feedrate,
         });
 
@@ -241,6 +249,67 @@ mod tests {
             let distance = ((point.x - center.x).powi(2) + (point.y - center.y).powi(2)).sqrt();
             assert!((distance - radius).abs() < 0.001);
         }
+    }
+
+    /// Regression test for D-01. Every infill scan line used to be emitted as
+    /// two segments both carrying the *whole line's* extrusion, so each line
+    /// was paid for twice -- once on the connector hop in from the previous
+    /// line, once along the line itself. That is ~2x over-extrusion through
+    /// the entire support column.
+    #[test]
+    fn test_infill_extrusion_matches_distance_actually_travelled() {
+        let config = SupportToolpathConfig::default();
+        let center = Point3D::new(0.0, 0.0, 0.0);
+        let segments = generate_support_infill(center, 5.0, 0.0, &config);
+
+        assert!(segments.len() >= 4, "expected several scan lines, got {}", segments.len());
+        assert_eq!(segments.len() % 2, 0, "scan lines come in travel/extrude pairs");
+
+        // Segments come as (connector hop, scan line). The hop across the
+        // column is a travel; the scan line bills exactly its own length.
+        for (pair_idx, pair) in segments.chunks(2).enumerate() {
+            assert_eq!(
+                pair[0].extrusion, 0.0,
+                "connector hop into scan line {} should be a travel",
+                pair_idx
+            );
+
+            let distance = (pair[1].position - pair[0].position).norm();
+            let expected = calculate_extrusion(
+                distance,
+                config.extrusion_width,
+                config.layer_height,
+                config.filament_diameter,
+            );
+            assert!(
+                (pair[1].extrusion - expected).abs() < 1e-12,
+                "scan line {} extrudes {} over {} mm, expected {}",
+                pair_idx,
+                pair[1].extrusion,
+                distance,
+                expected
+            );
+        }
+
+        // And the total is the scan-line length alone, not the round trip.
+        let scan_length: f64 = segments
+            .chunks(2)
+            .map(|pair| (pair[1].position - pair[0].position).norm())
+            .sum();
+        let total: f64 = segments.iter().map(|s| s.extrusion).sum();
+        let expected_total = calculate_extrusion(
+            scan_length,
+            config.extrusion_width,
+            config.layer_height,
+            config.filament_diameter,
+        );
+        assert!(
+            (total - expected_total).abs() < 1e-12,
+            "total extrusion {} should equal {} for {} mm of scan lines",
+            total,
+            expected_total,
+            scan_length
+        );
     }
 
     #[test]
