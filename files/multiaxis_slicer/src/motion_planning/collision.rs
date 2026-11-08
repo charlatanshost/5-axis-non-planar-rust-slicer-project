@@ -134,11 +134,11 @@ impl CollisionDetector {
         self.mesh_collider.is_some()
     }
 
-    /// Check if the printhead (modeled as a vertical capsule above the nozzle)
+    /// Check if the printhead, held vertically above the nozzle at `position`,
     /// intersects the cached collision mesh.
     ///
-    /// The capsule extends from `position` (nozzle tip) along the tool axis by
-    /// `body_height`, with radius `body_radius`.
+    /// Shorthand for [`Self::check_collision_with_mesh_oriented`] with a
+    /// straight-up tool axis; see there for the body model.
     pub fn check_collision_with_mesh(&self, position: &Point3D) -> bool {
         self.check_collision_with_mesh_oriented(position, &Vector3D::new(0.0, 0.0, 1.0))
     }
@@ -270,7 +270,7 @@ mod tests {
         use crate::geometry::Triangle;
         use crate::mesh::Mesh;
 
-        // A triangle at z=5, 30x30mm — well within the capsule (radius=15, at z=0)
+        // A triangle at z=5 — inside the body's footprint (radius=15, at z=0)
         let triangles = vec![
             Triangle::new(
                 Point3D::new(-5.0, -5.0, 5.0),
@@ -282,9 +282,10 @@ mod tests {
         let mut det = make_detector();
         det.set_collision_mesh(&mesh);
 
-        // Nozzle at z=0, capsule extends to z=50 with radius=15 — should hit the triangle at z=5
+        // Nozzle at z=0, body spans z in [2, 52] at radius 15 — the triangle
+        // at z=5 is inside it.
         let hit = det.check_collision_with_mesh(&Point3D::new(0.0, 0.0, 0.0));
-        assert!(hit, "Capsule should intersect triangle at z=5");
+        assert!(hit, "head body should intersect triangle at z=5");
     }
 
     #[test]
@@ -292,7 +293,7 @@ mod tests {
         use crate::geometry::Triangle;
         use crate::mesh::Mesh;
 
-        // Triangle far away from the capsule (x=200)
+        // Triangle well outside the body's footprint (x=200)
         let triangles = vec![
             Triangle::new(
                 Point3D::new(200.0, 0.0, 5.0),
@@ -305,7 +306,7 @@ mod tests {
         det.set_collision_mesh(&mesh);
 
         let hit = det.check_collision_with_mesh(&Point3D::new(0.0, 0.0, 0.0));
-        assert!(!hit, "Capsule should not intersect distant triangle");
+        assert!(!hit, "head body should not intersect distant triangle");
     }
 
     fn triangle_at_z(z: f64) -> crate::mesh::Mesh {
