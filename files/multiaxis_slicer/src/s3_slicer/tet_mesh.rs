@@ -469,7 +469,7 @@ impl TetMesh {
     ) -> Result<Self, String> {
         // Extract unique vertices and build face index list
         let mut vertices: Vec<Point3D> = Vec::new();
-        let mut vertex_map: HashMap<u64, usize> = HashMap::new();
+        let mut vertex_map: HashMap<VertexKey, usize> = HashMap::new();
         let mut facets: Vec<[usize; 3]> = Vec::new();
 
         for triangle in &surface_mesh.triangles {
@@ -1069,7 +1069,7 @@ fn add_interior_points(
 fn create_simple_tetrahedralization(
     vertices: &[Point3D],
     surface_triangles: &[crate::geometry::Triangle],
-    vertex_map: &HashMap<u64, usize>,
+    vertex_map: &HashMap<VertexKey, usize>,
     surface_vertex_count: usize,
 ) -> Vec<Tetrahedron> {
     let mut tets = Vec::new();
@@ -1717,21 +1717,109 @@ fn grid_ray_z_tri(a: &Point3D, b: &Point3D, c: &Point3D, x0: f64, y0: f64) -> Op
 }
 
 /// Hash a point for deduplication
-fn hash_point(p: &Point3D) -> u64 {
-    let x = (p.x * 1000000.0).round() as i64;
-    let y = (p.y * 1000000.0).round() as i64;
-    let z = (p.z * 1000000.0).round() as i64;
+/// Exact identity key for a vertex position, quantised to 1 nanometre.
+///
+/// This used to be a `u64` *hash* of the same quantised coordinates, used
+/// directly as a `HashMap` key -- so any hash collision silently welded two
+/// distinct vertices into one. That is unsound however good the hash is, and
+/// this hash was also mis-transcribed: `hash` started at 0, so the leading
+/// `hash.wrapping_mul(73856093)` multiplied zero and the first constant never
+/// reached `x` at all, leaving a weak two-round mix.
+///
+/// On structured geometry the damage was severe and systematic. A UV sphere
+/// lost 17% of its vertices (738 distinct positions collapsed to 612; at finer
+/// tessellation 3010 to 2504). The merged vertices produced degenerate and
+/// self-intersecting facets, so TetGen refused the mesh and returned 0
+/// tetrahedra -- which the caller then reported as "mesh may have
+/// self-intersecting facets", blaming the input for corruption introduced here.
+///
+/// Comparing the quantised coordinates directly cannot collide, and is also
+/// cheaper than hashing them first.
+pub type VertexKey = (i64, i64, i64);
 
-    let mut hash = 0u64;
-    hash = hash.wrapping_mul(73856093) ^ (x as u64);
-    hash = hash.wrapping_mul(19349663) ^ (y as u64);
-    hash = hash.wrapping_mul(83492791) ^ (z as u64);
-    hash
+fn hash_point(p: &Point3D) -> VertexKey {
+    (
+        (p.x * 1_000_000.0).round() as i64,
+        (p.y * 1_000_000.0).round() as i64,
+        (p.z * 1_000_000.0).round() as i64,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for D-06. `hash_point` used to fold the quantised
+    /// coordinates into a `u64` and that hash was used as the vertex identity
+    /// key, so any collision welded two distinct vertices into one. On
+    /// structured geometry this was catastrophic and systematic: a UV sphere
+    /// lost 17% of its vertices, and the resulting degenerate facets made
+    /// TetGen return 0 tetrahedra.
+    ///
+    /// The key must distinguish every distinct quantised position, so dedup by
+    /// key and dedup by exact quantised tuple have to agree exactly.
+    #[test]
+    fn test_vertex_key_never_merges_distinct_positions() {
+        use std::collections::HashSet;
+
+        // A UV sphere is the shape that exposed this: highly structured,
+        // sign-symmetric coordinates with many shared values per ring.
+        let (radius, stacks, slices) = (15.0, 24usize, 32usize);
+        let phi_of = |i: usize| std::f64::consts::PI * (1.0 - i as f64 / stacks as f64);
+        let pt = |phi: f64, theta: f64| {
+            Point3D::new(
+                radius * phi.sin() * theta.cos(),
+                radius * phi.sin() * theta.sin(),
+                radius * phi.cos() + radius,
+            )
+        };
+
+        let mut points = Vec::new();
+        for i in 0..=stacks {
+            let phi = phi_of(i);
+            for j in 0..slices {
+                let theta = 2.0 * std::f64::consts::PI * j as f64 / slices as f64;
+                points.push(pt(phi, theta));
+            }
+        }
+
+        let by_key: HashSet<VertexKey> = points.iter().map(hash_point).collect();
+        let by_exact: HashSet<(i64, i64, i64)> = points
+            .iter()
+            .map(|p| {
+                (
+                    (p.x * 1_000_000.0).round() as i64,
+                    (p.y * 1_000_000.0).round() as i64,
+                    (p.z * 1_000_000.0).round() as i64,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            by_key.len(),
+            by_exact.len(),
+            "vertex key merged {} distinct positions ({} exact -> {} keys)",
+            by_exact.len() - by_key.len(),
+            by_exact.len(),
+            by_key.len()
+        );
+
+        // And the sphere really does have the geometry we think it does: two
+        // poles plus (stacks - 1) rings of `slices` vertices each.
+        assert_eq!(by_exact.len(), 2 + (stacks - 1) * slices);
+    }
+
+    #[test]
+    fn test_vertex_key_separates_near_but_distinct_points() {
+        // 1 nm apart is the quantisation limit: these must stay distinct.
+        let a = Point3D::new(0.0, 0.0, 0.0);
+        let b = Point3D::new(0.000_001, 0.0, 0.0);
+        assert_ne!(hash_point(&a), hash_point(&b));
+
+        // Closer than the quantum, they are deliberately the same vertex.
+        let c = Point3D::new(0.000_000_1, 0.0, 0.0);
+        assert_eq!(hash_point(&a), hash_point(&c));
+    }
 
     #[test]
     fn test_tetrahedron_volume() {
