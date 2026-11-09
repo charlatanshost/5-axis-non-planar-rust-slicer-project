@@ -960,21 +960,62 @@ impl SlicerApp {
         let mesh = match &self.mesh { Some(m) => m, None => return };
         if self.toolpaths.is_empty() { return; }
 
-        // ── Build 2-D XY bin grid ─────────────────────────────────────────
-        let n_tris = mesh.triangles.len();
-        let mut centroids: Vec<[f64; 3]> = Vec::with_capacity(n_tris);
-        let mut face_normals: Vec<crate::geometry::Vector3D> = Vec::with_capacity(n_tris);
+        // ── Where the orientations come from ──────────────────────────────
+        //
+        // The tool should point perpendicular to the surface being PRINTED,
+        // which is the layer. When the slicer knows the layer normals --
+        // marching tetrahedra computes them from the scalar field gradient,
+        // which is exactly the isosurface normal -- use those.
+        //
+        // Otherwise fall back to the nearest model triangle. That fallback is
+        // only an approximation and it is wrong wherever the layer cuts
+        // across the model rather than along it: at the base of a vertical
+        // wall the nearest triangle IS the wall, whose normal is horizontal,
+        // so a flat bottom layer came out tilted to the limit. On a Benchy
+        // the first extrusion was commanded at 44.9 degrees with nothing
+        // below it but the bed.
+        let mut centroids: Vec<[f64; 3]> = Vec::new();
+        let mut face_normals: Vec<crate::geometry::Vector3D> = Vec::new();
 
-        for tri in &mesh.triangles {
-            let cx = (tri.v0.x + tri.v1.x + tri.v2.x) / 3.0;
-            let cy = (tri.v0.y + tri.v1.y + tri.v2.y) / 3.0;
-            let cz = (tri.v0.z + tri.v1.z + tri.v2.z) / 3.0;
-            centroids.push([cx, cy, cz]);
+        let layer_points: usize = self
+            .layers
+            .iter()
+            .flat_map(|l| l.contours.iter())
+            .filter(|c| c.normals.is_some())
+            .map(|c| c.points.len())
+            .sum();
 
-            let mut n = tri.normal();
-            if n.z < 0.0 { n = -n; } // always upper hemisphere
-            face_normals.push(n);
+        let from_layers = layer_points > 0;
+        if from_layers {
+            centroids.reserve(layer_points);
+            face_normals.reserve(layer_points);
+            for layer in &self.layers {
+                for contour in &layer.contours {
+                    let Some(ns) = contour.normals.as_ref() else { continue };
+                    for (p, n) in contour.points.iter().zip(ns.iter()) {
+                        centroids.push([p.x, p.y, p.z]);
+                        let mut n = *n;
+                        if n.z < 0.0 { n = -n; } // always upper hemisphere
+                        face_normals.push(n);
+                    }
+                }
+            }
+        } else {
+            let n_tris = mesh.triangles.len();
+            centroids.reserve(n_tris);
+            face_normals.reserve(n_tris);
+            for tri in &mesh.triangles {
+                let cx = (tri.v0.x + tri.v1.x + tri.v2.x) / 3.0;
+                let cy = (tri.v0.y + tri.v1.y + tri.v2.y) / 3.0;
+                let cz = (tri.v0.z + tri.v1.z + tri.v2.z) / 3.0;
+                centroids.push([cx, cy, cz]);
+
+                let mut n = tri.normal();
+                if n.z < 0.0 { n = -n; } // always upper hemisphere
+                face_normals.push(n);
+            }
         }
+        if centroids.is_empty() { return; }
 
         let x_min = mesh.bounds_min.x;
         let y_min = mesh.bounds_min.y;
@@ -1058,8 +1099,11 @@ impl SlicerApp {
         }
 
         self.log(format!(
-            "Applied surface normals to {} segments (max tilt {:.0}°, {} triangles)",
-            count, max_tilt_deg, n_tris
+            "Oriented {} segments from {} {} (max tilt {:.0}°)",
+            count,
+            centroids.len(),
+            if from_layers { "layer normals" } else { "model triangles" },
+            max_tilt_deg
         ));
     }
 

@@ -9,7 +9,7 @@
 // - 1 vertex above (or 3 below): triangle intersection (3 edge crossings)
 // - 2 vertices above: quad intersection (4 edge crossings, split to 2 triangles)
 
-use crate::geometry::{Point3D, LineSegment, Contour};
+use crate::geometry::{Point3D, LineSegment, Contour, Vector3D};
 use crate::s3_slicer::tet_mesh::TetMesh;
 use crate::s3_slicer::tet_scalar_field::TetScalarField;
 use crate::s3_slicer::isosurface::CurvedLayer;
@@ -52,6 +52,42 @@ pub fn extract_tet_layers(
 }
 
 /// Extract a single layer at a given iso-value
+/// Gradient of the scalar field inside a tetrahedron.
+///
+/// The field is linear within a tet, so the gradient is constant and follows
+/// from the four vertex values: with `D` the matrix of edge vectors from
+/// vertex 0 and `b` the corresponding value differences, `Dᵀ ∇s = b`.
+///
+/// The isosurface is a level set of that field, so `∇s` normalised is the
+/// surface normal — which is exactly the direction the tool should point when
+/// printing this layer. It is the quantity the GUI has been approximating by
+/// looking for the nearest *model* triangle, which is a different surface and
+/// disagrees wherever the layer cuts across the model rather than along it.
+fn tet_gradient(tet_mesh: &TetMesh, v: &[usize; 4], s: &[f64; 4]) -> Option<Vector3D> {
+    use nalgebra::Matrix3;
+
+    let p0 = tet_mesh.vertices[v[0]];
+    let e1 = tet_mesh.vertices[v[1]] - p0;
+    let e2 = tet_mesh.vertices[v[2]] - p0;
+    let e3 = tet_mesh.vertices[v[3]] - p0;
+
+    // Rows are the edge vectors, so this is D-transpose.
+    let dt = Matrix3::new(
+        e1.x, e1.y, e1.z,
+        e2.x, e2.y, e2.z,
+        e3.x, e3.y, e3.z,
+    );
+    let b = Vector3D::new(s[1] - s[0], s[2] - s[0], s[3] - s[0]);
+
+    let grad = dt.try_inverse()? * b;
+    let len = grad.norm();
+    if !len.is_finite() || len < 1e-12 {
+        // Degenerate or flat tet: no usable direction.
+        return None;
+    }
+    Some(grad / len)
+}
+
 fn extract_at_iso_value(
     tet_mesh: &TetMesh,
     scalar_field: &TetScalarField,
@@ -59,6 +95,8 @@ fn extract_at_iso_value(
     min_contour_length: f64,
 ) -> CurvedLayer {
     let mut segments: Vec<LineSegment> = Vec::new();
+    // One per segment, parallel to `segments`.
+    let mut seg_normals: Vec<Vector3D> = Vec::new();
 
     // For each tetrahedron, find edge crossings
     for tet in &tet_mesh.tets {
@@ -71,6 +109,8 @@ fn extract_at_iso_value(
             scalar_field.value_at(v[2]),
             scalar_field.value_at(v[3]),
         ];
+
+        let segments_before = segments.len();
 
         // Classify vertices: above (true) or below (false) iso-value
         let above = [
@@ -149,7 +189,18 @@ fn extract_at_iso_value(
             }
             _ => unreachable!(),
         }
+
+        // Every segment this tet contributed shares the tet's gradient, since
+        // the field is linear inside it. Fall back to the build direction
+        // rather than dropping the segment if the tet is degenerate.
+        if segments.len() > segments_before {
+            let g = tet_gradient(tet_mesh, v, &s)
+                .unwrap_or_else(|| Vector3D::new(0.0, 0.0, 1.0));
+            seg_normals.resize(segments.len(), g);
+        }
     }
+
+    debug_assert_eq!(segments.len(), seg_normals.len());
 
     // Compute average Z for the layer
     let avg_z = if segments.is_empty() {
@@ -165,7 +216,7 @@ fn extract_at_iso_value(
         segments,
         z: avg_z,
         iso_value,
-        normals: Vec::new(), // Normals can be computed later if needed
+        normals: seg_normals,
     }
 }
 

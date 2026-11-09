@@ -167,11 +167,38 @@ fn intersect_edge_with_plane(p1: Point3D, p2: Point3D, z: f64) -> Option<Point3D
 pub struct Contour {
     pub points: Vec<Point3D>,
     pub closed: bool,
+    /// Outward normal of the layer surface at each point, parallel to
+    /// `points`, when the slicer that produced this contour knows it.
+    ///
+    /// This is the direction the tool should point: perpendicular to the
+    /// surface actually being printed. Without it, orientation has to be
+    /// guessed from the model, and guessing by nearest model triangle gives
+    /// the wrong answer wherever the layer and the model surface disagree —
+    /// at the base of a vertical wall the nearest triangle is the wall, whose
+    /// normal is horizontal, so a flat bottom layer gets tilted to the limit.
+    ///
+    /// `None` for slicers that do not compute it; callers must cope.
+    pub normals: Option<Vec<Vector3D>>,
 }
 
 impl Contour {
     pub fn new(points: Vec<Point3D>, closed: bool) -> Self {
-        Self { points, closed }
+        Self { points, closed, normals: None }
+    }
+
+    /// A contour that also knows which way the layer surface faces at each
+    /// point. `normals` must be the same length as `points`.
+    pub fn with_normals(points: Vec<Point3D>, closed: bool, normals: Vec<Vector3D>) -> Self {
+        debug_assert_eq!(points.len(), normals.len(), "normals must parallel points");
+        if points.len() != normals.len() {
+            return Self::new(points, closed);
+        }
+        Self { points, closed, normals: Some(normals) }
+    }
+
+    /// Layer-surface normal at point `i`, if known.
+    pub fn normal_at(&self, i: usize) -> Option<Vector3D> {
+        self.normals.as_ref().and_then(|n| n.get(i)).copied()
     }
 
     pub fn is_empty(&self) -> bool {

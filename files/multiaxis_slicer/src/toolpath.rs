@@ -144,7 +144,7 @@ impl ToolpathGenerator {
 
         // Reorder in-place: build new vec in ordered sequence, then replace
         let reordered: Vec<crate::geometry::Contour> = ordered.into_iter()
-            .map(|i| std::mem::replace(&mut contours[i], crate::geometry::Contour { points: Vec::new(), closed: false }))
+            .map(|i| std::mem::replace(&mut contours[i], crate::geometry::Contour::new(Vec::new(), false)))
             .collect();
         *contours = reordered;
     }

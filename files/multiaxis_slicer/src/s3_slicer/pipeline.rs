@@ -983,7 +983,7 @@ pub fn execute_s4_untransform(
             let n_subs = sub_contours.len();
             for sub in sub_contours {
                 let closed = contour.closed && n_subs == 1;
-                untransformed_contours.push(crate::geometry::Contour { points: sub, closed });
+                untransformed_contours.push(crate::geometry::Contour::new(sub, closed));
             }
         }
 

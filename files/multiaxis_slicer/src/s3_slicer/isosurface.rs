@@ -84,6 +84,42 @@ impl CurvedLayer {
                 self.segments.len(), paths.len());
         }
 
+        // Chaining returns bare points, so the per-segment normals have to be
+        // re-attached by position. Segment endpoints are exactly the points
+        // that come back out, so a quantised lookup matches them; a point
+        // shared by two segments averages their normals, which smooths the
+        // seam between adjacent tets.
+        let normal_lookup: Option<std::collections::HashMap<(i64, i64, i64), Vector3D>> =
+            if self.normals.len() == self.segments.len() && !self.normals.is_empty() {
+                let key = |p: &Point3D| -> (i64, i64, i64) {
+                    (
+                        (p.x * 1_000.0).round() as i64,
+                        (p.y * 1_000.0).round() as i64,
+                        (p.z * 1_000.0).round() as i64,
+                    )
+                };
+                let mut acc: std::collections::HashMap<(i64, i64, i64), (Vector3D, usize)> =
+                    std::collections::HashMap::new();
+                for (seg, n) in self.segments.iter().zip(self.normals.iter()) {
+                    for p in [&seg.start, &seg.end] {
+                        let e = acc.entry(key(p)).or_insert((Vector3D::zeros(), 0));
+                        e.0 += *n;
+                        e.1 += 1;
+                    }
+                }
+                Some(
+                    acc.into_iter()
+                        .map(|(k, (sum, n))| {
+                            let v = sum / n as f64;
+                            let len = v.norm();
+                            (k, if len > 1e-9 { v / len } else { Vector3D::new(0.0, 0.0, 1.0) })
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            };
+
         // Convert paths to Contour objects
         let contours: Vec<Contour> = paths.into_iter()
             .filter(|points| points.len() >= 2)  // Filter out single-point paths
@@ -95,9 +131,22 @@ impl CurvedLayer {
                     false
                 };
 
-                Contour {
-                    points,
-                    closed: is_closed,
+                match &normal_lookup {
+                    Some(map) => {
+                        let normals: Vec<Vector3D> = points
+                            .iter()
+                            .map(|p| {
+                                let k = (
+                                    (p.x * 1_000.0).round() as i64,
+                                    (p.y * 1_000.0).round() as i64,
+                                    (p.z * 1_000.0).round() as i64,
+                                );
+                                map.get(&k).copied().unwrap_or(Vector3D::new(0.0, 0.0, 1.0))
+                            })
+                            .collect();
+                        Contour::with_normals(points, is_closed, normals)
+                    }
+                    None => Contour::new(points, is_closed),
                 }
             })
             .collect();
