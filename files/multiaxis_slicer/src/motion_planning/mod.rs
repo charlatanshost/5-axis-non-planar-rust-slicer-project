@@ -33,12 +33,8 @@ pub struct MotionPlanner {
 
 impl MotionPlanner {
     pub fn new(config: MotionPlanningConfig) -> Self {
-        let collision_detector = CollisionDetector {
-            print_head: config.print_head,
-            platform_bounds: config.platform_bounds,
-            printed_mesh: None,
-            mesh_collider: None,
-        };
+        let collision_detector =
+            CollisionDetector::new(config.print_head, config.platform_bounds);
 
         let singularity_optimizer = SingularityOptimizer {
             lambda_threshold: config.lambda_threshold,

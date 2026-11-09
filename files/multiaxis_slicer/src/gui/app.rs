@@ -1875,22 +1875,29 @@ impl SlicerApp {
             .max(5.0);
         let body_height = self.tcp_offset + profile.head_dims[2];
 
-        let mut detector = crate::motion_planning::collision::CollisionDetector {
-            print_head: crate::motion_planning::collision::PrintHead {
+        let mut detector = crate::motion_planning::collision::CollisionDetector::new(
+            crate::motion_planning::collision::PrintHead {
                 nozzle_diameter: 0.4,
                 body_radius,
                 body_height,
                 nozzle_clearance: profile.nozzle_clearance,
             },
-            platform_bounds: (
+            (
                 crate::geometry::Point3D::new(-500.0, -500.0, -50.0),
                 crate::geometry::Point3D::new(500.0, 500.0, 1000.0),
             ),
-            printed_mesh: None,
-            mesh_collider: None,
-        };
-        // Build the BVH once; the loops below query it thousands of times.
-        detector.set_collision_mesh(&mesh);
+        );
+        // Build the BVH ladder once; the loops below query it thousands of
+        // times. Banded by height so a segment is only tested against
+        // geometry that exists by the time it is printed -- testing against
+        // the whole model made the head swerve around the part it was in the
+        // middle of printing.
+        // 4 bands rather than 8: the ladder is cumulative, so band i holds
+        // i/n of the mesh and the whole ladder costs about n/2 copies to
+        // build. On a Benchy 8 bands added ~57s; 4 keeps the benefit at half
+        // the build cost, and the granularity only needs to be fine enough
+        // that the head is not tested against material far above it.
+        detector.set_collision_mesh_banded(&mesh, 4);
 
         // How far the tool may lean: the tightest rotary axis AND the head's
         // physical tilt envelope, whichever binds.
@@ -1935,10 +1942,20 @@ impl SlicerApp {
                     .paths
                     .par_iter_mut()
                     .map(|seg| {
-                        // Skip if current orientation already clears the mesh.
-                        if !detector
-                            .check_collision_with_mesh_oriented(&seg.position, &seg.orientation)
-                        {
+                        // Only geometry already deposited can be hit. The
+                        // nozzle tip is at the surface being printed, so
+                        // anything at or below it exists; anything above does
+                        // not yet. Testing the whole model instead made the
+                        // first extrusion on a Benchy come out at 44.9 degrees
+                        // of tilt, dodging the hull it was printing.
+                        let printed_to_z = seg.position.z;
+
+                        // Skip if the current orientation already clears it.
+                        if !detector.check_collision_with_printed(
+                            &seg.position,
+                            &seg.orientation,
+                            printed_to_z,
+                        ) {
                             return 0usize;
                         }
 
@@ -1964,9 +1981,11 @@ impl SlicerApp {
                             max_tilt_deg,
                             steps,
                         ) {
-                            if !detector
-                                .check_collision_with_mesh_oriented(&seg.position, &trial)
-                            {
+                            if !detector.check_collision_with_printed(
+                                &seg.position,
+                                &trial,
+                                printed_to_z,
+                            ) {
                                 // Only override when a clear angle was actually
                                 // found. If every tilt still collides (e.g. we are
                                 // inside the mesh at the bottom of the print), keep

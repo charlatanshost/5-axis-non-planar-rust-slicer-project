@@ -62,6 +62,16 @@ pub struct CollisionDetector {
     /// [`CollisionDetector::set_collision_mesh`]; while `None`, the mesh checks
     /// report no collision because there is no geometry to hit.
     pub mesh_collider: Option<Arc<MeshCollider>>,
+    /// Cumulative colliders ordered by height, each holding every triangle at
+    /// or below its ceiling. Built by
+    /// [`CollisionDetector::set_collision_mesh_banded`].
+    ///
+    /// This is what makes collision testing aware of print progress. Testing
+    /// against the whole model regardless of what has actually been deposited
+    /// makes the slicer swerve around geometry that does not exist yet: on a
+    /// Benchy the very first extrusion came out at 44.9 degrees of tilt, on
+    /// the bottom layer, avoiding the hull it was in the middle of printing.
+    banded: Vec<(f64, Arc<MeshCollider>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +135,105 @@ impl CollisionDetector {
         self.mesh_collider = MeshCollider::from_mesh(mesh).map(Arc::new);
     }
 
+    /// A detector with no collision geometry installed yet.
+    ///
+    /// Install it with [`Self::set_collision_mesh`] for whole-model testing,
+    /// or [`Self::set_collision_mesh_banded`] to test against print progress.
+    pub fn new(print_head: PrintHead, platform_bounds: (Point3D, Point3D)) -> Self {
+        Self {
+            print_head,
+            platform_bounds,
+            printed_mesh: None,
+            mesh_collider: None,
+            banded: Vec::new(),
+        }
+    }
+
+    /// Build a ladder of cumulative colliders so collision can be tested
+    /// against only what has been printed so far.
+    ///
+    /// Band `i` contains every triangle lying entirely at or below its
+    /// ceiling, so the bands nest. A query supplies the height printed to and
+    /// gets the tallest band that does not exceed it.
+    ///
+    /// `bands` trades granularity against memory: the ladder holds roughly
+    /// `bands / 2` copies of the mesh in total. 8 is enough to stop the head
+    /// avoiding phantom geometry without the ladder dominating memory.
+    pub fn set_collision_mesh_banded(&mut self, mesh: &crate::mesh::Mesh, bands: usize) {
+        self.banded.clear();
+        self.set_collision_mesh(mesh);
+
+        let bands = bands.max(1);
+        let z_lo = mesh.bounds_min.z;
+        let z_hi = mesh.bounds_max.z;
+        let span = z_hi - z_lo;
+        if !span.is_finite() {
+            return;
+        }
+        if span <= 1e-9 {
+            // A mesh with no height — a single flat layer, say. One band
+            // holding all of it, reachable once the print gets to that
+            // height. Returning with an empty ladder here would make every
+            // print-progress query silently report clear.
+            if let Some(c) = MeshCollider::from_mesh(mesh) {
+                self.banded.push((z_hi, Arc::new(c)));
+            }
+            return;
+        }
+
+        for i in 0..bands {
+            let ceiling = z_lo + span * (i + 1) as f64 / bands as f64;
+            let subset: Vec<crate::geometry::Triangle> = mesh
+                .triangles
+                .iter()
+                .filter(|t| {
+                    t.v0.z <= ceiling && t.v1.z <= ceiling && t.v2.z <= ceiling
+                })
+                .cloned()
+                .collect();
+            if subset.is_empty() {
+                continue;
+            }
+            if let Ok(sub_mesh) = crate::mesh::Mesh::new(subset) {
+                if let Some(c) = MeshCollider::from_mesh(&sub_mesh) {
+                    self.banded.push((ceiling, Arc::new(c)));
+                }
+            }
+        }
+        log::info!(
+            "  Collision: {} height bands built for print-progress testing",
+            self.banded.len()
+        );
+    }
+
+    /// Whether a banded ladder is available.
+    pub fn has_banded_mesh(&self) -> bool {
+        !self.banded.is_empty()
+    }
+
+    /// Does the head collide with geometry printed at or below `printed_to_z`?
+    ///
+    /// Returns `false` when nothing has been printed that low yet — there is
+    /// genuinely nothing to hit, which is the case the full-mesh test got
+    /// wrong.
+    pub fn check_collision_with_printed(
+        &self,
+        position: &Point3D,
+        orientation: &Vector3D,
+        printed_to_z: f64,
+    ) -> bool {
+        // Tallest band whose ceiling is at or below the printed height.
+        let Some((_, collider)) = self
+            .banded
+            .iter()
+            .rev()
+            .find(|(ceiling, _)| *ceiling <= printed_to_z)
+        else {
+            return false;
+        };
+        self.check_against(collider, position, orientation)
+    }
+
     /// Whether a collision mesh has been installed.
     ///
     /// While this is false, the mesh checks are no-ops and only the platform
@@ -162,13 +271,23 @@ impl CollisionDetector {
         position: &Point3D,
         orientation: &Vector3D,
     ) -> bool {
-        use parry3d::query::intersection_test;
-        use parry3d::shape::Cylinder;
-        use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3 as NaVec3};
-
         let Some(collider) = self.mesh_collider.as_ref() else {
             return false;
         };
+        self.check_against(collider, position, orientation)
+    }
+
+    /// The head-body intersection test itself, against a given collider.
+    /// Shared by the whole-model and print-progress entry points.
+    fn check_against(
+        &self,
+        collider: &MeshCollider,
+        position: &Point3D,
+        orientation: &Vector3D,
+    ) -> bool {
+        use parry3d::query::intersection_test;
+        use parry3d::shape::Cylinder;
+        use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3 as NaVec3};
 
         let radius = (self.print_head.body_radius as f32).max(1e-4);
         let height = (self.print_head.body_height as f32).max(1e-4);
@@ -228,20 +347,104 @@ mod tests {
     use crate::geometry::Point3D;
 
     fn make_detector() -> CollisionDetector {
-        CollisionDetector {
-            print_head: PrintHead {
+        CollisionDetector::new(
+            PrintHead {
                 nozzle_diameter: 0.4,
                 body_radius: 15.0,
                 body_height: 50.0,
                 nozzle_clearance: 2.0,
             },
-            platform_bounds: (
+            (
                 Point3D::new(-150.0, -150.0, 0.0),
                 Point3D::new(150.0, 150.0, 300.0),
             ),
-            printed_mesh: None,
-            mesh_collider: None,
+        )
+    }
+
+    /// Regression test for D-16, and the behaviour the whole-model test got
+    /// wrong.
+    ///
+    /// A tall column is printed bottom-up. While the nozzle is down at the
+    /// base, the material higher up the column does not exist yet, so the
+    /// head cannot possibly hit it — but testing against the entire static
+    /// mesh reported a collision and made the slicer tilt away from the part
+    /// it was in the middle of printing. On a Benchy that produced 44.9
+    /// degrees of tilt on the very first extrusion.
+    #[test]
+    fn test_unprinted_geometry_above_does_not_collide() {
+        use crate::geometry::Triangle;
+
+        // A column of triangles stacked from z=0 to z=100, offset in X so it
+        // sits inside the head body's 15 mm radius.
+        let mut tris = Vec::new();
+        let mut z = 0.0;
+        while z < 100.0 {
+            tris.push(Triangle::new(
+                Point3D::new(-2.0, -2.0, z),
+                Point3D::new(2.0, -2.0, z),
+                Point3D::new(0.0, 2.0, z),
+            ));
+            z += 2.0;
         }
+        let mesh = crate::mesh::Mesh::new(tris).expect("column is a valid mesh");
+
+        let mut det = make_detector();
+        det.set_collision_mesh_banded(&mesh, 8);
+        assert!(det.has_banded_mesh(), "banded ladder should have been built");
+
+        let up = Vector3D::new(0.0, 0.0, 1.0);
+        let at_base = Point3D::new(0.0, 0.0, 0.0);
+
+        // Whole-model test: the column above is reported as a collision.
+        assert!(
+            det.check_collision_with_mesh_oriented(&at_base, &up),
+            "the static mesh does intersect the head body — otherwise this \
+             test proves nothing"
+        );
+
+        // Print-progress test: nothing is printed yet, so nothing to hit.
+        assert!(
+            !det.check_collision_with_printed(&at_base, &up, 0.0),
+            "head collided with a column that has not been printed yet"
+        );
+    }
+
+    #[test]
+    fn test_printed_geometry_still_collides() {
+        use crate::geometry::Triangle;
+
+        // A slab at z = 10, well inside the head body when the nozzle is at
+        // the same height.
+        let mesh = crate::mesh::Mesh::new(vec![Triangle::new(
+            Point3D::new(-5.0, -5.0, 10.0),
+            Point3D::new(5.0, -5.0, 10.0),
+            Point3D::new(0.0, 5.0, 10.0),
+        )])
+        .expect("valid");
+
+        let mut det = make_detector();
+        det.set_collision_mesh_banded(&mesh, 4);
+
+        let up = Vector3D::new(0.0, 0.0, 1.0);
+        // Nozzle below the slab, having printed up past it: the body reaches
+        // up through the slab, which exists, so this must still be caught.
+        assert!(
+            det.check_collision_with_printed(&Point3D::new(0.0, 0.0, 0.0), &up, 50.0),
+            "head should still collide with geometry that HAS been printed"
+        );
+    }
+
+    #[test]
+    fn test_no_banded_ladder_reports_clear() {
+        // Without a ladder there is nothing to test against, and the caller
+        // must not get a phantom collision.
+        let det = make_detector();
+        assert!(!det.has_banded_mesh());
+        assert!(!det.check_collision_with_printed(
+            &Point3D::new(0.0, 0.0, 0.0),
+            &Vector3D::new(0.0, 0.0, 1.0),
+            1000.0
+        ));
     }
 
     #[test]

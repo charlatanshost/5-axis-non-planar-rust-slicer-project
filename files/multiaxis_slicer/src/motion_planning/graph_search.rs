@@ -194,15 +194,13 @@ mod tests {
 
     fn make_planner() -> PathPlanner {
         PathPlanner {
-            collision_detector: CollisionDetector {
-                print_head: PrintHead::default(),
-                platform_bounds: (
+            collision_detector: CollisionDetector::new(
+                PrintHead::default(),
+                (
                     Point3D::new(0.0, 0.0, 0.0),
                     Point3D::new(200.0, 200.0, 200.0),
                 ),
-                printed_mesh: None,
-                mesh_collider: None,
-            },
+            ),
             singularity_optimizer: SingularityOptimizer {
                 lambda_threshold: 0.01,
                 machine_config: MachineConfig {
