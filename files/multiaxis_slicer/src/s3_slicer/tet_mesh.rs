@@ -205,10 +205,44 @@ impl TetMesh {
             log::info!("  Mesh has {} triangles (>10K) — skipping raw TetGen attempt", tri_count);
         }
 
-        // ── Strategy 2: Voxel reconstruction (primary approach) ─────────
+        // ── Strategy 2: Grid-based tet mesh (bypasses TetGen entirely) ──
+        // Freudenthal 6-tet decomposition of a regular grid, keeping cells
+        // inside the surface. Face-matching between adjacent cubes is
+        // guaranteed by construction, so tet adjacency is sound.
+        //
+        // This runs BEFORE the TetGen-based decimation strategies below, and
+        // that ordering is the point. TetGen does not always fail by
+        // returning an error: on Marching Cubes output it can trip an
+        // assertion inside its C++ (tetgen.cxx:15273, "ivf.iloc ==
+        // NEARVERTEX") and abort the process outright. No Rust error handling
+        // can catch that -- it takes the whole application down, GUI included.
+        // While this strategy sat fifth in the cascade, behind up to eleven
+        // TetGen invocations, it was unreachable in practice even though it
+        // works: a sphere yields 216146 tets with zero degenerate.
+        //
+        // Quality is lower than TetGen's: the boundary is a staircase at the
+        // cell size rather than conforming to the surface, which is why the
+        // direct attempt above is still tried first.
+        log::info!("  Attempting grid-based tet mesh (no TetGen)...");
+        match Self::from_surface_mesh_grid(surface_mesh, 80) {
+            Ok(mesh) => {
+                log::info!("  Grid tet mesh succeeded: {} tets, {} surface tris",
+                    mesh.tets.len(), mesh.surface_triangles.len());
+                return Ok(mesh);
+            }
+            Err(e) => {
+                log::warn!("  Grid tet mesh failed: {}", e);
+            }
+        }
+
+        // ── Strategy 3: Voxel reconstruction + TetGen ───────────────────
         // Converts mesh to SDF on regular grid, then extracts a clean
         // manifold surface via Marching Cubes. Uses indexed output to bypass
         // hash_point vertex merging which can break MC topology.
+        //
+        // Reached only if the grid decomposition above failed, which it
+        // essentially cannot. Retained as a path to better boundary fidelity
+        // than the grid, but note the abort hazard described above.
         log::info!("  Attempting voxel reconstruction before TetGen...");
         let base_res = auto_grid_resolution(surface_mesh);
         let extent = surface_mesh.bounds_max - surface_mesh.bounds_min;
@@ -239,7 +273,7 @@ impl TetMesh {
             }
         }
 
-        // ── Strategy 2b: Retry voxel meshes WITHOUT quality constraints ───
+        // ── Strategy 3b: Retry voxel meshes WITHOUT quality constraints ───
         // TetGen often fails with status=4 ("small feature") when quality
         // constraints force Steiner point insertion near thin features.
         // Try multiple resolutions (including lower ones) without constraints.
@@ -271,7 +305,7 @@ impl TetMesh {
             }
         }
 
-        // ── Strategy 3: Vertex clustering (legacy fallback) ─────────────
+        // ── Strategy 4: Vertex clustering (legacy fallback) ─────────────
         // Cruder simplification that snaps vertices to a grid. Can introduce
         // self-intersections on complex meshes but works for simpler geometry.
         log::info!("  Isotropic remeshing didn't help — trying vertex clustering...");
@@ -297,24 +331,7 @@ impl TetMesh {
             }
         }
 
-        // ── Strategy 3b: Grid-based tet mesh (bypass TetGen entirely) ───
-        // Generates a regular grid of cubes covering the bounding box, splits
-        // each cube into 5 tetrahedra, and keeps only tets whose centroids are
-        // inside the surface mesh (via 3-axis ray casting). This works on ANY
-        // mesh regardless of self-intersections or other quality issues.
-        log::info!("  Attempting grid-based tet mesh (no TetGen)...");
-        match Self::from_surface_mesh_grid(surface_mesh, 80) {
-            Ok(mesh) => {
-                log::info!("  Grid tet mesh succeeded: {} tets, {} surface tris",
-                    mesh.tets.len(), mesh.surface_triangles.len());
-                return Ok(mesh);
-            }
-            Err(e) => {
-                log::warn!("  Grid tet mesh failed: {}", e);
-            }
-        }
-
-        // ── Strategy 4: Convex hull (last resort) ───────────────────────
+        // ── Strategy 5: Convex hull (last resort) ───────────────────────
         // Guaranteed manifold, but loses all concavities. ASAP deformation
         // on a convex hull is usually poor quality.
         log::info!("  All approaches failed — trying convex hull fallback...");
