@@ -601,14 +601,14 @@ fn geodesic_from_directions(
     // Divergence → Poisson → shift (identical pipeline to geodesic_at_t steps 3–5)
     let div = compute_vertex_divergence(topo, &face_grad);
 
-    let mut poisson_diag = poisson_laplacian.diag.clone();
-    poisson_diag[0] += 1e-6; // pin vertex 0 to remove null space
-    let poisson_system = SparseSymmetric {
-        n,
-        diag: poisson_diag,
-        off_diag: poisson_laplacian.off_diag.clone(),
-    };
-    let phi = conjugate_gradient(&poisson_system, &div, 2000, 1e-8);
+    // Same singular Poisson system as `geodesic_at_t` -- see the long comment
+    // there. Make the right-hand side consistent and deflate the constant
+    // rather than relying on a pin far too small to break the null space.
+    let div_mean = div.iter().sum::<f64>() / n.max(1) as f64;
+    let div_consistent: Vec<f64> = div.iter().map(|d| d - div_mean).collect();
+    let phi = conjugate_gradient_labelled(
+        poisson_laplacian, &div_consistent, 5000, 1e-8, "poisson-customfield", true,
+    );
 
     let source_mean: f64 = sources.iter().map(|&s| phi[s]).sum::<f64>() / sources.len() as f64;
     let mut distances: Vec<f64> = phi.iter().map(|&p| p - source_mean).collect();
@@ -636,7 +636,40 @@ fn conjugate_gradient(
     max_iter: usize,
     tol: f64,
 ) -> Vec<f64> {
+    conjugate_gradient_labelled(a, b, max_iter, tol, "cg", false)
+}
+
+/// As [`conjugate_gradient`], but reports whether it actually converged and can
+/// deflate the constant null space.
+///
+/// The unlabelled version used to return silently after exhausting `max_iter`,
+/// so a non-converged solve was indistinguishable from a good one and the
+/// resulting garbage distance field looked authoritative.
+///
+/// `deflate_constant` keeps every iterate orthogonal to the constant vector.
+/// Use it for the Poisson step, whose cotangent Laplacian is singular with
+/// null space `span{1}` -- see the call site for why that matters.
+fn conjugate_gradient_labelled(
+    a: &SparseSymmetric,
+    b: &[f64],
+    max_iter: usize,
+    tol: f64,
+    label: &str,
+    deflate_constant: bool,
+) -> Vec<f64> {
     let n = a.n;
+    // Removing the mean of a vector projects it onto the orthogonal complement
+    // of span{1}. Applied to the preconditioned residual every iteration, this
+    // keeps the whole Krylov space -- and therefore the solution -- clear of the
+    // null direction, which is what lets CG converge on a singular system.
+    let deflate = |v: &mut [f64]| {
+        if deflate_constant && !v.is_empty() {
+            let mean = v.iter().sum::<f64>() / v.len() as f64;
+            for x in v.iter_mut() {
+                *x -= mean;
+            }
+        }
+    };
     let mut x = vec![0.0; n];
     let mut r = b.to_vec();
     // Jacobi preconditioner: M^{-1} = 1/diag(A)
@@ -644,8 +677,11 @@ fn conjugate_gradient(
         if d.abs() > 1e-15 { 1.0 / d } else { 1.0 }
     }).collect();
 
+    deflate(&mut r);
+
     // z = M^{-1} r
     let mut z: Vec<f64> = r.iter().zip(&inv_diag).map(|(ri, mi)| ri * mi).collect();
+    deflate(&mut z);
     let mut p = z.clone();
     let mut rz: f64 = r.iter().zip(&z).map(|(ri, zi)| ri * zi).sum();
 
@@ -653,15 +689,22 @@ fn conjugate_gradient(
 
     let mut ap = vec![0.0; n];
 
-    for _iter in 0..max_iter {
+    let mut final_rel = f64::NAN;
+    let mut used_iters = 0usize;
+    let mut stalled = false;
+
+    for iter in 0..max_iter {
         let r_norm: f64 = r.iter().map(|ri| ri * ri).sum::<f64>().sqrt();
-        if r_norm / b_norm < tol {
+        final_rel = r_norm / b_norm;
+        used_iters = iter;
+        if final_rel < tol {
             break;
         }
 
         a.mul_vec(&p, &mut ap);
         let pap: f64 = p.iter().zip(&ap).map(|(pi, api)| pi * api).sum();
         if pap.abs() < 1e-30 {
+            stalled = true;
             break;
         }
         let alpha = rz / pap;
@@ -671,9 +714,12 @@ fn conjugate_gradient(
             r[i] -= alpha * ap[i];
         }
 
+        deflate(&mut r);
+
         for i in 0..n {
             z[i] = r[i] * inv_diag[i];
         }
+        deflate(&mut z);
 
         let rz_new: f64 = r.iter().zip(&z).map(|(ri, zi)| ri * zi).sum();
         let beta = rz_new / rz.max(1e-30);
@@ -682,6 +728,23 @@ fn conjugate_gradient(
         for i in 0..n {
             p[i] = z[i] + beta * p[i];
         }
+    }
+
+    if stalled {
+        log::warn!(
+            "  [{}] CG stalled after {} iters (pAp ~ 0, rel residual {:.3e}) \
+             -- system is likely singular",
+            label, used_iters, final_rel
+        );
+    } else if !(final_rel < tol) {
+        log::warn!(
+            "  [{}] CG did NOT converge: {} iters, rel residual {:.3e} > tol {:.1e} \
+             -- result is not a solution",
+            label, max_iter, final_rel, tol
+        );
+    } else {
+        log::debug!("  [{}] CG converged in {} iters (rel residual {:.3e})",
+            label, used_iters, final_rel);
     }
 
     x
@@ -741,7 +804,10 @@ fn geodesic_at_t(
         rhs[s] = mass[s];
     }
 
-    let u = conjugate_gradient(&heat_system, &rhs, 2000, 1e-8);
+    // The heat system M + t*L is positive definite (M is a positive diagonal
+    // mass matrix), but it grows ill-conditioned as t increases, so the larger
+    // multi-scale timesteps need a higher iteration budget than the smallest.
+    let u = conjugate_gradient_labelled(&heat_system, &rhs, 20_000, 1e-8, "heat", false);
 
     // Step 2: Per-face normalized negative gradient of u
     let mut face_grad: Vec<Vector3D> = Vec::with_capacity(topo.faces.len());
@@ -791,16 +857,33 @@ fn geodesic_at_t(
 
     // Step 4: Solve Poisson equation L*phi = div using the ISOTROPIC Laplacian.
     // (Using poisson_laplacian, not heat_laplacian — distance must be Euclidean.)
-    let mut poisson_diag = poisson_laplacian.diag.clone();
-    poisson_diag[0] += 1e-6; // Pin vertex 0 to make system non-singular
+    //
+    // This system is singular. With natural (Neumann) boundary conditions the
+    // cotangent Laplacian annihilates the constant vector, because phi is only
+    // ever determined up to an additive constant -- the shift in step 5 is what
+    // fixes it.
+    //
+    // The previous code tried to remove that null space by adding 1e-6 to a
+    // single diagonal entry ("pin vertex 0"). Cotangent weights on this mesh
+    // are O(1), so the perturbation was ~6 orders of magnitude too small to pin
+    // anything: the system stayed singular to working precision, CG wandered
+    // along the null direction, and it returned a non-solution. On a Benchy the
+    // Poisson residual never fell below ~0.3 (and reached 7.3) against a 1e-8
+    // tolerance, which the solver reported to nobody. Worse, the result varied
+    // between identical runs, because *which* vertex ends up at index 0 depends
+    // on vertex-welding order: the pin was the only thing breaking the symmetry.
+    //
+    // A singular system is harmless to CG provided it is *consistent* -- the
+    // right-hand side must have no component along the null space -- and
+    // provided the iterates stay out of that direction. So make div consistent
+    // by removing its mean (it is only nonzero there through discretisation
+    // error) and deflate the constant inside CG.
+    let div_mean = div.iter().sum::<f64>() / n.max(1) as f64;
+    let div_consistent: Vec<f64> = div.iter().map(|d| d - div_mean).collect();
 
-    let poisson_system = SparseSymmetric {
-        n,
-        diag: poisson_diag,
-        off_diag: poisson_laplacian.off_diag.clone(),
-    };
-
-    let phi = conjugate_gradient(&poisson_system, &div, 2000, 1e-8);
+    let phi = conjugate_gradient_labelled(
+        poisson_laplacian, &div_consistent, 5000, 1e-8, "poisson", true,
+    );
 
     // Step 5: Shift so source vertices have distance = 0.
     // Do NOT use abs() — that creates a mirror zero-crossing on the far side of the field,
@@ -1305,6 +1388,21 @@ pub fn geodesic_slice(mesh: &Mesh, config: &GeodesicSlicerConfig) -> Vec<Layer> 
     log::info!("  Z range: {:.2}mm, geodesic max: {:.2}mm, effective cap: {:.2}mm (factor={:.1})",
         z_range, max_dist, effective_max_dist, cap_factor);
 
+    // Sanity guard: a path along the surface can never be shorter than the
+    // straight line between its endpoints, so the largest geodesic distance
+    // must be at least the vertical extent the field has to span. If it is
+    // not, the Poisson solve did not produce a distance function and every
+    // level set below is meaningless -- which previously surfaced only as a
+    // flood of "floating contours" at the end of the print.
+    if z_weight <= 0.1 && max_dist < z_range * 0.95 {
+        log::error!(
+            "  Geodesic field is NOT a distance function: max {:.2}mm < model Z extent {:.2}mm. \
+             Geodesic distance is bounded below by Euclidean distance, so this is impossible. \
+             The Poisson solve has not converged -- layers from this field are invalid.",
+            max_dist, z_range
+        );
+    }
+
     let num_layers = (effective_max_dist / config.layer_height).ceil() as usize;
     if num_layers == 0 {
         log::warn!("  Effective max geodesic distance is 0, no layers to extract");
@@ -1579,6 +1677,44 @@ mod tests {
         let x = conjugate_gradient(&a, &b, 100, 1e-10);
         assert!((x[0] - 1.0).abs() < 1e-6);
         assert!((x[1] - 1.0).abs() < 1e-6);
+    }
+
+    /// Regression test for D-05. A graph Laplacian with natural boundary
+    /// conditions is singular: its null space is the constant vector, exactly
+    /// like the cotangent Laplacian in the Poisson step of the heat method.
+    ///
+    /// The old code tried to remove that by adding 1e-6 to one diagonal entry,
+    /// which is far too small to pin anything when the weights are O(1), so CG
+    /// wandered along the null direction and returned a non-solution -- and
+    /// said nothing about it. Deflating the constant instead makes CG converge
+    /// to the mean-zero representative of the solution family.
+    #[test]
+    fn test_cg_deflates_constant_null_space() {
+        // Path graph 0-1-2 with unit weights. Rows sum to zero, so L*1 = 0.
+        let l = SparseSymmetric {
+            n: 3,
+            diag: vec![1.0, 2.0, 1.0],
+            off_diag: vec![(0, 1, -1.0), (1, 2, -1.0)],
+        };
+        // Consistent right-hand side (sum zero, i.e. orthogonal to the null space).
+        let b = vec![1.0, 0.0, -1.0];
+
+        let x = conjugate_gradient_labelled(&l, &b, 500, 1e-12, "test", true);
+
+        // Solutions are (c+1, c, c-1) for any c; deflation selects c = 0.
+        assert!((x[0] - 1.0).abs() < 1e-8, "x = {:?}", x);
+        assert!((x[1] - 0.0).abs() < 1e-8, "x = {:?}", x);
+        assert!((x[2] + 1.0).abs() < 1e-8, "x = {:?}", x);
+
+        let mean = x.iter().sum::<f64>() / 3.0;
+        assert!(mean.abs() < 1e-9, "deflated solution should have zero mean, got {}", mean);
+
+        // And it must actually satisfy the system, up to the null direction.
+        let mut ax = vec![0.0; 3];
+        l.mul_vec(&x, &mut ax);
+        for i in 0..3 {
+            assert!((ax[i] - b[i]).abs() < 1e-8, "residual at {}: {} vs {}", i, ax[i], b[i]);
+        }
     }
 
     #[test]
