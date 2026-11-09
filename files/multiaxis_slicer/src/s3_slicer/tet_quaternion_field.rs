@@ -36,37 +36,97 @@ impl TetQuaternionField {
             .map(|ti| compute_tet_representative_normal(tet_mesh, ti))
             .collect();
 
-        // Optimization loop
+        // Per-tet objective rotation, computed once.
+        let objectives: Vec<UnitQuaternion<f64>> = (0..num_tets)
+            .into_par_iter()
+            .map(|ti| {
+                compute_optimal_rotation(
+                    &tet_normals[ti],
+                    &config.build_direction,
+                    &config.objective,
+                    config.overhang_threshold,
+                    config.max_rotation_degrees,
+                )
+            })
+            .collect();
+
+        // Which tets genuinely have something to ask for. Only a tet with a
+        // surface face can see an overhang; `compute_tet_representative_normal`
+        // hands interior tets a synthetic upward normal, which no fabrication
+        // objective ever wants to rotate.
+        let anchored: Vec<bool> = (0..num_tets)
+            .map(|ti| {
+                objectives[ti].angle() > 1e-6
+                    && tet_mesh.tet_neighbors[ti].iter().any(|nb| nb.is_none())
+            })
+            .collect();
+
+        // Base tets stay put so the build plate never moves. Without this the
+        // diffusion below would carry rotation all the way down and tilt the
+        // part off the bed.
+        let z_lo = tet_mesh.bounds_min.z;
+        let z_range = (tet_mesh.bounds_max.z - z_lo).max(1e-10);
+        let base: Vec<bool> = (0..num_tets)
+            .map(|ti| {
+                let c = tet_mesh.tets[ti].centroid(&tet_mesh.vertices);
+                (c.z - z_lo) / z_range < BASE_PIN_FRACTION
+            })
+            .collect();
+
+        let num_anchored = anchored.iter().filter(|&&a| a).count();
+        let num_base = base.iter().filter(|&&b| b).count();
+        log::info!("    Anchored (overhang) tets: {}, pinned base tets: {}",
+            num_anchored, num_base);
+
+        // Relaxation.
+        //
+        // This used to recompute `optimal` from the tet's own normal on every
+        // pass and blend that with the neighbours, which re-injected identity
+        // into the interior every iteration and so forced the field to decay
+        // exponentially away from the surface. Measured on a sphere whose tet
+        // mesh is 13 adjacency hops deep, the mean rotation fell 2.14 deg ->
+        // 0.44 -> 0.10 -> 0.02 and was zero by the fourth hop; 400 iterations
+        // gave bit-identical results to 50, because that decay is the fixed
+        // point rather than a failure to converge. The thin shell that
+        // survived was then averaged away by the global ASAP solve, which saw
+        // 95% of its edges demanding no change at all, leaving a total
+        // deformation of 0.026mm on a 48mm model.
+        //
+        // Instead, treat it as what it should be: a diffusion with boundary
+        // conditions. Overhang tets hold their objective, base tets hold
+        // identity, and every other tet is free to take the average of its
+        // neighbours without being dragged back toward identity. The field
+        // then varies smoothly through the volume.
         for iteration in 0..config.optimization_iterations {
             let new_rotations: Vec<UnitQuaternion<f64>> = (0..num_tets)
                 .into_par_iter()
                 .map(|ti| {
-                    let normal = &tet_normals[ti];
+                    if base[ti] {
+                        return UnitQuaternion::identity();
+                    }
 
-                    // Compute optimal rotation
-                    let optimal = compute_optimal_rotation(
-                        normal,
-                        &config.build_direction,
-                        &config.objective,
-                        config.overhang_threshold,
-                        config.max_rotation_degrees,
-                    );
+                    let neighbors: Vec<usize> = tet_mesh.tet_neighbors[ti]
+                        .iter()
+                        .filter_map(|n| *n)
+                        .collect();
 
-                    // Smooth with face-adjacent neighbors
-                    if config.smoothness_weight > 0.0 {
-                        let neighbors: Vec<usize> = tet_mesh.tet_neighbors[ti]
-                            .iter()
-                            .filter_map(|n| *n)
-                            .collect();
-
-                        smooth_with_neighbors(
-                            &optimal,
-                            &rotations,
-                            &neighbors,
-                            config.smoothness_weight,
-                        )
+                    if anchored[ti] {
+                        // Hold the objective, but let smoothing soften the
+                        // boundary between neighbouring overhang regions.
+                        if config.smoothness_weight > 0.0 {
+                            smooth_with_neighbors(
+                                &objectives[ti],
+                                &rotations,
+                                &neighbors,
+                                config.smoothness_weight,
+                            )
+                        } else {
+                            objectives[ti]
+                        }
                     } else {
-                        optimal
+                        // Free tet: pure neighbour average, no identity pull.
+                        average_neighbors(&rotations, &neighbors)
+                            .unwrap_or(rotations[ti])
                     }
                 })
                 .collect();
@@ -284,6 +344,46 @@ fn compute_strength_rotation(
 }
 
 /// Smooth rotation with face-adjacent neighbors
+/// Fraction of the model height whose tets are pinned to identity, so the
+/// part stays flat on the build plate while rotation diffuses above it.
+const BASE_PIN_FRACTION: f64 = 0.05;
+
+/// Running slerp average of the neighbours' rotations.
+///
+/// Returns `None` when there is nothing to average, so the caller can keep its
+/// current value rather than snapping to identity.
+fn average_neighbors(
+    current_rotations: &[UnitQuaternion<f64>],
+    neighbor_indices: &[usize],
+) -> Option<UnitQuaternion<f64>> {
+    let mut accumulated: Option<UnitQuaternion<f64>> = None;
+    let mut count = 0.0f64;
+
+    for &ni in neighbor_indices {
+        let Some(neighbor) = current_rotations.get(ni) else { continue };
+        if !neighbor.coords.iter().all(|c| c.is_finite()) {
+            continue;
+        }
+        match accumulated {
+            None => {
+                accumulated = Some(*neighbor);
+                count = 1.0;
+            }
+            Some(acc) => {
+                // Weight 1/(n+1) folds the (n+1)-th sample into the mean.
+                let t = 1.0 / (count + 1.0);
+                let blended = acc.slerp(neighbor, t);
+                if blended.coords.iter().all(|c| c.is_finite()) {
+                    accumulated = Some(blended);
+                    count += 1.0;
+                }
+            }
+        }
+    }
+
+    accumulated
+}
+
 fn smooth_with_neighbors(
     optimal: &UnitQuaternion<f64>,
     current_rotations: &[UnitQuaternion<f64>],
@@ -364,6 +464,73 @@ mod tests {
     use super::*;
     use crate::geometry::Point3D;
     use crate::s3_slicer::tet_mesh::Tetrahedron;
+
+    fn rot_z(deg: f64) -> UnitQuaternion<f64> {
+        UnitQuaternion::from_axis_angle(&Vector3D::z_axis(), deg.to_radians())
+    }
+
+    /// Regression test for D-10.
+    ///
+    /// A tet with no fabrication objective of its own must be free to take its
+    /// neighbours' rotation. The relaxation used to recompute the objective
+    /// from the tet's own normal every pass and blend that in, and
+    /// `compute_tet_representative_normal` hands interior tets a synthetic
+    /// upward normal that no objective ever rotates -- so identity was
+    /// re-injected into the interior on every iteration and the field decayed
+    /// exponentially from the surface.
+    ///
+    /// `average_neighbors` is the replacement, and the property that matters
+    /// is that it never drags a value toward identity.
+    #[test]
+    fn test_average_neighbors_does_not_pull_toward_identity() {
+        let a = rot_z(30.0);
+        let rotations = vec![a, a, a];
+
+        let avg = average_neighbors(&rotations, &[0, 1, 2])
+            .expect("three neighbours should average");
+
+        // Averaging equal rotations must reproduce them, not dilute them.
+        assert!(
+            (avg.angle() - a.angle()).abs() < 1e-9,
+            "average of three 30 deg rotations gave {:.4} deg",
+            avg.angle().to_degrees()
+        );
+    }
+
+    #[test]
+    fn test_average_neighbors_interpolates() {
+        // 0 and 60 degrees about the same axis average to 30.
+        let rotations = vec![rot_z(0.0), rot_z(60.0)];
+        let avg = average_neighbors(&rotations, &[0, 1]).expect("two neighbours");
+        assert!(
+            (avg.angle().to_degrees() - 30.0).abs() < 1e-6,
+            "expected 30 deg, got {:.4}",
+            avg.angle().to_degrees()
+        );
+    }
+
+    #[test]
+    fn test_average_neighbors_reports_nothing_to_average() {
+        let rotations = vec![rot_z(30.0)];
+        // No neighbours at all: the caller must be able to keep its own value
+        // rather than being handed identity.
+        assert!(average_neighbors(&rotations, &[]).is_none());
+        // Out-of-range indices are skipped, not treated as identity.
+        assert!(average_neighbors(&rotations, &[99]).is_none());
+    }
+
+    #[test]
+    fn test_average_neighbors_skips_non_finite() {
+        let good = rot_z(45.0);
+        let bad = UnitQuaternion::new_unchecked(nalgebra::Quaternion::new(
+            f64::NAN, 0.0, 0.0, 0.0,
+        ));
+        let rotations = vec![bad, good];
+
+        let avg = average_neighbors(&rotations, &[0, 1]).expect("one good neighbour");
+        assert!((avg.angle() - good.angle()).abs() < 1e-9);
+        assert!(avg.coords.iter().all(|c| c.is_finite()));
+    }
 
     fn make_simple_tet_mesh() -> TetMesh {
         let vertices = vec![
