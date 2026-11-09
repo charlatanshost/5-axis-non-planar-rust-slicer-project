@@ -124,7 +124,7 @@ pub fn compute_geodesic_distances(
 }
 
 /// Build unique vertex list and mapping
-fn build_vertex_list(mesh: &Mesh) -> (Vec<Point3D>, HashMap<u64, usize>) {
+fn build_vertex_list(mesh: &Mesh) -> (Vec<Point3D>, HashMap<VertexKey, usize>) {
     let mut vertices = Vec::new();
     let mut vertex_map = HashMap::new();
 
@@ -148,7 +148,7 @@ fn build_vertex_list(mesh: &Mesh) -> (Vec<Point3D>, HashMap<u64, usize>) {
 fn build_cotangent_laplacian(
     mesh: &Mesh,
     vertices: &[Point3D],
-    vertex_map: &HashMap<u64, usize>,
+    vertex_map: &HashMap<VertexKey, usize>,
 ) -> CsMat<f64> {
     let n = vertices.len();
     let mut triplet_mat = TriMat::new((n, n));
@@ -204,7 +204,7 @@ fn build_cotangent_laplacian(
 fn build_mass_matrix(
     mesh: &Mesh,
     _vertices: &[Point3D],
-    vertex_map: &HashMap<u64, usize>,
+    vertex_map: &HashMap<VertexKey, usize>,
 ) -> Vec<f64> {
     let n = vertex_map.len();
     let mut mass = vec![0.0; n];
@@ -243,7 +243,7 @@ fn compute_cotangent(pi: &Point3D, pj: &Point3D, pk: &Point3D) -> f64 {
 fn compute_mean_edge_length_squared(
     mesh: &Mesh,
     _vertices: &[Point3D],
-    vertex_map: &HashMap<u64, usize>,
+    vertex_map: &HashMap<VertexKey, usize>,
 ) -> f64 {
     let mut sum = 0.0;
     let mut count = 0;
@@ -391,7 +391,7 @@ fn compute_gradient_field(
     mesh: &Mesh,
     heat: &[f64],
     _vertices: &[Point3D],
-    vertex_map: &HashMap<u64, usize>,
+    vertex_map: &HashMap<VertexKey, usize>,
 ) -> Vec<Vector3D> {
     mesh.triangles
         .par_iter()
@@ -433,7 +433,7 @@ fn recover_distances(
     gradients: &[Vector3D],
     mesh: &Mesh,
     _vertices: &[Point3D],
-    vertex_map: &HashMap<u64, usize>,
+    vertex_map: &HashMap<VertexKey, usize>,
 ) -> Vec<f64> {
     let n = vertex_map.len();
 
@@ -532,7 +532,7 @@ fn recover_distances(
 fn compute_triangle_scalars(
     mesh: &Mesh,
     distances: &[f64],
-    vertex_map: &HashMap<u64, usize>,
+    vertex_map: &HashMap<VertexKey, usize>,
 ) -> Vec<f64> {
     mesh.triangles
         .par_iter()
@@ -547,21 +547,79 @@ fn compute_triangle_scalars(
 }
 
 /// Hash a point for vertex deduplication
-fn hash_point(p: &Point3D) -> u64 {
-    let x = (p.x * 1000000.0).round() as i64;
-    let y = (p.y * 1000000.0).round() as i64;
-    let z = (p.z * 1000000.0).round() as i64;
+/// Exact identity key for a vertex position, quantised to 1 nanometre.
+///
+/// This was a `u64` *hash* of the same quantised coordinates used directly as a
+/// `HashMap` key, so any collision silently welded two distinct vertices into
+/// one. Unsound however good the hash is -- and the hash was mis-transcribed:
+/// `hash` started at 0, so `hash.wrapping_mul(73856093)` multiplied zero and
+/// the first constant never reached `x`, leaving a weak two-round mix.
+///
+/// Measured loss on structured geometry was 17% of all vertices (a UV sphere's
+/// 738 distinct positions collapsing to 612 keys); real STL float32 data
+/// happened to escape unharmed. Here the corrupted vertex map feeds the
+/// cotangent Laplacian, so collisions would fuse unrelated parts of the
+/// surface into one node and let heat flow between them. See D-06.
+///
+/// Comparing the quantised coordinates directly cannot collide, and is cheaper
+/// than hashing them first.
+pub type VertexKey = (i64, i64, i64);
 
-    let mut hash = 0u64;
-    hash = hash.wrapping_mul(73856093) ^ (x as u64);
-    hash = hash.wrapping_mul(19349663) ^ (y as u64);
-    hash = hash.wrapping_mul(83492791) ^ (z as u64);
-    hash
+fn hash_point(p: &Point3D) -> VertexKey {
+    (
+        (p.x * 1_000_000.0).round() as i64,
+        (p.y * 1_000_000.0).round() as i64,
+        (p.z * 1_000_000.0).round() as i64,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for D-07. `hash_point` returned a `u64` hash that was
+    /// used as the vertex identity key, so collisions welded distinct vertices
+    /// together -- here fusing unrelated surface nodes in the cotangent
+    /// Laplacian. A UV sphere lost 17% of its vertices to it.
+    #[test]
+    fn test_vertex_key_never_merges_distinct_positions() {
+        use std::collections::HashSet;
+
+        let (radius, stacks, slices) = (15.0, 24usize, 32usize);
+        let phi_of = |i: usize| std::f64::consts::PI * (1.0 - i as f64 / stacks as f64);
+        let mut points = Vec::new();
+        for i in 0..=stacks {
+            let phi = phi_of(i);
+            for j in 0..slices {
+                let theta = 2.0 * std::f64::consts::PI * j as f64 / slices as f64;
+                points.push(Point3D::new(
+                    radius * phi.sin() * theta.cos(),
+                    radius * phi.sin() * theta.sin(),
+                    radius * phi.cos() + radius,
+                ));
+            }
+        }
+
+        let keys: HashSet<VertexKey> = points.iter().map(hash_point).collect();
+        let exact: HashSet<(i64, i64, i64)> = points
+            .iter()
+            .map(|p| {
+                (
+                    (p.x * 1_000_000.0).round() as i64,
+                    (p.y * 1_000_000.0).round() as i64,
+                    (p.z * 1_000_000.0).round() as i64,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            keys.len(),
+            exact.len(),
+            "vertex key merged {} distinct positions",
+            exact.len() - keys.len()
+        );
+        assert_eq!(exact.len(), 2 + (stacks - 1) * slices);
+    }
 
     #[test]
     fn test_cotangent_computation() {

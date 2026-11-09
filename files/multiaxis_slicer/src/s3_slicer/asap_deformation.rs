@@ -63,7 +63,7 @@ pub struct AsapSolver {
     config: AsapConfig,
 
     /// Vertex mapping (hash -> index)
-    vertex_map: HashMap<u64, usize>,
+    vertex_map: HashMap<VertexKey, usize>,
 
     /// Unique vertices
     vertices: Vec<Point3D>,
@@ -452,7 +452,7 @@ fn solve_sparse_system(matrix: &CsMat<f64>, rhs: &[f64]) -> Vec<f64> {
 }
 
 /// Build vertex list and mapping
-fn build_vertex_list(mesh: &Mesh) -> (Vec<Point3D>, HashMap<u64, usize>) {
+fn build_vertex_list(mesh: &Mesh) -> (Vec<Point3D>, HashMap<VertexKey, usize>) {
     let mut vertices = Vec::new();
     let mut vertex_map = HashMap::new();
 
@@ -487,7 +487,7 @@ fn compute_rest_edges(mesh: &Mesh) -> Vec<[Vector3D; 3]> {
 fn compute_cotangent_weights(
     mesh: &Mesh,
     vertices: &[Point3D],
-    vertex_map: &HashMap<u64, usize>,
+    vertex_map: &HashMap<VertexKey, usize>,
 ) -> HashMap<(usize, usize), f64> {
     let mut weights = HashMap::new();
 
@@ -513,7 +513,7 @@ fn compute_cotangent_weights(
 }
 
 /// Compute uniform weights (1.0 for all edges)
-fn compute_uniform_weights(mesh: &Mesh, vertex_map: &HashMap<u64, usize>) -> HashMap<(usize, usize), f64> {
+fn compute_uniform_weights(mesh: &Mesh, vertex_map: &HashMap<VertexKey, usize>) -> HashMap<(usize, usize), f64> {
     let mut weights = HashMap::new();
 
     for triangle in &mesh.triangles {
@@ -564,16 +564,29 @@ fn quaternion_to_matrix(q: &nalgebra::UnitQuaternion<f64>) -> Matrix3<f64> {
 }
 
 /// Hash a point for vertex deduplication
-fn hash_point(p: &Point3D) -> u64 {
-    let x = (p.x * 1000000.0).round() as i64;
-    let y = (p.y * 1000000.0).round() as i64;
-    let z = (p.z * 1000000.0).round() as i64;
+/// Exact identity key for a vertex position, quantised to 1 nanometre.
+///
+/// This was a `u64` *hash* of the same quantised coordinates used directly as a
+/// `HashMap` key, so any collision silently welded two distinct vertices into
+/// one. Unsound however good the hash is -- and the hash was mis-transcribed:
+/// `hash` started at 0, so `hash.wrapping_mul(73856093)` multiplied zero and
+/// the first constant never reached `x`, leaving a weak two-round mix.
+///
+/// Measured loss on structured geometry was 17% of all vertices (a UV sphere's
+/// 738 distinct positions collapsing to 612 keys); real STL float32 data
+/// happened to escape unharmed. See D-06, which fixed the identical function
+/// in tet_mesh.rs.
+///
+/// Comparing the quantised coordinates directly cannot collide, and is cheaper
+/// than hashing them first.
+pub type VertexKey = (i64, i64, i64);
 
-    let mut hash = 0u64;
-    hash = hash.wrapping_mul(73856093) ^ (x as u64);
-    hash = hash.wrapping_mul(19349663) ^ (y as u64);
-    hash = hash.wrapping_mul(83492791) ^ (z as u64);
-    hash
+fn hash_point(p: &Point3D) -> VertexKey {
+    (
+        (p.x * 1_000_000.0).round() as i64,
+        (p.y * 1_000_000.0).round() as i64,
+        (p.z * 1_000_000.0).round() as i64,
+    )
 }
 
 /// Create edge key (ordered)
@@ -588,6 +601,50 @@ fn edge_key(i: usize, j: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for D-07. `hash_point` returned a `u64` hash that was
+    /// used as the vertex identity key, so collisions welded distinct vertices
+    /// together -- here corrupting the vertex list the ARAP solve iterates on.
+    /// A UV sphere lost 17% of its vertices to it.
+    #[test]
+    fn test_vertex_key_never_merges_distinct_positions() {
+        use std::collections::HashSet;
+
+        let (radius, stacks, slices) = (15.0, 24usize, 32usize);
+        let phi_of = |i: usize| std::f64::consts::PI * (1.0 - i as f64 / stacks as f64);
+        let mut points = Vec::new();
+        for i in 0..=stacks {
+            let phi = phi_of(i);
+            for j in 0..slices {
+                let theta = 2.0 * std::f64::consts::PI * j as f64 / slices as f64;
+                points.push(Point3D::new(
+                    radius * phi.sin() * theta.cos(),
+                    radius * phi.sin() * theta.sin(),
+                    radius * phi.cos() + radius,
+                ));
+            }
+        }
+
+        let keys: HashSet<VertexKey> = points.iter().map(hash_point).collect();
+        let exact: HashSet<(i64, i64, i64)> = points
+            .iter()
+            .map(|p| {
+                (
+                    (p.x * 1_000_000.0).round() as i64,
+                    (p.y * 1_000_000.0).round() as i64,
+                    (p.z * 1_000_000.0).round() as i64,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            keys.len(),
+            exact.len(),
+            "vertex key merged {} distinct positions",
+            exact.len() - keys.len()
+        );
+        assert_eq!(exact.len(), 2 + (stacks - 1) * slices);
+    }
 
     #[test]
     fn test_cotangent_computation() {
