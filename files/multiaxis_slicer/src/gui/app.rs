@@ -3521,8 +3521,14 @@ impl eframe::App for SlicerApp {
         // NOTE: In egui, all Side/Top/Bottom panels must be added BEFORE CentralPanel.
         // CentralPanel takes whatever space remains after other panels are allocated.
         self.render_tab_bar(ctx);
-        self.render_control_panel(ctx);
-        self.render_stats_panel(ctx);
+        // The slicing controls and the slicing statistics belong to the Main
+        // tab. They were drawn on every tab, so the Printer Profiles page
+        // opened with a third of the window given over to layer heights and
+        // infill patterns that have nothing to do with configuring a machine.
+        if self.active_tab == AppTab::Main {
+            self.render_control_panel(ctx);
+            self.render_stats_panel(ctx);
+        }
         self.render_gcode_terminal(ctx);
         self.render_central_panel(ctx);
     }

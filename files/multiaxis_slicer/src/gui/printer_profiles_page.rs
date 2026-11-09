@@ -240,20 +240,36 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
             );
             ui.add_space(4.0);
 
-            // Column headers
-            ui.horizontal(|ui| {
-                ui.add_sized([40.0, 0.0], egui::Label::new(egui::RichText::new("Name").weak()));
-                ui.add_sized([60.0, 0.0], egui::Label::new(egui::RichText::new("Type").weak()));
-                ui.add_sized([60.0, 0.0], egui::Label::new(egui::RichText::new("Moves").weak()));
-                ui.add_sized([60.0, 0.0], egui::Label::new(egui::RichText::new("Min").weak()));
-                ui.add_sized([60.0, 0.0], egui::Label::new(egui::RichText::new("Max").weak()));
-            });
-            ui.separator();
-
+            // One grid for headers and rows, so the columns actually line up.
+            // The headers were previously fixed-width `add_sized` labels while
+            // each row sized its own widgets, so the two drifted apart: the
+            // "Min" header sat about 100px left of the min field, and the
+            // rotation-axis, direction, speed and delete columns had no header
+            // at all.
             let mut to_remove: Option<usize> = None;
+            egui::Grid::new("rotary_axes_table")
+                .num_columns(10)
+                .spacing([6.0, 6.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    let hdr = |ui: &mut egui::Ui, s: &str| {
+                        ui.label(egui::RichText::new(s).weak().small());
+                    };
+                    hdr(ui, "Name");
+                    hdr(ui, "Type");
+                    hdr(ui, "Moves");
+                    hdr(ui, "Axis");
+                    hdr(ui, "Dir");
+                    hdr(ui, "Min");
+                    hdr(ui, "");
+                    hdr(ui, "Max");
+                    hdr(ui, "Speed");
+                    hdr(ui, "");
+                    ui.end_row();
+
             for i in 0..profile.rotary_axes.len() {
                 let ax = &mut profile.rotary_axes[i];
-                ui.horizontal(|ui| {
+                {
                     // Name
                     let mut name = ax.name.clone();
                     let name_resp = ui.add_sized([40.0, 20.0], egui::TextEdit::singleline(&mut name));
@@ -323,6 +339,12 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
                             ax.right_handed = !ax.right_handed;
                             changed = true;
                         }
+                    } else {
+                        // Keep the column count constant: a linear joint has
+                        // no rotation axis and no sign convention, but the
+                        // grid still needs both cells.
+                        ui.label("");
+                        ui.label("");
                     }
 
                     // Min / Max
@@ -333,21 +355,24 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
 
                     // Max angular speed (rotary only)
                     if ax.axis_type == AxisType::Rotary {
-                        ui.label("≤");
                         if ui.add(egui::DragValue::new(&mut ax.max_angular_speed)
                             .suffix(" °/s")
                             .range(0.0..=3600.0)
                             .speed(1.0))
                             .on_hover_text("Maximum angular speed (deg/s). G-code feedrate is capped so this axis never moves faster than this.")
                             .changed() { changed = true; }
+                    } else {
+                        ui.label("");
                     }
 
                     // Remove button
-                    if ui.small_button("✕").clicked() {
+                    if ui.small_button("✕").on_hover_text("Remove this axis").clicked() {
                         to_remove = Some(i);
                     }
-                });
+                    ui.end_row();
+                }
             }
+                });
 
             if let Some(idx) = to_remove {
                 profile.rotary_axes.remove(idx);
@@ -417,7 +442,10 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
         ui.add_space(4.0);
 
         // ── Toolhead ──────────────────────────────────────────────────────
-        ui.collapsing("Toolhead", |ui| {
+        // Named for what it holds. "Toolhead" suggested it was where the head's
+        // physical properties live, but those are in the section below — this
+        // one is extrusion settings.
+        ui.collapsing("Extruder", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Nozzle diameter:");
                 if ui.add(
@@ -450,9 +478,17 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
         ui.add_space(4.0);
 
         // ── Machine Simulation ────────────────────────────────────────────
-        ui.collapsing("Machine Simulation", |ui| {
+        // This is not only a preview. The head body dimensions drive collision
+        // detection, the nozzle clearance sets the volume excluded from it,
+        // and the max tool tilt bounds every orientation the slicer emits.
+        // Filed under "Machine Simulation" those read as display options, and
+        // nobody looking for "how far may my tool tilt" would think to open a
+        // section about simulation.
+        ui.collapsing("Machine Geometry & Limits", |ui| {
             ui.label(
-                egui::RichText::new("Simple geometric shapes shown in the 3D viewport. \
+                egui::RichText::new("Head and bed geometry. Shown in the 3D viewport, and \
+                    also what collision detection and the tool-tilt limit are computed from — \
+                    these are not display-only settings. Simple geometric shapes. \
                     Segments where the head and bed overlap are highlighted red.")
                     .weak()
                     .small(),
