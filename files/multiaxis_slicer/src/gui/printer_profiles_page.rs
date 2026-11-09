@@ -300,6 +300,29 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
                                     }
                                 }
                             });
+
+                        // Sign convention. Machines differ on which way a
+                        // positive command leans the tool, and getting it
+                        // backwards is a 90 degree orientation error that no
+                        // controller will reject -- it just drives the head
+                        // into the part. Verify with the round-trip check
+                        // below after setting it.
+                        let label = if ax.right_handed { "↻+" } else { "↺+" };
+                        if ui
+                            .selectable_label(ax.right_handed, label)
+                            .on_hover_text(
+                                "Direction of a POSITIVE command.\n\
+                                 ↻+ = right-hand rule about the rotation axis (default).\n\
+                                 ↺+ = this machine calls the other direction positive.\n\n\
+                                 Set it to match the hardware, then use the kinematics \
+                                 check below to confirm the commanded angles actually \
+                                 point the tool where the slicer intends.",
+                            )
+                            .clicked()
+                        {
+                            ax.right_handed = !ax.right_handed;
+                            changed = true;
+                        }
                     }
 
                     // Min / Max
@@ -560,6 +583,66 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
                         .suffix(" mm"),
                 ).changed() { changed = true; }
             });
+            // ── Kinematics self-check ─────────────────────────────────────
+            // Solve IK for a sweep of tool directions, run FK back on the
+            // result, and report the worst discrepancy. A configuration that
+            // reproduces what it is asked for reads ~0; anything larger means
+            // the emitted A/B values point the tool somewhere other than
+            // intended, which is exactly the failure that shipped unnoticed
+            // (92.4 deg worst case) before this check existed.
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Kinematics check:")
+                    .on_hover_text("Round-trips a sweep of tool orientations through inverse \
+                        then forward kinematics using this profile's axes. Verifies the \
+                        rotation axes, their order, and each axis's positive direction are \
+                        self-consistent. This checks the maths against the configuration -- \
+                        it cannot know whether the configuration matches your hardware.");
+
+                let mut gen = crate::gcode::GCodeGenerator::new();
+                gen.kinematics.tcp_offset = profile.tcp_offset;
+                gen.kinematics.axes = profile
+                    .rotary_axes
+                    .iter()
+                    .filter(|ax| ax.axis_type == AxisType::Rotary)
+                    .map(|ax| crate::gcode::GCodeAxis {
+                        name: ax.name.clone(),
+                        is_head: ax.moving_part == MovingPart::Head,
+                        min_deg: ax.min,
+                        max_deg: ax.max,
+                        rotation_axis: ax.rotation_axis.as_vec3_f64(),
+                        max_deg_per_s: ax.max_angular_speed,
+                        direction: if ax.right_handed { 1 } else { -1 },
+                    })
+                    .collect();
+
+                if gen.kinematics.axes.len() < 2 {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 160, 60),
+                        "needs 2 rotary axes",
+                    );
+                } else {
+                    let worst = gen.verify_round_trip(profile.max_tool_tilt_deg);
+                    if worst < 0.01 {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(90, 190, 110),
+                            format!("✓ exact (worst {:.4}°)", worst),
+                        );
+                    } else if worst < 1.0 {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(200, 160, 60),
+                            format!("⚠ {:.3}° error", worst),
+                        );
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 90, 90),
+                            format!("✗ {:.1}° error — tool will not point where intended", worst),
+                        );
+                    }
+                }
+            });
+            ui.separator();
+
             ui.horizontal(|ui| {
                 ui.label("Max tool tilt:")
                     .on_hover_text("How far the tool axis may lean from vertical (degrees). \

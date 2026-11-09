@@ -155,9 +155,20 @@ pub struct AxisConfig {
     /// this axis never exceeds this speed. 0 = unlimited.
     #[serde(default = "default_axis_angular_speed")]
     pub max_angular_speed: f64,
+    /// Sign convention: `true` when a positive commanded value produces a
+    /// right-handed rotation about `rotation_axis`, `false` when the machine
+    /// defines positive the other way.
+    ///
+    /// Machines genuinely differ, so this has to be configuration. Set it to
+    /// match the real hardware and confirm with the round-trip check on the
+    /// profile page, which reports whether the commanded angles actually point
+    /// the tool where the slicer intended.
+    #[serde(default = "default_axis_right_handed")]
+    pub right_handed: bool,
 }
 
 fn default_axis_angular_speed() -> f64 { 30.0 }
+fn default_axis_right_handed() -> bool { true }
 
 impl Default for AxisConfig {
     fn default() -> Self {
@@ -169,6 +180,7 @@ impl Default for AxisConfig {
             max: 180.0,
             rotation_axis: RotationAxis::X,
             max_angular_speed: 30.0,
+            right_handed: true,
         }
     }
 }
@@ -314,8 +326,15 @@ impl Default for PrinterProfile {
             workspace_z: (0.0, 200.0),
             kinematics_type: KinematicsType::FiveAxis,
             rotary_axes: vec![
-                AxisConfig { name: "A".to_string(), axis_type: AxisType::Rotary, moving_part: MovingPart::Head, min: -180.0, max: 180.0, rotation_axis: RotationAxis::X, max_angular_speed: 30.0 },
-                AxisConfig { name: "B".to_string(), axis_type: AxisType::Rotary, moving_part: MovingPart::Bed,  min: -180.0, max: 180.0, rotation_axis: RotationAxis::Y, max_angular_speed: 30.0 },
+                // Both rotaries on the head: a tilting-head machine, matching
+                // MachineKinematics::default(). The two defaults used to
+                // disagree -- this one put B on the bed -- and since
+                // build_gcode_axes reads the profile, the profile won. Bed
+                // rotation also needs the part branch to transform the XYZ
+                // path, which is not implemented; see
+                // docs/KINEMATICS_DESIGN_NOTE.md.
+                AxisConfig { name: "A".to_string(), axis_type: AxisType::Rotary, moving_part: MovingPart::Head, min: -180.0, max: 180.0, rotation_axis: RotationAxis::X, max_angular_speed: 30.0, right_handed: true },
+                AxisConfig { name: "B".to_string(), axis_type: AxisType::Rotary, moving_part: MovingPart::Head, min: -180.0, max: 180.0, rotation_axis: RotationAxis::Y, max_angular_speed: 30.0, right_handed: true },
             ],
             tcp_offset: 0.0,
             rotary_axis_mode: crate::gcode::RotaryAxisMode::AB,
@@ -1988,13 +2007,14 @@ impl SlicerApp {
                         min_deg: ax.min,
                         max_deg: ax.max,
                         rotation_axis: ax.rotation_axis.as_vec3_f64(),
+                        direction: if ax.right_handed { 1 } else { -1 },
                         max_deg_per_s: ax.max_angular_speed,
                     })
                     .collect()
             })
             .unwrap_or_else(|| vec![
-                crate::gcode::GCodeAxis { name: "A".to_string(), is_head: true, min_deg: -180.0, max_deg: 180.0, rotation_axis: [1.,0.,0.], max_deg_per_s: 30.0 },
-                crate::gcode::GCodeAxis { name: "B".to_string(), is_head: true, min_deg: -180.0, max_deg: 180.0, rotation_axis: [0.,1.,0.], max_deg_per_s: 30.0 },
+                crate::gcode::GCodeAxis { name: "A".to_string(), is_head: true, min_deg: -180.0, max_deg: 180.0, rotation_axis: [1.,0.,0.], max_deg_per_s: 30.0, direction: 1 },
+                crate::gcode::GCodeAxis { name: "B".to_string(), is_head: true, min_deg: -180.0, max_deg: 180.0, rotation_axis: [0.,1.,0.], max_deg_per_s: 30.0, direction: 1 },
             ])
     }
 
