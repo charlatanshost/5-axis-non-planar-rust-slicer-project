@@ -16,6 +16,9 @@ pub struct Viewport3D {
     pub camera_pitch: f32,
     pub camera_distance: f32,
     pub camera_target: [f32; 3],
+    /// Whether the camera has been framed on the build volume for the
+    /// no-mesh view. Done once, so it does not fight the user's own camera.
+    has_framed_empty_view: bool,
 
     // Default camera state for reset (H key)
     default_camera_yaw: f32,
@@ -126,6 +129,8 @@ impl Viewport3D {
             default_camera_pitch: 30.0,
             default_camera_distance: 100.0,
             default_camera_target: [0.0, 0.0, 0.0],
+
+            has_framed_empty_view: false,
 
             last_mouse_pos: None,
             is_rotating: false,
@@ -1244,6 +1249,40 @@ impl Viewport3D {
             log::warn!("VIEWPORT: render() called with mesh present but not loaded yet!");
         }
 
+        // Frame the build volume when there is no mesh to frame on.
+        //
+        // The camera starts at the origin, 100 mm out -- but the default build
+        // volume spans 0..200 in X and Y, so its centre is (100, 100) and the
+        // camera sat at a *corner* of a 200 mm plate, half its width away. The
+        // plate filled the viewport as a huge quad cutting diagonally across
+        // it, which read as a rendering fault rather than as the bed.
+        //
+        // Done once, so panning and zooming afterwards still work normally.
+        if app.mesh.is_none() && !self.has_framed_empty_view {
+            if let Some(p) = app.profiles.get(app.active_profile_index) {
+                let cx = ((p.workspace_x.0 + p.workspace_x.1) / 2.0) as f32;
+                let cy = ((p.workspace_y.0 + p.workspace_y.1) / 2.0) as f32;
+                let span = ((p.workspace_x.1 - p.workspace_x.0)
+                    .max(p.workspace_y.1 - p.workspace_y.0)) as f32;
+                if span > 1.0 {
+                    // The scene is Z-up: set_mesh frames on (x, y, z) straight
+                    // from the mesh bounds, and the build plate grid is built
+                    // in the XY plane at a constant z. So the bed centre is
+                    // (cx, cy, z), not (cx, z, cy).
+                    self.camera_target = [cx, cy, 0.0];
+                    self.camera_distance = span * 1.6;
+                    self.default_camera_target = self.camera_target;
+                    self.default_camera_distance = self.camera_distance;
+                    self.has_framed_empty_view = true;
+                }
+            }
+        }
+        if app.mesh.is_some() {
+            // A loaded mesh frames the camera itself; re-arm for the next
+            // time the viewport is empty.
+            self.has_framed_empty_view = false;
+        }
+
         // Update mesh if it changed
         // When showing deformed mesh, display that instead of the original
         let display_mesh = if app.show_deformed_mesh {
@@ -1425,16 +1464,12 @@ impl Viewport3D {
                 );
             }
 
-            // Show camera controls hint
-            let painter = ui.painter();
-            let hint_pos = egui::pos2(rect.left() + 10.0, rect.bottom() - 20.0);
-            painter.text(
-                hint_pos,
-                egui::Align2::LEFT_BOTTOM,
-                "H: Reset camera | Drag: Rotate | Shift+Drag: Pan | Scroll: Zoom",
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_rgba_unmultiplied(200, 200, 200, 180),
-            );
+            // The camera hint is drawn by render_3d, which this function calls
+            // just above. Drawing it here too put two different strings at the
+            // same bottom-left position, overlapping into an unreadable
+            // smudge -- and this copy was also wrong: it advertised
+            // "Drag: Rotate | Shift+Drag: Pan", neither of which is bound.
+            // handle_input rotates on Secondary (right) and pans on Middle.
         } else {
             // No mesh and no machine geometry — show empty placeholder
             let painter = ui.painter();
@@ -1969,9 +2004,16 @@ impl Viewport3D {
                         let yaw_rad = camera_yaw.to_radians();
                         let pitch_rad = camera_pitch.to_radians();
 
-                        let camera_x = camera_target[0] + camera_distance * pitch_rad.cos() * yaw_rad.sin();
-                        let camera_y = camera_target[1] + camera_distance * pitch_rad.sin();
-                        let camera_z = camera_target[2] + camera_distance * pitch_rad.cos() * yaw_rad.cos();
+                        // Z-up orbit. The scene is Z-up throughout -- meshes are
+                        // framed straight from (x, y, z) bounds and the build
+                        // plate grid lies in the XY plane -- but the camera was
+                        // placed and oriented as though Y were up, which
+                        // rendered the whole world rotated 90 degrees: the bed
+                        // appeared as a vertical wall and models lay on their
+                        // side.
+                        let camera_x = camera_target[0] + camera_distance * pitch_rad.cos() * yaw_rad.cos();
+                        let camera_y = camera_target[1] + camera_distance * pitch_rad.cos() * yaw_rad.sin();
+                        let camera_z = camera_target[2] + camera_distance * pitch_rad.sin();
 
                         // Create three-d viewport
                         let viewport = Viewport {
@@ -1986,7 +2028,7 @@ impl Viewport3D {
                             viewport,
                             vec3(camera_x, camera_y, camera_z),
                             vec3(camera_target[0], camera_target[1], camera_target[2]),
-                            vec3(0.0, 1.0, 0.0),
+                            vec3(0.0, 0.0, 1.0), // Z-up, matching the scene
                             degrees(45.0),
                             5.0,      // Near plane: Increased from 0.1 to 5.0 for better depth precision
                             10000.0,  // Far plane: Sufficient for 300mm build volume
@@ -2177,11 +2219,12 @@ impl Viewport3D {
             );
         }
 
-        // Show controls help
+        // Controls help — the single source of truth for this string, and it
+        // matches what `handle_input` actually binds.
         painter.text(
             rect.left_bottom() + egui::vec2(10.0, -10.0),
             egui::Align2::LEFT_BOTTOM,
-            "Right-drag: Rotate | Middle-drag: Pan | Scroll: Zoom",
+            "H: Reset camera | Right-drag: Rotate | Middle-drag: Pan | Scroll: Zoom",
             egui::FontId::monospace(11.0),
             egui::Color32::from_rgb(150, 150, 150),
         );
