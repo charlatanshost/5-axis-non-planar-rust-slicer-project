@@ -57,9 +57,7 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                 .show(ui, |ui| {
 
             // File Operations Section
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("File Operations").strong());
-                ui.separator();
+            section(ui, "sec_file", "File Operations", true, |ui| {
 
                 if ui.button("📁 Load STL").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
@@ -111,9 +109,7 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
             ui.add_space(10.0);
 
             // Machine Configuration Section
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("Machine Profile").strong());
-                ui.separator();
+            section(ui, "sec_machine", "Machine Profile", false, |ui| {
 
                 // Profile selector — pick from saved profiles and jump to editor
                 ui.horizontal(|ui| {
@@ -196,12 +192,11 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
             ui.add_space(10.0);
 
             // Slicing Parameters Section
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("Slicing Parameters").strong());
-                ui.separator();
+            section(ui, "sec_slicing", "Slicing Parameters", true, |ui| {
 
-                // Slicing mode selector
-                ui.horizontal(|ui| {
+                // Slicing mode selector. In the same grid as the rows below so
+                // its control shares their left edge.
+                field_grid(ui, "slicing_mode_row", |ui| {
                     ui.label("Slicing mode:");
                     egui::ComboBox::from_id_salt("slicing_mode")
                         .selected_text(match app.slicing_mode {
@@ -259,6 +254,7 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                                     can only produce shells, never fillable solid cross-sections. It is a surface-finishing \
                                     technique, not a route to non-planar printing of solids.");
                         });
+                    ui.end_row();
                 });
 
                 // Surface the measured state of the selected mode, so a choice
@@ -1007,9 +1003,7 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
             ui.add_space(10.0);
 
             // Visualization Controls Section
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("Visualization").strong());
-                ui.separator();
+            section(ui, "sec_view", "Visualization", false, |ui| {
 
                 ui.checkbox(&mut app.show_mesh, "Show mesh");
                 ui.checkbox(&mut app.show_layers, "Show layers");
@@ -1131,9 +1125,7 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
             ui.add_space(10.0);
 
             // Actions Section
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("Actions").strong());
-                ui.separator();
+            section(ui, "sec_actions", "Actions", true, |ui| {
 
                 let can_slice = app.mesh.is_some() && !app.is_slicing;
                 let needs_deform_preview = app.slicing_mode == crate::gui::app::SlicingMode::Curved
@@ -1457,9 +1449,7 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
 
             // G-code Preview Section
             if !app.gcode_lines.is_empty() {
-                ui.group(|ui| {
-                    ui.label(egui::RichText::new("G-code Preview").strong());
-                    ui.separator();
+                section(ui, "sec_gcode", "G-code Preview", false, |ui| {
 
                     egui::ScrollArea::vertical()
                         .max_height(200.0)
