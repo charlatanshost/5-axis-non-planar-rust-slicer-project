@@ -3,6 +3,47 @@
 use crate::gui::app::SlicerApp;
 use egui;
 
+/// A titled section with consistent styling, collapsible so the panel can be
+/// folded down to what is actually in use.
+///
+/// Sections were previously `ui.group` + a bold label + a separator, repeated
+/// by hand, which gave the title the same visual weight as the controls under
+/// it and meant every section was permanently expanded — pushing the primary
+/// actions below the fold.
+fn section<R>(
+    ui: &mut egui::Ui,
+    id: &str,
+    title: &str,
+    default_open: bool,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) {
+    egui::CollapsingHeader::new(egui::RichText::new(title).strong())
+        .id_salt(id)
+        .default_open(default_open)
+        .show(ui, |ui| {
+            ui.add_space(2.0);
+            add(ui);
+            ui.add_space(2.0);
+        });
+    ui.add_space(4.0);
+}
+
+/// Two-column grid for label/control rows.
+///
+/// Laid out with `ui.horizontal` instead, each row sizes its own label, so
+/// "Layer height:", "Min height:" and "Nozzle diameter:" each started their
+/// slider at a different x and ended their value box at a different x. A grid
+/// shares one column boundary across every row in the section.
+///
+/// Call `ui.end_row()` after each label/control pair.
+fn field_grid(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Grid::new(id)
+        .num_columns(2)
+        .spacing([10.0, 6.0])
+        .min_col_width(104.0)
+        .show(ui, add);
+}
+
 pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
     egui::SidePanel::left("control_panel")
         .default_width(300.0)
@@ -814,66 +855,61 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                     ui.add_space(5.0);
                 }
 
-                ui.horizontal(|ui| {
+                field_grid(ui, "layer_heights", |ui| {
                     ui.label("Layer height:");
                     ui.add(egui::Slider::new(&mut app.config.layer_height, 0.05..=0.5)
                         .suffix(" mm"));
-                });
+                    ui.end_row();
 
-                ui.horizontal(|ui| {
                     ui.label("Min height:");
                     ui.add(egui::Slider::new(&mut app.config.min_layer_height, 0.01..=2.0)
                         .suffix(" mm")
                         .step_by(0.01))
                         .on_hover_text("Thinnest layer used on steep/vertical surfaces (adaptive mode).");
-                });
+                    ui.end_row();
 
-                ui.horizontal(|ui| {
                     ui.label("Max height:");
                     ui.add(egui::Slider::new(&mut app.config.max_layer_height, 0.01..=5.0)
                         .suffix(" mm")
                         .step_by(0.01))
                         .on_hover_text("Thickest layer used on flat/horizontal surfaces (adaptive mode).");
-                });
+                    ui.end_row();
 
-                ui.checkbox(&mut app.config.adaptive, "Adaptive layer height")
-                    .on_hover_text("Vary layer height by local surface slope.\nFlat faces → max height (fast). Vertical faces → min height (fine detail).\nUses triangle normals to estimate slope at each layer.");
-
-                // S3-Slicer specific parameter (only shown/used in S3 Curved mode — S4 has its own)
-                if app.slicing_mode == crate::gui::app::SlicingMode::Curved {
-                    ui.horizontal(|ui| {
-                        ui.label("Max rotation:");
+                    // S3-Slicer specific parameter (only shown/used in S3 Curved mode — S4 has its own)
+                    if app.slicing_mode == crate::gui::app::SlicingMode::Curved {
+                        ui.label("Max rotation:")
+                            .on_hover_text(
+                                "Limits how much each triangle can rotate during deformation.\n\
+                                 Lower = gentler deformation, more recognisable mesh.\n\
+                                 Higher = more aggressive optimisation, potential distortion.",
+                            );
                         ui.add(egui::Slider::new(&mut app.config.max_rotation_degrees, 5.0..=45.0)
                             .suffix("°")
                             .step_by(1.0));
-                    });
-                    if ui.small_button("?").on_hover_text(
-                        "Limits how much each triangle can rotate during deformation.\n\
-                         Lower values = gentler deformation, more recognizable mesh\n\
-                         Higher values = more aggressive optimization, potential distortion"
-                    ).clicked() {}
-                }
+                        ui.end_row();
+                    }
 
-                ui.separator();
-
-                ui.horizontal(|ui| {
                     ui.label("Nozzle diameter:");
                     ui.add(egui::Slider::new(&mut app.nozzle_diameter, 0.2..=1.2)
                         .suffix(" mm"));
-                });
+                    ui.end_row();
 
-                ui.horizontal(|ui| {
                     ui.label("Feedrate:");
                     ui.add(egui::Slider::new(&mut app.feedrate, 10.0..=150.0)
                         .suffix(" mm/s"));
+                    ui.end_row();
                 });
+
+                ui.add_space(2.0);
+                ui.checkbox(&mut app.config.adaptive, "Adaptive layer height")
+                    .on_hover_text("Vary layer height by local surface slope.\nFlat faces → max height (fast). Vertical faces → min height (fine detail).\nUses triangle normals to estimate slope at each layer.");
 
                 ui.separator();
 
                 // Toolpath Pattern Selection
                 ui.label(egui::RichText::new("Toolpath Pattern").strong());
 
-                ui.horizontal(|ui| {
+                field_grid(ui, "toolpath_pattern_fields", |ui| {
                     ui.label("Pattern:");
                     use crate::toolpath_patterns::ToolpathPattern;
                     egui::ComboBox::from_id_salt("toolpath_pattern")
@@ -883,17 +919,15 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                             ui.selectable_value(&mut app.toolpath_pattern, ToolpathPattern::Spiral, "Spiral");
                             ui.selectable_value(&mut app.toolpath_pattern, ToolpathPattern::Zigzag, "Zigzag");
                         });
-                });
+                    ui.end_row();
 
-                ui.horizontal(|ui| {
                     ui.label("Line width:");
                     ui.add(egui::Slider::new(&mut app.toolpath_line_width, 0.2..=2.0)
                         .suffix(" mm"));
-                });
+                    ui.end_row();
 
-                // Wall loops (shown for Contour pattern)
-                if app.toolpath_pattern == crate::toolpath_patterns::ToolpathPattern::Contour {
-                    ui.horizontal(|ui| {
+                    // Wall loops (shown for Contour pattern)
+                    if app.toolpath_pattern == crate::toolpath_patterns::ToolpathPattern::Contour {
                         ui.label("Wall loops:");
                         let mut wall_count_f = app.wall_count as f64;
                         if ui.add(egui::Slider::new(&mut wall_count_f, 1.0..=10.0)
@@ -901,23 +935,22 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                             .changed() {
                             app.wall_count = wall_count_f as usize;
                         }
-                    });
-                }
+                        ui.end_row();
+                    }
 
-                // Infill density (always visible)
-                ui.horizontal(|ui| {
+                    // Infill density (always visible)
                     ui.label("Infill density:");
                     ui.add(egui::Slider::new(&mut app.toolpath_infill_density, 0.0..=1.0)
                         .suffix("%")
                         .custom_formatter(|v, _| format!("{:.0}", v * 100.0)))
                         .on_hover_text("0% = no infill (hollow), 100% = solid fill");
-                });
+                    ui.end_row();
 
                 // Infill pattern selector (shown when Contour pattern and density > 0)
                 if app.toolpath_pattern == crate::toolpath_patterns::ToolpathPattern::Contour
                     && app.toolpath_infill_density > 0.01
                 {
-                    ui.horizontal(|ui| {
+                    {
                         ui.label("Infill pattern:");
                         use crate::toolpath_patterns::InfillPattern;
                         egui::ComboBox::from_id_salt("infill_pattern")
@@ -936,8 +969,12 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                                 ui.selectable_value(&mut app.infill_pattern, InfillPattern::AdaptiveCubic, "Adaptive Cubic")
                                     .on_hover_text("Grid pattern with adaptive density — dense near walls,\nsparser in the interior. Saves material on larger parts");
                             });
-                    });
+                        ui.end_row();
+                    }
                 }
+                });
+
+                ui.add_space(2.0);
 
                 // Force-infill override for coordinate-transform modes (geodesic has infill by default)
                 let is_coord_transform_mode = matches!(
