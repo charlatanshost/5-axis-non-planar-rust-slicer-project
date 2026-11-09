@@ -13,7 +13,7 @@
 use crate::geometry::Point3D;
 use crate::s3_slicer::tet_mesh::TetMesh;
 use crate::s3_slicer::tet_quaternion_field::TetQuaternionField;
-use nalgebra::{Matrix3, Vector3 as NVector3, SVD};
+use nalgebra::{Matrix3, Rotation3, UnitQuaternion, Vector3 as NVector3, SVD};
 use sprs::TriMat;
 use std::collections::HashMap;
 
@@ -197,8 +197,31 @@ impl TetAsapSolver {
                     rotation = u_corr * v_t;
                 }
 
+                // Blend toward the quaternion field's target on the rotation
+                // group, before any scaling is applied.
+                //
+                // This used to be done afterwards as a linear combination of
+                // matrices, `transform * (1 - w) + target * w`. A linear
+                // combination of two rotations is not a rotation: it
+                // contracts, by up to 1 - cos(theta/2) for a separation of
+                // theta, so the blend quietly shrank every tet that carried a
+                // rotation. Interpolating on the group with slerp keeps the
+                // result a rotation, leaving scaling to the explicit factor
+                // below where it can be seen and clamped.
+                if self.config.quaternion_weight > 0.0 {
+                    let target_quat = self.quaternion_field.rotation_at(ti);
+                    if target_quat.angle() > 1e-6 {
+                        let w = self.config.quaternion_weight.clamp(0.0, 1.0);
+                        let current = UnitQuaternion::from_rotation_matrix(
+                            &Rotation3::from_matrix_unchecked(rotation),
+                        );
+                        let blended = current.slerp(&target_quat, w);
+                        rotation = blended.to_rotation_matrix().into_inner();
+                    }
+                }
+
                 // ASAP: include scaling (S from SVD)
-                let transform = if self.config.allow_scaling {
+                if self.config.allow_scaling {
                     // T = R * S = U * diag(singular_values) * V^T = F itself
                     // But we limit extreme scaling
                     let s = &svd.singular_values;
@@ -212,22 +235,6 @@ impl TetAsapSolver {
                 } else {
                     // ARAP: rotation only
                     rotation
-                };
-
-                // Blend with quaternion field guidance
-                if self.config.quaternion_weight > 0.0 {
-                    let target_quat = self.quaternion_field.rotation_at(ti);
-                    if target_quat.angle() > 1e-6 {
-                        let target_mat = target_quat.to_rotation_matrix().into_inner();
-
-                        // Blend: (1-w)*transform + w*target
-                        let w = self.config.quaternion_weight.min(1.0);
-                        transform * (1.0 - w) + target_mat * w
-                    } else {
-                        transform
-                    }
-                } else {
-                    transform
                 }
             })
             .collect()
@@ -436,6 +443,51 @@ mod tests {
         ];
 
         TetMesh::new(vertices, tets)
+    }
+
+    /// Regression test for D-11.
+    ///
+    /// The local step blends the SVD rotation toward the quaternion field's
+    /// target. That blend used to be a linear combination of matrices,
+    /// `transform * (1 - w) + target * w`, which is not a rotation: it
+    /// contracts, so every tet carrying a rotation was quietly shrunk.
+    /// Interpolating on the rotation group keeps the result orthogonal and
+    /// leaves scaling to the explicit, clamped factor.
+    #[test]
+    fn test_rotation_blend_stays_a_rotation() {
+        let axis = nalgebra::Vector3::z_axis();
+        let a = UnitQuaternion::from_axis_angle(&axis, 0.0);
+        let b = UnitQuaternion::from_axis_angle(&axis, 60f64.to_radians());
+
+        for &w in &[0.0, 0.3, 0.5, 1.0] {
+            let slerped = a.slerp(&b, w).to_rotation_matrix().into_inner();
+
+            // A rotation has determinant 1 and preserves lengths.
+            assert!(
+                (slerped.determinant() - 1.0).abs() < 1e-12,
+                "w={}: slerp determinant {} is not 1",
+                w,
+                slerped.determinant()
+            );
+            let probe = nalgebra::Vector3::new(1.0, 0.0, 0.0);
+            assert!(
+                ((slerped * probe).norm() - 1.0).abs() < 1e-12,
+                "w={}: slerp changed the length of a unit vector",
+                w
+            );
+        }
+
+        // And demonstrate what the old linear blend did at the same weight:
+        // it contracts, which is exactly the spurious shrink that was being
+        // applied to every rotating tet.
+        let ma = a.to_rotation_matrix().into_inner();
+        let mb = b.to_rotation_matrix().into_inner();
+        let linear = ma * 0.7 + mb * 0.3;
+        assert!(
+            linear.determinant() < 0.99,
+            "expected the linear blend to contract, determinant was {}",
+            linear.determinant()
+        );
     }
 
     /// Regression test for D-08, and the invariant the bug violated.
