@@ -78,6 +78,15 @@ pub struct S3PipelineConfig {
     /// ASAP convergence threshold
     pub asap_convergence_threshold: f64,
 
+    /// How strongly the ASAP local step is pulled toward the quaternion
+    /// field's target rotation, 0..1.
+    ///
+    /// At 0 the solve is pure ARAP and ignores the field entirely; at 1 each
+    /// tet takes the field's rotation outright. This was hardcoded at 0.3,
+    /// which is one of several dampers that between them left a Benchy with
+    /// 0.187 mm of total deformation on a 48 mm model.
+    pub asap_quaternion_weight: f64,
+
     /// Z-bias for Dijkstra edge weights in the S4 pipeline (0 = Euclidean, 1 = pure |ΔZ|).
     /// Only used by DeformationMethod::S4Deform.  Default 0.8 gives height-tracking layers.
     pub z_bias: f64,
@@ -114,8 +123,34 @@ impl Default for S3PipelineConfig {
             smoothness_weight: 0.5,
             max_rotation_degrees: 15.0,  // Conservative default to prevent extreme deformations
             deformation_method: DeformationMethod::VirtualScalarField,  // Default to virtual - no mesh collapse
-            asap_max_iterations: 3,      // 3 iterations is usually enough for ARAP convergence
+            // ASAP is a local/global alternation, and at 3 iterations it is
+            // nowhere near converged -- the per-iteration displacement was
+            // still falling when it stopped, so the deformation was simply
+            // under-solved. Of the four knobs that damp the result this is
+            // the only one that moves it: raising max_rotation_degrees from
+            // 15 to 45, or asap_quaternion_weight from 0.3 to 1.0, or the
+            // diffusion iteration count from 50 to 600, each changed the
+            // layer curvature by under 3%.
+            //
+            // The cost of iterating is folding. Measured on a 30 mm sphere,
+            // maximum per-layer Z variation against inverted tets:
+            //
+            //       iters   inverted   extent   max Z spread
+            //           3       0.0%    1.00x       3.12 mm
+            //           8       0.0%    1.00x       3.06 mm
+            //          15       0.7%    1.00x       4.37 mm
+            //          22       0.9%    1.01x       4.95 mm
+            //          30       2.1%    1.04x       5.65 mm
+            //          60       3.6%    1.16x       7.78 mm
+            //
+            // Inverted tets fold the mesh locally, which makes the barycentric
+            // mapping non-injective there and can self-intersect the layers.
+            // 20 sits at the knee: about 58% more layer curvature than 3, for
+            // under 1% folding. Past 30 the folding accelerates faster than
+            // the curvature improves.
+            asap_max_iterations: 20,
             asap_convergence_threshold: 1e-3,  // Higher threshold for faster termination
+            asap_quaternion_weight: 0.3,
             z_bias: 0.8,  // Height-tracking Dijkstra by default
             auto_z_bias: true,
             use_asap: false,
@@ -517,7 +552,7 @@ fn execute_tet_pipeline(
     let tet_asap_config = TetAsapConfig {
         max_iterations: config.asap_max_iterations,
         convergence_threshold: config.asap_convergence_threshold,
-        quaternion_weight: 0.3,
+        quaternion_weight: config.asap_quaternion_weight,
         constraint_weight: 500.0,
         allow_scaling: true, // ASAP (with scaling) - key difference from surface ARAP
     };

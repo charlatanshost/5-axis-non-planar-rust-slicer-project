@@ -2198,6 +2198,7 @@ impl SlicerApp {
                 deformation_method,
                 asap_max_iterations,
                 asap_convergence_threshold: asap_convergence,
+                asap_quaternion_weight: 0.3,
                 ..S3PipelineConfig::default()
             };
 
@@ -2303,6 +2304,7 @@ impl SlicerApp {
                 deformation_method: crate::s3_slicer::DeformationMethod::S4Deform,
                 asap_max_iterations,
                 asap_convergence_threshold: asap_convergence,
+                asap_quaternion_weight: 0.3,
                 z_bias,
                 auto_z_bias,
                 use_asap,
@@ -2780,6 +2782,7 @@ impl SlicerApp {
                     deformation_method: crate::s3_slicer::DeformationMethod::S4Deform,
                     asap_max_iterations: self.s4_asap_max_iterations,
                     asap_convergence_threshold: self.s4_asap_convergence,
+                asap_quaternion_weight: 0.3,
                     z_bias: self.s4_z_bias,
                     auto_z_bias: self.s4_auto_z_bias,
                     use_asap: self.s4_use_asap,
@@ -2799,6 +2802,7 @@ impl SlicerApp {
                     deformation_method: crate::s3_slicer::DeformationMethod::S4Deform,
                     asap_max_iterations: self.s3_asap_max_iterations,
                     asap_convergence_threshold: self.s3_asap_convergence,
+                asap_quaternion_weight: 0.3,
                     z_bias: 0.8,
                     ..S3PipelineConfig::default()
                 }
