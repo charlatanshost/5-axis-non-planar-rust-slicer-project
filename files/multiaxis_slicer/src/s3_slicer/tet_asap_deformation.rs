@@ -123,8 +123,10 @@ impl TetAsapSolver {
             // Local step: compute optimal transforms per tet
             let transforms = self.local_step(&positions);
 
-            // Global step: solve for new positions
-            let new_positions = self.global_step(&transforms);
+            // Global step: solve for new positions, warm-started from where we
+            // currently are. Restarting the solve from scratch each iteration
+            // threw away all the progress made so far.
+            let new_positions = self.global_step(&transforms, &positions);
 
             // Check convergence
             let max_disp = positions.iter().zip(new_positions.iter())
@@ -231,8 +233,14 @@ impl TetAsapSolver {
             .collect()
     }
 
-    /// Global step: solve Laplacian system for new vertex positions
-    fn global_step(&self, transforms: &[Matrix3<f64>]) -> Vec<Point3D> {
+    /// Global step: solve Laplacian system for new vertex positions.
+    ///
+    /// `current_positions` seeds the iterative solve. This matters enormously:
+    /// the system is a near-singular Laplacian pinned only at the bottom 5% of
+    /// vertices, and Gauss-Seidel moves information roughly one vertex per
+    /// sweep, so a bad starting point is never recovered from within any
+    /// sensible iteration budget.
+    fn global_step(&self, transforms: &[Matrix3<f64>], current_positions: &[Point3D]) -> Vec<Point3D> {
         let n = self.rest_mesh.vertices.len();
 
         let mut triplets = TriMat::new((n, n));
@@ -248,8 +256,17 @@ impl TetAsapSolver {
             for (a, b) in tet.edges() {
                 let weight = self.edge_weights.get(&edge_key(a, b)).copied().unwrap_or(1.0);
 
-                // Rest-pose edge vector
-                let rest_edge = self.rest_mesh.vertices[b] - self.rest_mesh.vertices[a];
+                // Rest-pose edge vector, oriented b -> a to match the sign of
+                // this edge's contribution to the Laplacian rows below.
+                //
+                // The row for `a` encodes w * (p_a - p_b), so the right-hand
+                // side entry for `a` must be w * T * (a_rest - b_rest). It was
+                // built from (b_rest - a_rest) and added with a plus, which
+                // asks for every deformed edge to be the *negation* of its
+                // transformed rest edge -- i.e. it asks the solver to turn the
+                // mesh inside out. Even an identity transform produced a
+                // fully inverted mesh.
+                let rest_edge = self.rest_mesh.vertices[a] - self.rest_mesh.vertices[b];
                 let rest_vec = NVector3::new(rest_edge.x, rest_edge.y, rest_edge.z);
 
                 // Apply transform
@@ -282,11 +299,17 @@ impl TetAsapSolver {
             rhs_z[vi] += w * v.z;
         }
 
-        // Solve
+        // Solve, starting from the current configuration rather than from
+        // nothing. 30 sweeps was also far too few for a mesh of this size --
+        // the solver exits early once it stops moving, so a high cap is only
+        // paid for when it is genuinely needed.
         let matrix = triplets.to_csr();
-        let sol_x = solve_gauss_seidel(&matrix, &rhs_x, 30);
-        let sol_y = solve_gauss_seidel(&matrix, &rhs_y, 30);
-        let sol_z = solve_gauss_seidel(&matrix, &rhs_z, 30);
+        let init_x: Vec<f64> = current_positions.iter().map(|p| p.x).collect();
+        let init_y: Vec<f64> = current_positions.iter().map(|p| p.y).collect();
+        let init_z: Vec<f64> = current_positions.iter().map(|p| p.z).collect();
+        let sol_x = solve_gauss_seidel(&matrix, &rhs_x, &init_x, GAUSS_SEIDEL_MAX_SWEEPS);
+        let sol_y = solve_gauss_seidel(&matrix, &rhs_y, &init_y, GAUSS_SEIDEL_MAX_SWEEPS);
+        let sol_z = solve_gauss_seidel(&matrix, &rhs_z, &init_z, GAUSS_SEIDEL_MAX_SWEEPS);
 
         (0..n)
             .map(|i| Point3D::new(sol_x[i], sol_y[i], sol_z[i]))
@@ -312,10 +335,38 @@ fn compute_edge_weights(tet_mesh: &TetMesh) -> HashMap<(usize, usize), f64> {
     weights
 }
 
-/// Gauss-Seidel iterative solver
-fn solve_gauss_seidel(matrix: &sprs::CsMat<f64>, rhs: &[f64], max_iter: usize) -> Vec<f64> {
+/// Sweep cap for the global Laplacian solve.
+///
+/// Gauss-Seidel on a Laplacian carries information about one vertex per sweep
+/// and its spectral radius approaches 1 as the mesh refines, so a cap in the
+/// tens cannot converge a mesh of thousands of vertices. The solver stops as
+/// soon as it stops moving, so this bound is only reached when it is needed.
+const GAUSS_SEIDEL_MAX_SWEEPS: usize = 2000;
+
+/// Gauss-Seidel iterative solver, seeded with `initial`.
+///
+/// `initial` used to be ignored in favour of `rhs * 0.01`, which is not an
+/// approximate solution of anything: for this Laplacian the right-hand side is
+/// a sum of weighted edge vectors, so interior entries are near zero because
+/// the edges around a vertex cancel. Every solve therefore began with the mesh
+/// collapsed onto the origin, and 30 sweeps only carried the constrained
+/// bottom vertices' influence a short way into the interior. The result was a
+/// mesh shrunk to a third of its extent with over half its tets inverted,
+/// which the pipeline's quality gate then rejected -- so TetVolumetric always
+/// fell back to VirtualScalarField and produced flat layers.
+fn solve_gauss_seidel(
+    matrix: &sprs::CsMat<f64>,
+    rhs: &[f64],
+    initial: &[f64],
+    max_iter: usize,
+) -> Vec<f64> {
     let n = rhs.len();
-    let mut solution: Vec<f64> = rhs.iter().map(|&r| if r.is_finite() { r * 0.01 } else { 0.0 }).collect();
+    let mut solution: Vec<f64> = (0..n)
+        .map(|i| match initial.get(i) {
+            Some(&v) if v.is_finite() => v,
+            _ => 0.0,
+        })
+        .collect();
 
     for _ in 0..max_iter {
         let mut max_change = 0.0f64;
@@ -385,6 +436,88 @@ mod tests {
         ];
 
         TetMesh::new(vertices, tets)
+    }
+
+    /// Regression test for D-08, and the invariant the bug violated.
+    ///
+    /// With an identity rotation field and scaling disabled, the global solve
+    /// is being asked for exactly the rest pose, so it must return it: every
+    /// edge satisfies p_a - p_b = I * (a_rest - b_rest) already.
+    ///
+    /// The right-hand side was built from (b_rest - a_rest) while the
+    /// Laplacian row for `a` encodes w * (p_a - p_b), so the system actually
+    /// demanded the negation of every edge -- it asked the solver to turn the
+    /// mesh inside out. On a sphere that gave 53.8% inverted tets at 0.33x
+    /// extent, which the pipeline's quality gate rejected, so TetVolumetric
+    /// always fell back to VirtualScalarField and emitted flat layers.
+    #[test]
+    fn test_identity_field_reproduces_the_rest_pose() {
+        let mesh = make_test_tet_mesh();
+        let rest = mesh.vertices.clone();
+
+        // An identity field: no tet asks to rotate.
+        let mut qfield = TetQuaternionField::optimize(&mesh, QuaternionFieldConfig::default());
+        for q in &mut qfield.rotations {
+            *q = nalgebra::UnitQuaternion::identity();
+        }
+
+        let config = TetAsapConfig {
+            allow_scaling: false,
+            quaternion_weight: 0.0,
+            ..TetAsapConfig::default()
+        };
+        let solver = TetAsapSolver::new(mesh, qfield, config);
+        let deformed = solver.solve();
+
+        assert_eq!(deformed.vertices.len(), rest.len());
+        for (i, (got, want)) in deformed.vertices.iter().zip(rest.iter()).enumerate() {
+            let err = (*got - *want).norm();
+            assert!(
+                err < 1e-3,
+                "vertex {} moved {:.4}mm from the rest pose ({:?} vs {:?})",
+                i, err, got, want
+            );
+        }
+
+        // And nothing may be turned inside out.
+        let quality = deformed.check_quality();
+        assert_eq!(
+            quality.inverted_tets, 0,
+            "identity field inverted {} of {} tets",
+            quality.inverted_tets,
+            deformed.tets.len()
+        );
+    }
+
+    /// The global solve must be seeded from the supplied positions rather than
+    /// from a rescaling of the right-hand side. Starting from the rest pose
+    /// with an identity transform, it should already be at the answer and
+    /// barely move; the old `rhs * 0.01` seed began with the mesh collapsed
+    /// onto the origin instead.
+    #[test]
+    fn test_gauss_seidel_honours_its_initial_guess() {
+        let n = 3;
+        // A well-conditioned diagonal system whose solution is (1, 2, 3).
+        let mut triplets = TriMat::new((n, n));
+        triplets.add_triplet(0, 0, 2.0);
+        triplets.add_triplet(1, 1, 2.0);
+        triplets.add_triplet(2, 2, 2.0);
+        let matrix = triplets.to_csr();
+        let rhs = vec![2.0, 4.0, 6.0];
+
+        // Seeded at the exact answer, it must stay there after one sweep.
+        let exact = vec![1.0, 2.0, 3.0];
+        let got = solve_gauss_seidel(&matrix, &rhs, &exact, 1);
+        for i in 0..n {
+            assert!((got[i] - exact[i]).abs() < 1e-12, "moved away from the solution: {:?}", got);
+        }
+
+        // And a poor seed still converges, so the seed is a starting point and
+        // not a constraint.
+        let got = solve_gauss_seidel(&matrix, &rhs, &[0.0, 0.0, 0.0], 50);
+        for i in 0..n {
+            assert!((got[i] - exact[i]).abs() < 1e-9, "failed to converge: {:?}", got);
+        }
     }
 
     #[test]
