@@ -1900,57 +1900,67 @@ impl SlicerApp {
 
         let tilt_step_deg = 5.0_f64;
         let steps = ((max_tilt_deg / tilt_step_deg).ceil() as usize + 1).max(1);
-        let mut n_fixed = 0usize;
 
-        for toolpath in &mut self.toolpaths {
-            for seg in &mut toolpath.paths {
-                // Skip if current orientation already clears the mesh.
-                if !detector.check_collision_with_mesh_oriented(
-                    &seg.position, &seg.orientation,
-                ) {
-                    continue;
-                }
+        // One BVH query per segment, plus up to `steps` more for each segment
+        // that collides. Curved layers produce orders of magnitude more
+        // segments than planar ones -- a 30 mm sphere gives ~146k, a Benchy far
+        // more -- and this ran serially, which is why the pass took longer than
+        // the slice it was processing. Every segment is independent and the BVH
+        // is read-only, so the work parallelises exactly.
+        use rayon::prelude::*;
+        let n_fixed: usize = self
+            .toolpaths
+            .par_iter_mut()
+            .map(|toolpath| {
+                toolpath
+                    .paths
+                    .par_iter_mut()
+                    .map(|seg| {
+                        // Skip if current orientation already clears the mesh.
+                        if !detector
+                            .check_collision_with_mesh_oriented(&seg.position, &seg.orientation)
+                        {
+                            return 0usize;
+                        }
 
-                // Radial escape direction (away from cone/mesh center in XY).
-                let dx = seg.position.x - cone_cx;
-                let dy = seg.position.y - cone_cy;
-                let rxy = (dx * dx + dy * dy).sqrt();
-                let (ex, ey) = if rxy > 1e-6 {
-                    (dx / rxy, dy / rxy)
-                } else {
-                    (1.0_f64, 0.0_f64)
-                };
+                        // Radial escape direction (away from cone/mesh center in XY).
+                        let dx = seg.position.x - cone_cx;
+                        let dy = seg.position.y - cone_cy;
+                        let rxy = (dx * dx + dy * dy).sqrt();
+                        let (ex, ey) = if rxy > 1e-6 {
+                            (dx / rxy, dy / rxy)
+                        } else {
+                            (1.0_f64, 0.0_f64)
+                        };
 
-                // Search outward from the CURRENT orientation in order of
-                // increasing angular deviation, accepting the first candidate
-                // that clears. This nudges a good surface-normal orientation
-                // minimally instead of snapping it back to vertical, which is
-                // what sweeping up from 0° used to do.
-                let mut best_orient = seg.orientation;
-                let mut found_clear = false;
-                for trial in collision_escape_candidates(
-                    seg.orientation,
-                    (ex, ey),
-                    tilt_step_deg,
-                    max_tilt_deg,
-                    steps,
-                ) {
-                    if !detector.check_collision_with_mesh_oriented(&seg.position, &trial) {
-                        best_orient = trial;
-                        found_clear = true;
-                        break;
-                    }
-                }
-
-                // Only override the orientation if a clear angle was actually found.
-                // If every tilt angle still collides (e.g. we're inside the mesh at the
-                // bottom of the print), keep the original orientation — do NOT force max tilt.
-                if found_clear {
-                    seg.orientation = best_orient;
-                    n_fixed += 1;
-                }
-            }
-        }
+                        // Search outward from the CURRENT orientation in order of
+                        // increasing angular deviation, accepting the first candidate
+                        // that clears. This nudges a good surface-normal orientation
+                        // minimally instead of snapping it back to vertical, which is
+                        // what sweeping up from 0° used to do.
+                        for trial in collision_escape_candidates(
+                            seg.orientation,
+                            (ex, ey),
+                            tilt_step_deg,
+                            max_tilt_deg,
+                            steps,
+                        ) {
+                            if !detector
+                                .check_collision_with_mesh_oriented(&seg.position, &trial)
+                            {
+                                // Only override when a clear angle was actually
+                                // found. If every tilt still collides (e.g. we are
+                                // inside the mesh at the bottom of the print), keep
+                                // the original -- do NOT force max tilt.
+                                seg.orientation = trial;
+                                return 1usize;
+                            }
+                        }
+                        0usize
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
 
         if n_fixed > 0 {
             self.log(format!(
