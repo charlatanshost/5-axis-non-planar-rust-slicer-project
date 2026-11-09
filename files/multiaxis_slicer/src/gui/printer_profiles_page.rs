@@ -561,6 +561,20 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
                 ).changed() { changed = true; }
             });
             ui.horizontal(|ui| {
+                ui.label("Max tool tilt:")
+                    .on_hover_text("How far the tool axis may lean from vertical (degrees). \
+                        This is NOT the rotary axes' travel range -- it is the head's physical \
+                        envelope: gantry clearance, hot-end geometry, filament path. Both limits \
+                        apply and the tighter one wins. Set too high and the slicer will happily \
+                        emit orientations that point the nozzle at the bed.");
+                if ui.add(
+                    egui::DragValue::new(&mut profile.max_tool_tilt_deg)
+                        .range(1.0..=90.0)
+                        .speed(0.5)
+                        .suffix("°"),
+                ).changed() { changed = true; }
+            });
+            ui.horizontal(|ui| {
                 ui.label("Linear travel (0 = fixed):");
                 if ui.add(egui::DragValue::new(&mut profile.head_travel[0]).suffix(" mm").speed(1.0).prefix("X ")).changed() { changed = true; }
                 if ui.add(egui::DragValue::new(&mut profile.head_travel[1]).suffix(" mm").speed(1.0).prefix("Y ")).changed() { changed = true; }

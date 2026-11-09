@@ -261,6 +261,20 @@ pub struct PrinterProfile {
     /// from.
     #[serde(default = "profile_default_nozzle_clearance")]
     pub nozzle_clearance: f64,
+    /// How far the tool axis may lean away from vertical, in degrees.
+    ///
+    /// This is **not** the same quantity as a rotary axis's travel range, and
+    /// conflating the two is what let the orientation passes emit upside-down
+    /// tool vectors: the default profile allows A and B to travel +/-180
+    /// degrees, so deriving the tilt budget from axis travel permitted tilts up
+    /// to 177 degrees, i.e. the nozzle pointing into the bed.
+    ///
+    /// What actually bounds it is the head's physical envelope -- gantry
+    /// clearance, hot-end geometry, filament path -- so it is a separate
+    /// property of the machine. Both limits apply; the effective budget is
+    /// whichever is tighter.
+    #[serde(default = "profile_default_max_tool_tilt")]
+    pub max_tool_tilt_deg: f64,
     /// Bed surface shape for machine simulation
     #[serde(default)]
     pub bed_shape: BedShape,
@@ -281,6 +295,7 @@ fn profile_default_head_dims() -> [f64; 3] { [60.0, 60.0, 80.0] }
 fn profile_default_nozzle_radius() -> f64 { 5.0 }
 fn profile_default_nozzle_length() -> f64 { 20.0 }
 fn profile_default_nozzle_clearance() -> f64 { 2.0 }
+fn profile_default_max_tool_tilt() -> f64 { 45.0 }
 
 /// Bed surface shape used in machine simulation
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -318,6 +333,7 @@ impl Default for PrinterProfile {
             nozzle_radius: 5.0,
             nozzle_length: 20.0,
             nozzle_clearance: 2.0,
+            max_tool_tilt_deg: 45.0,
             bed_travel:  [0.0, 0.0, 200.0], // bed moves up to 200 mm in Z by default
             head_travel: [300.0, 300.0, 0.0], // head moves 300 mm in X/Y by default
         }
@@ -864,6 +880,60 @@ impl SlicerApp {
     /// maximum tilt angle of the head rotary axes defined in the active printer profile.
     ///
     /// Skipped for `Conical` mode (which has its own analytical normal formula).
+    /// How far the tool axis may lean from vertical, in degrees.
+    ///
+    /// Two separate limits apply and the tighter one wins:
+    ///
+    /// * the rotary axes' travel range, since the machine cannot command an
+    ///   angle it cannot reach, and
+    /// * the head's physical tilt envelope, `PrinterProfile::max_tool_tilt_deg`.
+    ///
+    /// Every orientation pass must use this rather than deriving a budget from
+    /// axis travel alone. Doing the latter is what produced G-code with tilts
+    /// up to 177.98 degrees -- the nozzle pointing into the bed -- because the
+    /// default profile lets A and B travel +/-180 degrees.
+    ///
+    /// `head_axes_only` restricts the axis-travel part to axes that move the
+    /// head, for passes that only reorient the tool rather than the part.
+    pub fn tool_tilt_budget_deg(&self, head_axes_only: bool) -> f64 {
+        let profile = self.profiles.get(self.active_profile_index);
+
+        // Tightest relevant rotary axis. IK assigns the same angle magnitude to
+        // each axis, so the most restricted one is the bottleneck.
+        let axis_budget = profile
+            .map(|p| {
+                p.rotary_axes
+                    .iter()
+                    .filter(|ax| {
+                        ax.axis_type == AxisType::Rotary
+                            && (!head_axes_only || ax.moving_part == MovingPart::Head)
+                    })
+                    .map(|ax| ax.max.abs().max(ax.min.abs()))
+                    .fold(f64::MAX, f64::min)
+            })
+            .unwrap_or(f64::MAX);
+        let axis_budget = if axis_budget == f64::MAX || axis_budget < 1.0 {
+            // No usable axis definition: fall back to the head envelope alone.
+            f64::MAX
+        } else {
+            axis_budget
+        };
+
+        let head_budget = profile
+            .map(|p| p.max_tool_tilt_deg)
+            .filter(|t| t.is_finite() && *t > 0.0)
+            .unwrap_or_else(profile_default_max_tool_tilt);
+
+        let budget = axis_budget.min(head_budget);
+        // Never return something unusable; a zero budget would pin every
+        // segment vertical and silently disable non-planar printing.
+        if budget.is_finite() && budget >= 1.0 {
+            budget.min(90.0)
+        } else {
+            profile_default_max_tool_tilt()
+        }
+    }
+
     pub fn apply_surface_normal_orientations(&mut self) {
         if matches!(self.slicing_mode, SlicingMode::Conical) { return; }
         if !self.use_surface_normals { return; }
@@ -930,17 +1000,8 @@ impl SlicerApp {
             best_n
         };
 
-        // ── Max tilt from active profile head axes ────────────────────────
-        let max_tilt_deg = self.profiles.get(self.active_profile_index)
-            .map(|p| {
-                p.rotary_axes.iter()
-                    .filter(|ax| ax.moving_part == MovingPart::Head && ax.axis_type == AxisType::Rotary)
-                    .map(|ax| ax.max.abs().max(ax.min.abs()))
-                    .fold(0.0f64, f64::max)
-            })
-            .unwrap_or(0.0);
-        // Fall back to 45° if no head axes defined
-        let max_tilt_deg = if max_tilt_deg < 1.0 { 45.0 } else { max_tilt_deg };
+        // Axis travel AND the head's physical tilt envelope, whichever binds.
+        let max_tilt_deg = self.tool_tilt_budget_deg(true);
         let max_tilt_rad = max_tilt_deg.to_radians();
 
         // ── Assign orientations ───────────────────────────────────────────
@@ -1146,14 +1207,9 @@ impl SlicerApp {
         let cell_size = (head_half_diag / 3.0).max(8.0).min(25.0);
         let mut hmap = HeightMap::new(x0, y0, x1, y1, cell_size);
 
-        // Maximum tilt allowed by the active profile's head rotary axes
+        // Axis travel AND the head's physical tilt envelope, whichever binds.
         let max_tilt_rad = {
-            let deg = profile.rotary_axes.iter()
-                .filter(|ax| ax.moving_part == MovingPart::Head
-                          && ax.axis_type  == AxisType::Rotary)
-                .map(|ax| ax.max.abs().max(ax.min.abs()))
-                .fold(0.0f64, f64::max);
-            if deg < 1.0 { 45.0f64.to_radians() } else { deg.to_radians() }
+            self.tool_tilt_budget_deg(true).to_radians()
         };
 
         // Pre-compute 16 azimuth offsets (0°, 22.5°, 45°, …)
@@ -1543,19 +1599,9 @@ impl SlicerApp {
             return;
         }
 
-        // Max tilt the machine can actually execute: limited by the tightest rotary axis
-        // (IK assigns the same angle magnitude to both head and bed axes, so each must
-        // be within its own limit; the bottleneck is whichever axis is most restricted).
-        let max_tilt_rad = {
-            let profile_max = self.profiles.get(self.active_profile_index).map(|p| {
-                p.rotary_axes.iter()
-                    .filter(|ax| ax.axis_type == AxisType::Rotary)
-                    .map(|ax| ax.max.abs().max(ax.min.abs()))
-                    .fold(f64::MAX, f64::min) // tightest axis
-            }).unwrap_or(f64::MAX);
-            if profile_max == f64::MAX || profile_max < 1.0 { 90_f64.to_radians() }
-            else { profile_max.to_radians() }
-        };
+        // Max tilt the machine can actually execute: the tightest rotary axis AND
+        // the head's physical tilt envelope, whichever binds.
+        let max_tilt_rad = self.tool_tilt_budget_deg(false).to_radians();
 
         // Clamp the cone half-angle to the machine limit.
         let alpha_rad = self.conical_angle_degrees.to_radians().min(max_tilt_rad);
@@ -1827,15 +1873,15 @@ impl SlicerApp {
         // Build the BVH once; the loops below query it thousands of times.
         detector.set_collision_mesh(&mesh);
 
-        // Maximum tilt each individual axis can handle (IK assigns the same magnitude to
-        // head and bed, so the bottleneck is the most restricted rotary axis overall).
-        let max_tilt_deg = {
-            let tightest = profile.rotary_axes.iter()
-                .filter(|ax| ax.axis_type == AxisType::Rotary)
-                .map(|ax| ax.max.abs().max(ax.min.abs()))
-                .fold(f64::MAX, f64::min);
-            if tightest == f64::MAX || tightest < 1.0 { 45.0 } else { tightest }
-        };
+        // How far the tool may lean: the tightest rotary axis AND the head's
+        // physical tilt envelope, whichever binds.
+        //
+        // This used to use the axis travel range alone. The default profile
+        // lets A and B travel +/-180 degrees, so the escape search below was
+        // free to rotate the tool all the way over -- measured G-code contained
+        // tilts up to 177.98 degrees, i.e. the nozzle pointing into the bed,
+        // on every single segment.
+        let max_tilt_deg = self.tool_tilt_budget_deg(false);
 
         // Radial center for escape direction: use conical center or mesh centroid.
         let (cone_cx, cone_cy) = if matches!(self.slicing_mode, SlicingMode::Conical) {
@@ -3771,7 +3817,111 @@ pub(crate) fn collision_escape_candidates(
 #[cfg(test)]
 mod tests {
     use super::collision_escape_candidates;
+    use super::{AxisType, MovingPart, PrinterProfile, SlicerApp};
     use crate::geometry::Vector3D;
+
+    /// Build an app with one profile whose rotary axes travel +/-`axis_deg` and
+    /// whose head envelope allows `head_deg` of tilt.
+    fn app_with_limits(axis_deg: f64, head_deg: f64) -> SlicerApp {
+        let mut profile = PrinterProfile::default();
+        for ax in &mut profile.rotary_axes {
+            ax.min = -axis_deg;
+            ax.max = axis_deg;
+        }
+        profile.max_tool_tilt_deg = head_deg;
+
+        let mut app = SlicerApp::default();
+        app.profiles = vec![profile];
+        app.active_profile_index = 0;
+        app
+    }
+
+    /// Regression test for D-12.
+    ///
+    /// Every orientation pass used to derive its tilt budget from the rotary
+    /// axes' travel range alone. The default profile lets A and B travel
+    /// +/-180 degrees, so the collision escape search was free to rotate the
+    /// tool all the way over: measured G-code for a sphere contained tilts up
+    /// to 177.98 degrees -- the nozzle pointing into the bed -- on every one of
+    /// 146216 segments, with A and B spanning the full +/-180.
+    ///
+    /// How far an axis can travel and how far the nozzle may lean are different
+    /// quantities. Both must bind.
+    #[test]
+    fn test_tilt_budget_is_limited_by_the_head_not_just_the_axes() {
+        // The shipped default: axes can go all the way round, the head cannot.
+        let app = app_with_limits(180.0, 45.0);
+        assert_eq!(app.tool_tilt_budget_deg(false), 45.0);
+        assert_eq!(app.tool_tilt_budget_deg(true), 45.0);
+    }
+
+    #[test]
+    fn test_tilt_budget_takes_whichever_limit_is_tighter() {
+        // Axis-limited: a 20 degree axis beats a 45 degree head envelope.
+        let app = app_with_limits(20.0, 45.0);
+        assert_eq!(app.tool_tilt_budget_deg(false), 20.0);
+
+        // Head-limited: a 30 degree head envelope beats 90 degree axes.
+        let app = app_with_limits(90.0, 30.0);
+        assert_eq!(app.tool_tilt_budget_deg(false), 30.0);
+    }
+
+    #[test]
+    fn test_tilt_budget_never_exceeds_ninety_degrees() {
+        // Past 90 degrees the tool is pointing below horizontal, which is never
+        // a legitimate printing orientation however the profile is configured.
+        let app = app_with_limits(180.0, 180.0);
+        assert!(
+            app.tool_tilt_budget_deg(false) <= 90.0,
+            "budget was {}",
+            app.tool_tilt_budget_deg(false)
+        );
+    }
+
+    #[test]
+    fn test_tilt_budget_survives_a_degenerate_profile() {
+        // No rotary axes at all: fall back to the head envelope.
+        let mut app = app_with_limits(180.0, 45.0);
+        app.profiles[0].rotary_axes.clear();
+        assert_eq!(app.tool_tilt_budget_deg(false), 45.0);
+
+        // A nonsensical head limit must not pin every segment vertical, which
+        // would silently disable non-planar printing altogether.
+        let app = app_with_limits(180.0, 0.0);
+        assert!(app.tool_tilt_budget_deg(false) >= 1.0);
+
+        // No profile at all.
+        let mut app = SlicerApp::default();
+        app.profiles.clear();
+        assert!(app.tool_tilt_budget_deg(false) >= 1.0);
+    }
+
+    #[test]
+    fn test_tilt_budget_head_axes_only_ignores_bed_axes() {
+        let mut profile = PrinterProfile::default();
+        // Head axis is the restrictive one; the bed axis is wide open.
+        for ax in &mut profile.rotary_axes {
+            let (min, max) = if ax.moving_part == MovingPart::Head {
+                (-15.0, 15.0)
+            } else {
+                (-180.0, 180.0)
+            };
+            ax.min = min;
+            ax.max = max;
+            assert_eq!(ax.axis_type, AxisType::Rotary);
+        }
+        profile.max_tool_tilt_deg = 60.0;
+
+        let mut app = SlicerApp::default();
+        app.profiles = vec![profile];
+        app.active_profile_index = 0;
+
+        // Head-only passes see the 15 degree head axis.
+        assert_eq!(app.tool_tilt_budget_deg(true), 15.0);
+        // Passes that may also turn the part still see the head axis as the
+        // tightest of all rotary axes.
+        assert_eq!(app.tool_tilt_budget_deg(false), 15.0);
+    }
 
     fn angle_deg(a: &Vector3D, b: &Vector3D) -> f64 {
         (a.dot(b) / (a.norm() * b.norm()))
