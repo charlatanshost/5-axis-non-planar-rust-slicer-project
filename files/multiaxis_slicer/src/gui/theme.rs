@@ -54,21 +54,56 @@ impl Default for SlicerColors {
     }
 }
 
+// ── Semantic status colours ───────────────────────────────────────────────
+//
+// Panels used to inline `Color32::from_rgb(...)` at each call site, so the same
+// idea — "this is a warning" — was spelled several slightly different ways and
+// `SlicerColors` below went unused. Reference these instead, so a palette
+// change lands everywhere at once.
+
+/// Something is fine, verified, or complete.
+pub const OK: Color32 = Color32::from_rgb(90, 190, 110);
+/// Works, but with a caveat the user should know about.
+pub const CAUTION: Color32 = Color32::from_rgb(200, 160, 60);
+/// Broken, or will not produce a usable result.
+pub const BAD: Color32 = Color32::from_rgb(220, 90, 90);
+/// Interactive accent, matching the selection fill.
+pub const ACCENT: Color32 = Color32::from_rgb(0, 120, 215);
+
 /// Apply dark theme optimized for 3D viewport
 pub fn apply_theme(ctx: &egui::Context) {
     let mut style = Style::default();
     let mut visuals = Visuals::dark();
 
+    let colors = SlicerColors::default();
+
     // Darker background for better 3D contrast
     visuals.window_fill = Color32::from_rgb(30, 30, 30);
-    visuals.panel_fill = Color32::from_rgb(40, 40, 40);
+    visuals.panel_fill = colors.panel_bg;
 
-    // Accent color
-    visuals.selection.bg_fill = Color32::from_rgb(0, 120, 215);
-    visuals.widgets.active.bg_fill = Color32::from_rgb(0, 120, 215);
+    // Accent colour, taken from the palette rather than repeated literals.
+    visuals.selection.bg_fill = colors.accent;
+    visuals.widgets.active.bg_fill = colors.accent;
     visuals.widgets.hovered.bg_fill = Color32::from_rgb(0, 100, 180);
 
-    // Slightly larger text for readability
+    // Softer, consistent corners. `Style::default()` leaves these sharp, and
+    // the panels never set them, so every widget had square corners regardless
+    // of the rest of the styling.
+    let rounding = egui::Rounding::same(4.0);
+    visuals.widgets.noninteractive.rounding = rounding;
+    visuals.widgets.inactive.rounding = rounding;
+    visuals.widgets.hovered.rounding = rounding;
+    visuals.widgets.active.rounding = rounding;
+    visuals.widgets.open.rounding = rounding;
+    visuals.window_rounding = egui::Rounding::same(6.0);
+
+    // Breathing room. The control panel stacks a lot of rows, and the egui
+    // defaults pack them tightly enough to read as one undifferentiated block.
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    style.spacing.indent = 16.0;
+    style.spacing.slider_width = 140.0;
+
     style.visuals = visuals;
 
     ctx.set_style(style);

@@ -17,7 +17,7 @@ pub fn render(app: &mut SlicerApp, ui: &mut egui::Ui) {
             .map(|p| p.name.clone())
             .unwrap_or_else(|| "—".to_string());
 
-        egui::ComboBox::from_id_source("edit_profile_selector")
+        egui::ComboBox::from_id_salt("edit_profile_selector")
             .selected_text(&editing_name)
             .show_ui(ui, |ui| {
                 for i in 0..app.profiles.len() {
@@ -193,7 +193,7 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
         ui.horizontal(|ui| {
             ui.label("Kinematics:");
             let current_label = profile.kinematics_type.label();
-            egui::ComboBox::from_id_source("kinematics_type")
+            egui::ComboBox::from_id_salt("kinematics_type")
                 .selected_text(current_label)
                 .show_ui(ui, |ui| {
                     for kt in KinematicsType::all() {
@@ -261,7 +261,7 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
 
                     // Type
                     let type_label = ax.axis_type.label();
-                    egui::ComboBox::from_id_source(format!("axis_type_{}", i))
+                    egui::ComboBox::from_id_salt(format!("axis_type_{}", i))
                         .selected_text(type_label)
                         .width(65.0)
                         .show_ui(ui, |ui| {
@@ -275,7 +275,7 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
 
                     // Moving part
                     let part_label = ax.moving_part.label();
-                    egui::ComboBox::from_id_source(format!("axis_part_{}", i))
+                    egui::ComboBox::from_id_salt(format!("axis_part_{}", i))
                         .selected_text(part_label)
                         .width(60.0)
                         .show_ui(ui, |ui| {
@@ -289,7 +289,7 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
 
                     // Rotation axis (only for rotary joints)
                     if ax.axis_type == AxisType::Rotary {
-                        egui::ComboBox::from_id_source(format!("axis_rot_{}", i))
+                        egui::ComboBox::from_id_salt(format!("axis_rot_{}", i))
                             .selected_text(format!("↺{}", ax.rotation_axis.label()))
                             .width(52.0)
                             .show_ui(ui, |ui| {
@@ -373,7 +373,7 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
         ui.collapsing("5-Axis G-code Output", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Rotary axis labels:");
-                egui::ComboBox::from_id_source("rotary_axis_mode_profile")
+                egui::ComboBox::from_id_salt("rotary_axis_mode_profile")
                     .selected_text(match profile.rotary_axis_mode {
                         crate::gcode::RotaryAxisMode::AB => "A/B (pitch + roll)",
                         crate::gcode::RotaryAxisMode::BC => "B/C (tilt + rotate)",
@@ -473,7 +473,7 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
                     BedShape::Rectangle => "Rectangle",
                     BedShape::Circle    => "Circle",
                 };
-                egui::ComboBox::from_id_source("bed_shape_selector")
+                egui::ComboBox::from_id_salt("bed_shape_selector")
                     .selected_text(shape_label)
                     .show_ui(ui, |ui| {
                         if ui.selectable_label(profile.bed_shape == BedShape::Rectangle, "Rectangle").clicked() {
@@ -618,24 +618,24 @@ fn render_profile_editor(ui: &mut egui::Ui, profile: &mut PrinterProfile) -> boo
 
                 if gen.kinematics.axes.len() < 2 {
                     ui.colored_label(
-                        egui::Color32::from_rgb(200, 160, 60),
+                        crate::gui::theme::CAUTION,
                         "needs 2 rotary axes",
                     );
                 } else {
                     let worst = gen.verify_round_trip(profile.max_tool_tilt_deg);
                     if worst < 0.01 {
                         ui.colored_label(
-                            egui::Color32::from_rgb(90, 190, 110),
+                            crate::gui::theme::OK,
                             format!("✓ exact (worst {:.4}°)", worst),
                         );
                     } else if worst < 1.0 {
                         ui.colored_label(
-                            egui::Color32::from_rgb(200, 160, 60),
+                            crate::gui::theme::CAUTION,
                             format!("⚠ {:.3}° error", worst),
                         );
                     } else {
                         ui.colored_label(
-                            egui::Color32::from_rgb(220, 90, 90),
+                            crate::gui::theme::BAD,
                             format!("✗ {:.1}° error — tool will not point where intended", worst),
                         );
                     }

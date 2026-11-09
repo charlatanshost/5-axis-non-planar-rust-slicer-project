@@ -81,7 +81,7 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                         .get(app.active_profile_index)
                         .map(|p| p.name.clone())
                         .unwrap_or_default();
-                    egui::ComboBox::from_id_source("active_profile_selector")
+                    egui::ComboBox::from_id_salt("active_profile_selector")
                         .selected_text(&active_name)
                         .show_ui(ui, |ui| {
                             for i in 0..app.profiles.len() {
@@ -164,31 +164,87 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                     ui.label("Slicing mode:");
                     egui::ComboBox::from_id_salt("slicing_mode")
                         .selected_text(match app.slicing_mode {
-                            crate::gui::app::SlicingMode::Planar => "Planar (Traditional)",
-                            crate::gui::app::SlicingMode::S4 => "S4 Non-Planar",
+                            crate::gui::app::SlicingMode::Planar => "Planar",
+                            crate::gui::app::SlicingMode::S4 => "S4 Non-Planar (Dijkstra)",
                             crate::gui::app::SlicingMode::Conical => "Conical (RotBot)",
-                            crate::gui::app::SlicingMode::Curved => "S3 Curved Layer",
-                            crate::gui::app::SlicingMode::Geodesic => "Geodesic (Heat Method)",
+                            crate::gui::app::SlicingMode::Curved => "Curved layers (S3 / volumetric)",
+                            crate::gui::app::SlicingMode::Geodesic => "⚠ Geodesic (Heat Method)",
                             crate::gui::app::SlicingMode::CoordTransformCylindrical => "Cylindrical",
                             crate::gui::app::SlicingMode::CoordTransformSpherical => "Spherical",
                         })
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::Planar, "Planar (Traditional)")
-                                .on_hover_text("Standard planar slicing — flat layers at constant Z height");
+                            // Ordered and labelled by what each mode actually
+                            // achieves, measured on reference models — see
+                            // docs/SLICING_MODE_STATUS.md. The list used to be
+                            // flat and uniform, which gave no way to tell that
+                            // one entry is broken and another is the only route
+                            // to genuine simultaneous non-planar slicing.
+                            ui.label(egui::RichText::new("Recommended").small().weak());
+                            ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::Planar, "Planar")
+                                .on_hover_text("Standard planar slicing — flat layers at constant Z height.\n\nThe dependable baseline: no known correctness problems.");
+                            ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::Curved, "Curved layers (S3 / volumetric)")
+                                .on_hover_text("S3-Slicer: per-tet quaternion field → volumetric ASAP deformation → \
+                                    marching tetrahedra.\n\nThe only mode that produces per-feature tool orientation AND \
+                                    fillable solid cross-sections, so the only route to true simultaneous non-planar \
+                                    printing.\n\nPick 'Tet Volumetric' as the deformation method below — the other \
+                                    methods are weaker fallbacks.");
+
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("Special-purpose").small().weak());
                             ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::Conical, "Conical (RotBot)")
-                                .on_hover_text("Conical slicing: Shift Z by r*tan(angle) → Planar slice → Reverse shift.\nSimple & fast, great for radially symmetric overhangs.");
-                            ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::S4, "S4 Non-Planar")
-                                .on_hover_text("S4-style: Deform mesh → Planar slice → Un-deform toolpaths.\nSimpler approach, uses Dijkstra distance field for rotation direction.");
-                            ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::Curved, "S3 Curved Layer")
-                                .on_hover_text("S3-Slicer: Quaternion field optimization → Deformation → Curved layers.\nMore complex, multiple deformation methods available.");
-                            ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::Geodesic, "Geodesic (Heat Method)")
-                                .on_hover_text("Geodesic slicing: layers follow surface curvature via Heat Method distance field.\nLayers are equidistant along the mesh surface, not through air.");
+                                .on_hover_text("Shift Z by r·tan(angle) → planar slice → reverse shift.\n\nOne global cone about a \
+                                    single axis, at one constant angle. Good for radially symmetric parts — a spire, a funnel, \
+                                    a bowl.\n\nIt cannot help overhangs that face different directions: opposite sides of a part \
+                                    get opposite radial slopes, so one is helped and the other made worse.");
+                            ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::S4, "S4 Non-Planar (Dijkstra)")
+                                .on_hover_text("Deform mesh → planar slice → un-deform toolpaths, with rotation direction \
+                                    from a Dijkstra distance field.\n\nConstrained to one rotation axis for the whole model \
+                                    (two with multi-axis enabled), so it suits overhangs facing a single direction. For \
+                                    multi-directional overhangs use Curved layers instead.");
                             ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::CoordTransformCylindrical, "Cylindrical")
-                                .on_hover_text("Cylindrical slicing: maps mesh to (theta, z, r) space.\nPlanar slices become concentric radial shells around the Z axis.");
+                                .on_hover_text("Maps the mesh to (θ, z, r); planar slices become concentric radial shells \
+                                    around the Z axis.\n\nKnown limitation: a branch-cut artifact at θ = ±π.");
                             ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::CoordTransformSpherical, "Spherical")
-                                .on_hover_text("Spherical slicing: maps mesh to (theta, phi, r) space.\nPlanar slices become concentric spherical shells around a center point.");
+                                .on_hover_text("Maps the mesh to (θ, φ, r); planar slices become concentric spherical shells \
+                                    around a centre point.\n\nKnown limitation: a branch-cut artifact at θ = ±π.");
+
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("Not working").small().weak());
+                            ui.selectable_value(&mut app.slicing_mode, crate::gui::app::SlicingMode::Geodesic,
+                                egui::RichText::new("⚠ Geodesic (Heat Method)").color(crate::gui::theme::CAUTION))
+                                .on_hover_text("BROKEN — the Poisson solve does not converge, so the distance field is not \
+                                    a distance function and the layers derived from it are meaningless. The log will say so.\n\n\
+                                    Separately, geodesic level sets are curves on the surface, so even once fixed this mode \
+                                    can only produce shells, never fillable solid cross-sections. It is a surface-finishing \
+                                    technique, not a route to non-planar printing of solids.");
                         });
                 });
+
+                // Surface the measured state of the selected mode, so a choice
+                // that cannot work says so before it is run rather than after.
+                match app.slicing_mode {
+                    crate::gui::app::SlicingMode::Geodesic => {
+                        ui.colored_label(
+                            crate::gui::theme::BAD,
+                            "⚠ Geodesic is broken: the Poisson solve does not converge.",
+                        );
+                    }
+                    crate::gui::app::SlicingMode::Conical => {
+                        ui.label(
+                            egui::RichText::new("One global cone — suits radially symmetric parts only.")
+                                .small()
+                                .weak(),
+                        );
+                    }
+                    crate::gui::app::SlicingMode::S4 => {
+                        ui.label(
+                            egui::RichText::new("Single rotation axis for the whole model.")
+                                .small()
+                                .weak(),
+                        );
+                    }
+                    _ => {}
+                }
 
                 ui.add_space(5.0);
 
@@ -499,7 +555,7 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                         // Diffusion mode selector
                         ui.horizontal(|ui| {
                             ui.label("Diffusion:");
-                            egui::ComboBox::from_id_source("geodesic_diffusion_mode")
+                            egui::ComboBox::from_id_salt("geodesic_diffusion_mode")
                                 .selected_text(match app.geodesic_diffusion_mode {
                                     1 => "Adaptive Scalar",
                                     2 => "Anisotropic",
@@ -679,8 +735,8 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                         // Deformation method combo box (S4Deform removed - use S4 mode instead)
                         egui::ComboBox::from_label("")
                             .selected_text(match app.s3_deformation_method {
-                                crate::s3_slicer::DeformationMethod::TetVolumetric => "Tet Volumetric (Best)",
-                                crate::s3_slicer::DeformationMethod::VirtualScalarField => "Virtual",
+                                crate::s3_slicer::DeformationMethod::TetVolumetric => "Tet Volumetric (recommended)",
+                                crate::s3_slicer::DeformationMethod::VirtualScalarField => "Virtual (near-planar fallback)",
                                 crate::s3_slicer::DeformationMethod::AsapDeformation => "ASAP Deformation",
                                 crate::s3_slicer::DeformationMethod::ScaleControlled => "Scale-Controlled",
                                 crate::s3_slicer::DeformationMethod::S4Deform => "S4 (use S4 mode)",
@@ -689,14 +745,21 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                                 ui.selectable_value(
                                     &mut app.s3_deformation_method,
                                     crate::s3_slicer::DeformationMethod::TetVolumetric,
-                                    "Tet Volumetric (Best)"
-                                ).on_hover_text("Full volumetric pipeline from the original S3-Slicer paper.\nUses tetrahedral mesh, per-tet ASAP deformation with scaling,\nand marching tetrahedra for layer extraction.");
+                                    "Tet Volumetric (recommended)"
+                                ).on_hover_text("Full volumetric pipeline from the S3-Slicer paper: tetrahedral mesh, \
+                                    per-tet quaternion field, volumetric ASAP deformation with scaling, and marching \
+                                    tetrahedra for layer extraction.\n\nThe only option here that gives per-feature tool \
+                                    orientation and fillable solid cross-sections. The others below are fallbacks that \
+                                    produce near-flat layers.");
 
                                 ui.selectable_value(
                                     &mut app.s3_deformation_method,
                                     crate::s3_slicer::DeformationMethod::VirtualScalarField,
-                                    "Virtual"
-                                ).on_hover_text("Computes scalar field directly without mesh deformation.\nAvoids mesh collapse issues. Good for complex models.");
+                                    "Virtual (near-planar fallback)"
+                                ).on_hover_text("Computes a scalar field directly, with no mesh deformation, so it cannot \
+                                    collapse.\n\nThis is also what Tet Volumetric falls back to automatically if its \
+                                    deformation fails a quality check — which shows up as essentially flat layers. Watch \
+                                    the log for 'Falling back to VirtualScalarField'.");
 
                                 ui.selectable_value(
                                     &mut app.s3_deformation_method,
@@ -900,7 +963,7 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                     ui.label("Tolerance:");
                     ui.add(egui::DragValue::new(&mut app.config.tolerance)
                         .speed(1e-7)
-                        .clamp_range(1e-10..=1e-3));
+                        .range(1e-10..=1e-3));
                 });
             });
 
