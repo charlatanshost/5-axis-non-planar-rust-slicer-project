@@ -1178,7 +1178,24 @@ pub fn render(app: &mut SlicerApp, ctx: &egui::Context) {
                     ui.add_space(5.0);
                 }
 
-                if ui.add_enabled(can_slice, egui::Button::new("🔪 Slice!").min_size(egui::vec2(ui.available_width(), 40.0))).clicked() {
+                // The primary action. Filled with the accent colour so it
+                // reads as the thing to press, rather than as one more
+                // same-coloured button in a column of them.
+                let slice_btn = egui::Button::new(
+                    egui::RichText::new("Slice")
+                        .size(15.0)
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                )
+                .min_size(egui::vec2(ui.available_width(), 38.0))
+                .fill(if can_slice {
+                    crate::gui::theme::ACCENT
+                } else {
+                    crate::gui::theme::surface_2()
+                })
+                .rounding(egui::Rounding::same(6.0));
+
+                if ui.add_enabled(can_slice, slice_btn).clicked() {
                     app.start_slicing();
                 }
 

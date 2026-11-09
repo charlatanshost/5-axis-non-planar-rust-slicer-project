@@ -62,47 +62,132 @@ impl Default for SlicerColors {
 // change lands everywhere at once.
 
 /// Something is fine, verified, or complete.
-pub const OK: Color32 = Color32::from_rgb(90, 190, 110);
+pub const OK: Color32 = Color32::from_rgb(86, 196, 134);
 /// Works, but with a caveat the user should know about.
-pub const CAUTION: Color32 = Color32::from_rgb(200, 160, 60);
+pub const CAUTION: Color32 = Color32::from_rgb(226, 170, 76);
 /// Broken, or will not produce a usable result.
-pub const BAD: Color32 = Color32::from_rgb(220, 90, 90);
+pub const BAD: Color32 = Color32::from_rgb(232, 104, 104);
 /// Interactive accent, matching the selection fill.
-pub const ACCENT: Color32 = Color32::from_rgb(0, 120, 215);
+pub const ACCENT: Color32 = Color32::from_rgb(62, 142, 232);
 
-/// Apply dark theme optimized for 3D viewport
+// ── Surfaces ──────────────────────────────────────────────────────────────
+//
+// A three-level surface ramp, slightly blue-tinted rather than neutral grey.
+// Pure greys read as flat and dated on a dark UI, and with window, panel and
+// widget fills all within a few points of each other there was nothing to
+// separate a control from the panel behind it.
+
+/// Deepest surface: behind everything, and the 3D viewport's surround.
+const SURFACE_0: Color32 = Color32::from_rgb(22, 24, 29);
+/// Panels sit above the window background.
+const SURFACE_1: Color32 = Color32::from_rgb(30, 33, 40);
+/// Resting state of an interactive widget.
+const SURFACE_2: Color32 = Color32::from_rgb(42, 46, 56);
+/// Hovered widget.
+const SURFACE_3: Color32 = Color32::from_rgb(54, 59, 71);
+/// Hairline separators and widget outlines.
+const HAIRLINE: Color32 = Color32::from_rgb(58, 63, 75);
+
+/// Primary body text.
+const TEXT: Color32 = Color32::from_rgb(226, 230, 238);
+/// Secondary text: hints, units, inactive labels.
+const TEXT_DIM: Color32 = Color32::from_rgb(150, 158, 172);
+
+/// Resting fill of an interactive widget, for callers that need to match it.
+pub fn surface_2() -> Color32 {
+    SURFACE_2
+}
+
+/// Apply the dark theme.
 pub fn apply_theme(ctx: &egui::Context) {
     let mut style = Style::default();
     let mut visuals = Visuals::dark();
 
-    let colors = SlicerColors::default();
+    // ── Surfaces ──────────────────────────────────────────────────────
+    visuals.window_fill = SURFACE_0;
+    visuals.panel_fill = SURFACE_1;
+    visuals.extreme_bg_color = SURFACE_0; // text edit / plot backgrounds
+    visuals.faint_bg_color = Color32::from_rgb(36, 40, 48); // striped rows
 
-    // Darker background for better 3D contrast
-    visuals.window_fill = Color32::from_rgb(30, 30, 30);
-    visuals.panel_fill = colors.panel_bg;
+    // ── Widget states ─────────────────────────────────────────────────
+    // Each state gets a distinct fill and a matching outline, so a control is
+    // visibly a control rather than a word floating on the panel.
+    visuals.widgets.noninteractive.bg_fill = SURFACE_1;
+    visuals.widgets.noninteractive.weak_bg_fill = SURFACE_1;
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, HAIRLINE);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT);
 
-    // Accent colour, taken from the palette rather than repeated literals.
-    visuals.selection.bg_fill = colors.accent;
-    visuals.widgets.active.bg_fill = colors.accent;
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0, 100, 180);
+    // `inactive` is also what egui fills a slider handle with. Left at the
+    // same tone as the panel the handle reads as a hollow outline and the
+    // control looks disabled, so this sits deliberately brighter than the
+    // trough behind it.
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(96, 104, 122);
+    visuals.widgets.inactive.weak_bg_fill = SURFACE_2;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, HAIRLINE);
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT);
 
-    // Softer, consistent corners. `Style::default()` leaves these sharp, and
-    // the panels never set them, so every widget had square corners regardless
-    // of the rest of the styling.
-    let rounding = egui::Rounding::same(4.0);
+    visuals.widgets.hovered.bg_fill = SURFACE_3;
+    visuals.widgets.hovered.weak_bg_fill = SURFACE_3;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ACCENT);
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, Color32::WHITE);
+
+    visuals.widgets.active.bg_fill = ACCENT;
+    visuals.widgets.active.weak_bg_fill = ACCENT;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, Color32::WHITE);
+
+    visuals.widgets.open.bg_fill = SURFACE_2;
+    visuals.widgets.open.weak_bg_fill = SURFACE_2;
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, HAIRLINE);
+
+    visuals.selection.bg_fill = ACCENT.linear_multiply(0.55);
+    visuals.selection.stroke = egui::Stroke::new(1.0, Color32::WHITE);
+    visuals.hyperlink_color = ACCENT;
+    visuals.override_text_color = None;
+
+    // Separators should be hairlines, not slabs.
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, HAIRLINE);
+
+    // ── Shape ─────────────────────────────────────────────────────────
+    let rounding = egui::Rounding::same(5.0);
     visuals.widgets.noninteractive.rounding = rounding;
     visuals.widgets.inactive.rounding = rounding;
     visuals.widgets.hovered.rounding = rounding;
     visuals.widgets.active.rounding = rounding;
     visuals.widgets.open.rounding = rounding;
-    visuals.window_rounding = egui::Rounding::same(6.0);
+    visuals.window_rounding = egui::Rounding::same(8.0);
+    visuals.menu_rounding = egui::Rounding::same(6.0);
 
-    // Breathing room. The control panel stacks a lot of rows, and the egui
-    // defaults pack them tightly enough to read as one undifferentiated block.
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.button_padding = egui::vec2(8.0, 4.0);
-    style.spacing.indent = 16.0;
+    // Drop the heavy default drop shadows; a hairline does the separating.
+    visuals.window_shadow = egui::epaint::Shadow {
+        offset: egui::vec2(0.0, 2.0),
+        blur: 12.0,
+        spread: 0.0,
+        color: Color32::from_black_alpha(90),
+    };
+    visuals.popup_shadow = visuals.window_shadow;
+
+    // ── Typography ────────────────────────────────────────────────────
+    // egui's defaults are uniformly small, so a heading read at the same
+    // weight as a slider label and the panel had no hierarchy.
+    use egui::{FontFamily::{Monospace, Proportional}, FontId, TextStyle};
+    style.text_styles = [
+        (TextStyle::Heading, FontId::new(18.0, Proportional)),
+        (TextStyle::Body, FontId::new(13.5, Proportional)),
+        (TextStyle::Button, FontId::new(13.5, Proportional)),
+        (TextStyle::Small, FontId::new(11.5, Proportional)),
+        (TextStyle::Monospace, FontId::new(12.5, Monospace)),
+    ]
+    .into();
+
+    // ── Spacing ───────────────────────────────────────────────────────
+    style.spacing.item_spacing = egui::vec2(8.0, 7.0);
+    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.spacing.menu_margin = egui::Margin::same(6.0);
+    style.spacing.indent = 18.0;
     style.spacing.slider_width = 140.0;
+    style.spacing.interact_size.y = 24.0; // taller, easier-to-hit controls
+    style.spacing.scroll.bar_width = 9.0;
 
     style.visuals = visuals;
 
