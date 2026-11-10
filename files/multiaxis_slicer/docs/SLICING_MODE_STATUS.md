@@ -1,10 +1,11 @@
 # Slicing mode status
 
-What each slicing mode actually does as of commit `51c0195` (November 2026), what
+What each slicing mode actually does as of commit `419842d` (November 2026), what
 was repaired to get there, and what is still broken. Every number below was
 measured, not estimated; the method is at the end so results can be reproduced.
 
-Two reference models are used throughout:
+Reference models used throughout (a third, `StanfordBunny_fixed.stl`, 80 281
+triangles and 83 mm tall, joined them for the later end-to-end measurements):
 
 - **sphere** — a UV sphere, radius 15 mm, 24 × 32 tessellation, 1472 triangles,
   generated analytically and verified watertight (2208 edges, 0 boundary,
@@ -20,7 +21,7 @@ Two reference models are used throughout:
 | Mode | State | Use it? |
 |---|---|---|
 | **Planar** | No known correctness defect | Yes — the dependable baseline |
-| **TetVolumetric** | Runs end to end; deformation is modest | Yes, for non-planar work |
+| **TetVolumetric** | Runs end to end to sane G-code; walls correct, infill still planar | Yes, for non-planar work |
 | S4 Deform | Runs, but structurally limited to 1–2 rotation axes | Only for single-direction overhangs |
 | Conical | Correct, but a single global cone | Only for radially symmetric parts |
 | Geodesic | **Broken** — Poisson solve does not converge | No |
@@ -31,10 +32,10 @@ Two reference models are used throughout:
 ## TetVolumetric
 
 The volumetric S3 pipeline: tetrahedralize → per-tet quaternion field →
-volumetric ASAP deformation → volume scalar field → marching tetrahedra. This
-is the only mode in the tree that can produce **fillable solid cross-sections
-with per-feature orientation**, which is what simultaneous non-planar printing
-needs.
+volumetric ASAP deformation → volume scalar field → level sets of that field on
+the model surface. This is the only mode in the tree that can produce
+**fillable solid cross-sections with per-feature orientation**, which is what
+simultaneous non-planar printing needs.
 
 It did not work at all before this batch. Three independent defects each
 prevented it from completing:
@@ -83,42 +84,80 @@ Mean rotation angle by adjacency depth, on the sphere (13 hops deep):
 | before | 2.14° | 0.44 | 0.10 | 0.02 | 0.00 | — | — | — | 5/13 |
 | after | 1.48° | 1.36 | 1.16 | 0.94 | 0.76 | 0.69 | 0.51 | 0.38 | **13/13** |
 
+### From "runs" to printable output
+
+The pipeline completing was not the same as its output being usable. Driving the
+real GUI code path headlessly from slice to G-code exposed a second set of
+defects, each fixed in turn:
+
+- **Tool tilt was bounded by axis travel, not by the head** (`ebb11fb`). The
+  default profile lets A and B travel ±180°, and four passes derived their tilt
+  budget from that, so G-code contained tilts up to 177.98° — nozzle pointing
+  into the bed. `PrinterProfile::max_tool_tilt_deg` (default 45) now bounds it.
+- **The collision pass was serial** (`95317d6`) and never finished on a Benchy.
+  Parallelised; the BVH is read-only.
+- **The deformation was unfinished, not limited** (`080d1c6`). Of four damping
+  parameters only `asap_max_iterations` binds; at 3 the ASAP alternation had not
+  converged. Raised to 20, the knee before folding sets in (0.9 % inverted tets
+  on the sphere at 22 iterations, 3.6 % at 60).
+- **Collision tested against unprinted geometry** (`02a3975`). It now queries a
+  ladder of colliders banded by height, so only material at or below the
+  nozzle counts.
+- **Orientation came from the nearest model triangle** (`9d442cf`) rather than
+  from the layer being printed. At the base of a wall that is the wall, so a
+  flat first layer was tilted to the limit: a Benchy's first extrusion came out
+  at 44.9°. Layer normals are now the scalar-field gradient, computed per tet
+  and carried on `Contour::normals`. First extrusion: 0.9°.
+- **Layers were cut from the wrong surface** (`419842d`). Marching tetrahedra
+  emitted every edge of every isosurface polygon, interior ones included, so a
+  layer was the wireframe of the isosurface and interior mesh edges were printed
+  as walls. Its outline was the tet mesh boundary — the grid's 0.75 mm staircase
+  — and overshot the model because the tet mesh does. `surface_layers.rs` now
+  samples the field at the model's surface vertices and takes level sets on the
+  model's own triangles.
+
 ### Current behaviour
 
-| | sphere | 3dbenchy |
+End to end, slice through G-code, layer height 0.5 mm, default profile:
+
+| | 3dbenchy | Stanford bunny |
 |---|---|---|
-| tetrahedralizer | TetGen direct, 8701 tets | grid, 271 492 tets |
-| tets carrying rotation | 2017 (23.2 %) | 73 784 (27.2 %) |
-| max rotation | 14.9° (hits the 15° cap) | 14.2° |
-| peak ASAP displacement | 0.237 mm | 0.187 mm |
-| inverted tets | 0 | 0 |
-| extent ratio | 1.00× | 1.00× |
-| layers | 57 | 239 |
-| per-layer Z spread (median) | 1.558 mm | 0.888 mm |
-| wall-clock | 0.7 s | 27 s |
+| tetrahedralizer | grid, 271 492 tets | grid |
+| layers | 94 | 163 |
+| layer contours | 308, all closed | 198, all closed |
+| layer Z range | 0.477–48.000 (model 0–48) | 1.239–83.549 (model 0.88–83.75) |
+| toolpath moves | 31 546 | 150 855 |
+| max tool tilt | 43.57° | 45.00° (at the budget) |
+| A / B range | −40.4…43.0° / −25.2…35.9° | −42.4…42.3° / −33.6…40.7° |
+| non-finite, negative-E or below-model moves | 0 | 0 |
+| slice / toolpath time | 25 s / 2.1 s | 58 s / 3.2 s |
+
+Toolpath Z reads about 2 mm above each model. That is travel z-hop; extruding
+moves alone top out at 47.987 and 83.548.
+
+How non-planar the layers are was last measured before the switch to surface
+extraction: on the Benchy, median per-layer Z spread 1.234 mm with 0 inverted
+tets at 20 ASAP iterations. It has not been re-measured on the new contours.
 
 ### Known limitations
 
-- **Deformation is modest.** 0.187 mm of peak displacement on a 48 mm model is
-  real (7× what it was) but small. Four dampers remain in series:
-  `max_rotation_degrees` defaults to 15, `quaternion_weight` to 0.3,
-  `asap_max_iterations` to 3, and the diffusion itself decays with depth.
-  Iteration count now genuinely matters — 50 iterations rotate 46.6 % of tets,
-  400 rotate 95.7 % — so these are worth tuning before assuming an algorithmic
-  limit.
-- **Layers extend outside the model.** On the Benchy they span Z −0.28 to 48.38
-  on a 0..48 model, i.e. 0.28 mm below the build plate. This is a consequence of
-  a deliberate design choice: `from_surface_mesh_grid` keeps any cube with at
-  least one inside vertex so the tet mesh *encloses* every surface vertex, which
-  `deform_surface_through_tets` requires for its barycentric lookup. The
-  enclosure is load-bearing — **do not shrink the grid.** The clipping belongs
-  in layer extraction.
-- **Grid boundary is a staircase** at the cell size (0.75 mm on a Benchy),
-  because the grid tetrahedralizer is axis-aligned. `extract_tet_layers` takes
-  contours off the tet mesh surface, so this shows up in the layers. TetGen's
-  output is boundary-conforming and much better, which is why the direct attempt
-  is still tried first — but TetGen rejects anything over 80 000 vertices /
-  160 000 facets, and a Benchy is 112 569, so real models land on the grid.
+- **Infill is planar.** Walls now follow the curved layer exactly, but infill is
+  generated as straight scan lines across each layer and projected onto it.
+- **The tet mesh encloses the model on purpose.** `from_surface_mesh_grid` keeps
+  any cube with at least one inside vertex, so every surface vertex has a
+  containing tet. Both `deform_surface_through_tets` and `surface_layers.rs`
+  depend on that. **Do not shrink the grid.**
+- **The grid's resolution still bounds the field**, though no longer the
+  outline: the scalar field is linear per tet, so features of the deformation
+  finer than a 0.75 mm cell are not represented. TetGen gives a better mesh and
+  is still tried first, but rejects anything over 80 000 vertices / 160 000
+  facets, so real models land on the grid.
+- **The quality gate is too permissive.** A deformation is rejected only at
+  30 % inverted tets or 5× extent; 3.6 % already means visible folding.
+- **Kinematics are partly configurable.** Axis order, rotation axis and sign
+  convention are (`4ffb29c`), with a round-trip check on the profile page. Joint
+  offsets beyond a single scalar TCP offset, and bed-side rotary axes, are not;
+  see `KINEMATICS_DESIGN_NOTE.md`.
 
 ---
 
@@ -216,15 +255,13 @@ field is unused.
 
 Ordered roughly by value.
 
-1. **Tune the TetVolumetric dampers.** `max_rotation_degrees`,
-   `quaternion_weight`, `asap_max_iterations`. Iteration count now has real
-   effect; the others are untested above their defaults.
-2. **Clip extracted layers to the model.** Contours currently fall below the
-   build plate. Must be done in layer extraction, *not* by shrinking the grid.
-3. **Geodesic Poisson convergence.** Next suspect is the Jacobi preconditioner
-   versus the null-space projection.
-4. **Grid boundary fidelity.** Either snap boundary tets to the surface, or
-   raise the grid resolution and accept the tet-count cost.
+1. **Curved-layer infill.** The largest remaining gap in the printed output.
+2. **Tighten the deformation quality gate** from 30 % inverted tets to something
+   that reflects when folding becomes visible.
+3. **Kinematics: joint offsets and the part branch**, per the design note. Needed
+   before G-code is trusted on a real tilting head with two pivots.
+4. **Geodesic Poisson convergence.** Next suspect is the Jacobi preconditioner
+   versus the null-space projection. Low value: the mode only makes shells.
 5. **`hash_point` in three more modules.** `deformation_v2.rs`,
    `quaternion_field.rs` and `scalar_field.rs` use a different variant,
    `(x<<42) ^ (y<<21) ^ z`. Also a hash used as an identity key and so unsound by
@@ -270,10 +307,14 @@ Run with `cargo run --release --example probe`. The release profile matters:
 
 Useful things to measure:
 
+- **Is the G-code sane, not just the slice?** `SlicerApp::default()` needs no
+  egui context, so a probe can set `app.mesh` and `app.layers` and call
+  `generate_toolpaths()` and `generate_gcode_from_toolpaths()` — the real code
+  path. Check tilt against the budget, A/B ranges, non-finite values, and the Z
+  of *extruding* moves separately from travels. This is what found the 177°
+  tilts; nothing upstream of G-code showed them.
 - **Is a layer genuinely non-planar?** Per-layer internal Z spread, i.e.
-  `max(p.z) − min(p.z)` over each layer's contour points. Compare it against the
-  grid cell size — if the median sits *at* the cell size, you are measuring the
-  staircase, not deformation.
+  `max(p.z) − min(p.z)` over each layer's contour points.
 - **Did the pipeline silently fall back?** Watch for `Falling back to
   VirtualScalarField` in the log. Flat layers and "mode produced output" look
   identical in the GUI otherwise.
