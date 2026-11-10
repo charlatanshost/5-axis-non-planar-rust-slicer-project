@@ -63,7 +63,7 @@ pub fn extract_tet_layers(
 /// printing this layer. It is the quantity the GUI has been approximating by
 /// looking for the nearest *model* triangle, which is a different surface and
 /// disagrees wherever the layer cuts across the model rather than along it.
-fn tet_gradient(tet_mesh: &TetMesh, v: &[usize; 4], s: &[f64; 4]) -> Option<Vector3D> {
+pub(crate) fn tet_gradient(tet_mesh: &TetMesh, v: &[usize; 4], s: &[f64; 4]) -> Option<Vector3D> {
     use nalgebra::Matrix3;
 
     let p0 = tet_mesh.vertices[v[0]];

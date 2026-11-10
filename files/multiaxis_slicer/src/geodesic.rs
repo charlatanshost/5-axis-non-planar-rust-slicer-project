@@ -1049,7 +1049,7 @@ fn find_source_vertices(topo: &MeshTopology, source: &GeodesicSource) -> Vec<usi
 /// differing in the last bits -- and the 1e-4 quantization in
 /// [`chain_segments_into_contours`] could hash the two copies to different
 /// keys, breaking the chain mid-loop.
-fn extract_level_set(
+pub(crate) fn extract_level_set(
     topo: &MeshTopology,
     distances: &[f64],
     level: f64,

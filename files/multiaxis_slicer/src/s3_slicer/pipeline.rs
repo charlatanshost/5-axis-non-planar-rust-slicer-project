@@ -615,11 +615,23 @@ fn execute_tet_pipeline(
         log::info!("    ... and {} more layers", curved_layers.len() - 5);
     }
 
-    // Step 6: Convert to standard layers
-    log::info!("Step 6/6: Converting to standard layers...");
-    let layers: Vec<Layer> = curved_layers.iter()
-        .map(|cl| cl.to_layer())
-        .collect();
+    // Step 6: Layers for printing, cut on the MODEL surface.
+    //
+    // The marching-tet layers above are kept for the result struct, but they
+    // are not what gets printed: they are the wireframe of each isosurface,
+    // bounded by the tet mesh rather than the model. See surface_layers.rs.
+    log::info!("Step 6/6: Extracting boundary-conforming layers on the model surface...");
+    let mut layers: Vec<Layer> = crate::s3_slicer::surface_layers::extract_surface_layers(
+        &original_mesh,
+        &tet_mesh,
+        &tet_scalar_field,
+        config.layer_height,
+    );
+    if layers.is_empty() {
+        // Never hand back nothing if the older path has something.
+        log::warn!("  Surface extraction produced no layers; using marching-tet contours");
+        layers = curved_layers.iter().map(|cl| cl.to_layer()).collect();
+    }
 
     let total_contours: usize = layers.iter().map(|l| l.contours.len()).sum();
     let total_points: usize = layers.iter()

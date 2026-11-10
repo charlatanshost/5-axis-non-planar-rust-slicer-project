@@ -28,6 +28,7 @@ pub mod voxel_remesh;
 pub mod tet_dijkstra_field;
 pub mod s4_rotation_field;
 pub mod tet_point_location;
+pub mod surface_layers;
 
 pub use scalar_field::{ScalarField, ScalarFieldConfig, FieldType};
 pub use deformation::{DeformationConfig, DeformedMesh, DeformationTransform, deform_mesh};
