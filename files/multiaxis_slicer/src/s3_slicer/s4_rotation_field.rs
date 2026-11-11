@@ -118,12 +118,28 @@ impl S4RotationField {
         let base_tets: std::collections::HashSet<usize> =
             dijkstra_field.base_tets.iter().cloned().collect();
 
+        // The overhang tets are boundary conditions too. Diffusion with only
+        // the base pinned has one steady state, identity everywhere, and the
+        // iteration heads for it: the Phase 1 rotations were averaged away
+        // with their neighbours until nothing was left. A Benchy asked for
+        // 15 degrees came out with 1.00 at most and 0.8 % of tets rotated at
+        // all, so the mode sliced planar. Holding the seeds makes this an
+        // interpolation between "rotate this much here" and "not at all on
+        // the bed", which is what the comment above describes.
+        let seeds: Vec<Option<UnitQuaternion<f64>>> = rotations
+            .iter()
+            .enumerate()
+            .map(|(ti, q)| (q.angle() > 1e-6 && !base_tets.contains(&ti)).then_some(*q))
+            .collect();
+
         for iter in 0..config.smoothing_iterations {
             let new_rotations: Vec<UnitQuaternion<f64>> = (0..num_tets)
                 .into_par_iter()
                 .map(|ti| {
                     if base_tets.contains(&ti) {
                         UnitQuaternion::identity() // pin build-plate tets to zero
+                    } else if let Some(seed) = seeds[ti] {
+                        seed // pin overhang tets to what they asked for
                     } else {
                         smooth_single_tet(ti, &rotations, tet_mesh, config.smoothness_weight)
                     }
@@ -558,5 +574,58 @@ mod tests {
             "Smoothed energy ({}) should be <= unsmoothed energy ({})",
             field_smoothed.energy, field_unsmoothed.energy
         );
+    }
+
+    /// A closed axis-aligned box as triangles.
+    fn box_tris(lo: [f64; 3], hi: [f64; 3]) -> Vec<crate::geometry::Triangle> {
+        use crate::geometry::Triangle;
+        let p = |x: usize, y: usize, z: usize| Point3D::new(
+            if x == 0 { lo[0] } else { hi[0] },
+            if y == 0 { lo[1] } else { hi[1] },
+            if z == 0 { lo[2] } else { hi[2] },
+        );
+        let v = [p(0,0,0), p(1,0,0), p(1,1,0), p(0,1,0), p(0,0,1), p(1,0,1), p(1,1,1), p(0,1,1)];
+        let mut t = Vec::new();
+        for &(a, b, c, d) in &[(0,3,2,1), (4,5,6,7), (0,1,5,4), (1,2,6,5), (2,3,7,6), (3,0,4,7)] {
+            t.push(Triangle::new(v[a], v[b], v[c]));
+            t.push(Triangle::new(v[a], v[c], v[d]));
+        }
+        t
+    }
+
+    /// Regression test for D-24. Overhang tets are where the rotation is
+    /// asked for, and the diffusion that spreads it inward must hold them
+    /// there. It used to pin only the bed, so the requested rotation was
+    /// averaged away: a Benchy asked for 15 degrees ended with 1.00 at most
+    /// and the mode sliced planar.
+    ///
+    /// A mushroom -- a wide cap on a narrow stem -- has an unmistakable
+    /// overhang under the cap and a bed to diffuse towards.
+    #[test]
+    fn test_overhang_rotations_survive_diffusion() {
+        let mut tris = box_tris([8.0, 8.0, 0.0], [12.0, 12.0, 10.0]);
+        tris.extend(box_tris([0.0, 0.0, 10.0], [20.0, 20.0, 14.0]));
+        let surface = crate::mesh::Mesh::new(tris).unwrap();
+        let mesh = TetMesh::from_surface_mesh_grid(&surface, 14).expect("grid tet mesh");
+        let dijkstra = TetDijkstraField::compute(&mesh, 0.8);
+
+        let config = S4RotationConfig { smoothing_iterations: 50, ..S4RotationConfig::default() };
+        let seeded = S4RotationField::compute(
+            &mesh, &dijkstra, &S4RotationConfig { smoothing_iterations: 0, ..config.clone() });
+        let seeds = seeded.rotations.iter().filter(|q| q.angle() > 1e-6).count();
+        assert!(seeds > 10, "the underside of the cap should seed rotations, got {}", seeds);
+
+        let field = S4RotationField::compute(&mesh, &dijkstra, &config);
+        let max_deg = field.rotations.iter().map(|q| q.angle()).fold(0.0f64, f64::max).to_degrees();
+        assert!(
+            max_deg > config.max_rotation_degrees - 0.1,
+            "requested {} degrees under the overhang, {:.2} left after diffusion",
+            config.max_rotation_degrees, max_deg
+        );
+
+        // And it must still have spread: more tets rotated than were seeded.
+        let rotated = field.rotations.iter().filter(|q| q.angle() > 0.01).count();
+        assert!(rotated > seeds, "diffusion did not spread the rotation ({} of {} seeds)", rotated, seeds);
+        eprintln!("seeds {}, rotated after diffusion {}, max {:.2} deg", seeds, rotated, max_deg);
     }
 }
