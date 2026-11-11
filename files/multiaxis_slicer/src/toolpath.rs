@@ -292,7 +292,69 @@ impl ToolpathGenerator {
 
         let wall_count = self.pattern_config.wall_count;
 
-        for contour in &layer.contours {
+        // ── Outlines versus holes ──────────────────────────────────────────
+        // A layer's contours are not all the same kind of thing. One nested
+        // inside another is a hole in it, and has to be treated as one: its
+        // walls belong on the solid side, and nothing is filled across it.
+        //
+        // Every contour used to be handled as a solid island. A hole got wall
+        // loops offset INTO the hole and then infill laid across it, so a
+        // Benchy -- cabin, windows, chimney bore -- had 16% of its extruded
+        // points in places the model has no material.
+        //
+        // offset_contour already knows the difference, by winding: it expects
+        // outlines counter-clockwise and holes clockwise. Nothing upstream
+        // guarantees that, since contours come out of segment chaining in
+        // whichever direction the chain happened to run. So work out the
+        // nesting here and put each contour in the winding it should have.
+        let prepared: Vec<(crate::geometry::Contour, bool)> = {
+            let closed: Vec<&crate::geometry::Contour> = layer
+                .contours
+                .iter()
+                .filter(|c| c.closed && c.points.len() >= 3)
+                .collect();
+            layer
+                .contours
+                .iter()
+                .map(|c| {
+                    if !c.closed || c.points.len() < 3 {
+                        return (c.clone(), false);
+                    }
+                    // Depth = how many other outlines enclose this one.
+                    let depth = closed
+                        .iter()
+                        .filter(|o| !std::ptr::eq(**o, c) && is_point_in_contour(&c.points[0], o))
+                        .count();
+                    let is_hole = depth % 2 == 1;
+                    let ccw = crate::contour_offset::signed_area_2d(&c.points) > 0.0;
+                    let mut c = c.clone();
+                    if ccw == is_hole {
+                        // Wrong way round for its role: reverse, normals too.
+                        c.points.reverse();
+                        if let Some(n) = c.normals.as_mut() {
+                            n.reverse();
+                        }
+                    }
+                    (c, is_hole)
+                })
+                .collect()
+        };
+
+        // Where infill must not go: each hole, grown by its own walls.
+        let keep_out: Vec<crate::geometry::Contour> = prepared
+            .iter()
+            .filter(|(_, is_hole)| *is_hole)
+            .map(|(hole, _)| {
+                generate_wall_loops(hole, wall_count, self.pattern_config.line_width)
+                    .into_iter()
+                    .filter(|wl| wl.points.iter().all(|pt| !is_point_in_contour(pt, hole)))
+                    .last()
+                    .unwrap_or_else(|| hole.clone())
+            })
+            .collect();
+
+        for (contour, is_hole) in &prepared {
+            let is_hole = *is_hole;
             if contour.points.len() < 3 {
                 continue;
             }
@@ -321,8 +383,10 @@ impl ToolpathGenerator {
             // This is especially common with adaptive layers which creates more irregular
             // cross-sections. Remove any wall loop where a point falls outside the original
             // contour boundary; fall back to tracing the original if all loops are invalid.
+            // For a hole the test is the other way round: its walls sit on
+            // the solid side, which is OUTSIDE the hole's own outline.
             wall_loops.retain(|wl| {
-                wl.points.iter().all(|pt| is_point_in_contour(pt, contour))
+                wl.points.iter().all(|pt| is_point_in_contour(pt, contour) != is_hole)
             });
             if wall_loops.is_empty() {
                 self.extrude_contour(contour, apply_nonplanar_offset, orientation, paths, layer.layer_height);
@@ -422,8 +486,9 @@ impl ToolpathGenerator {
                 self.extrude_contour(wall_contour, apply_nonplanar_offset, orientation, paths, layer.layer_height);
             }
 
-            // Generate infill inside the innermost wall
-            if self.pattern_config.infill_density > 0.01 && !self.pattern_config.skip_infill {
+            // Generate infill inside the innermost wall. Never for a hole:
+            // "inside" a hole is empty space.
+            if !is_hole && self.pattern_config.infill_density > 0.01 && !self.pattern_config.skip_infill {
                 let innermost = wall_loops.last().unwrap();
 
                 // Collect all wall loop points for IDW Z fallback on curved layers.
@@ -443,6 +508,17 @@ impl ToolpathGenerator {
                     raycaster_opt, // Accurate mesh Z + coverage gap fill
                     z_override,    // Analytic conical formula (overrides IDW)
                 );
+
+                // Infill is generated across the whole outline; cut it where
+                // it would cross a hole.
+                let infill_lines: Vec<Vec<Point3D>> = if keep_out.is_empty() {
+                    infill_lines
+                } else {
+                    infill_lines
+                        .iter()
+                        .flat_map(|line| cut_line_around(line, &keep_out))
+                        .collect()
+                };
 
                 for line in &infill_lines {
                     if line.len() < 2 {
@@ -627,10 +703,160 @@ impl ToolpathGenerator {
     }
 }
 
+/// Split a polyline wherever it passes through any of `keep_out`, returning
+/// the pieces that lie outside all of them.
+///
+/// Infill is generated across a whole outline and sampled along each line, so
+/// a crossing falls between two samples. The exact crossing is found by
+/// bisection between them, so a piece ends at the keep-out boundary rather
+/// than up to a sample spacing short of it.
+fn cut_line_around(
+    line: &[Point3D],
+    keep_out: &[crate::geometry::Contour],
+) -> Vec<Vec<Point3D>> {
+    let blocked = |p: &Point3D| keep_out.iter().any(|k| is_point_in_contour(p, k));
+
+    // Boundary point between one free and one blocked sample.
+    let crossing = |free: Point3D, hit: Point3D| -> Point3D {
+        let (mut a, mut b) = (free, hit);
+        for _ in 0..24 {
+            let m = Point3D::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.z + b.z) * 0.5);
+            if blocked(&m) { b = m; } else { a = m; }
+        }
+        a
+    };
+
+    let mut pieces: Vec<Vec<Point3D>> = Vec::new();
+    let mut run: Vec<Point3D> = Vec::new();
+    let mut prev: Option<(Point3D, bool)> = None;
+
+    for &p in line {
+        let is_blocked = blocked(&p);
+        if let Some((q, q_blocked)) = prev {
+            match (q_blocked, is_blocked) {
+                (false, true) => {
+                    // Leaving free space: end the run at the boundary.
+                    run.push(crossing(q, p));
+                    if run.len() >= 2 {
+                        pieces.push(std::mem::take(&mut run));
+                    } else {
+                        run.clear();
+                    }
+                }
+                (true, false) => {
+                    // Re-entering free space: start a run at the boundary.
+                    run.push(crossing(p, q));
+                }
+                _ => {}
+            }
+        }
+        if !is_blocked {
+            run.push(p);
+        }
+        prev = Some((p, is_blocked));
+    }
+    if run.len() >= 2 {
+        pieces.push(run);
+    }
+    pieces
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::geometry::Contour;
+
+    fn square(lo: f64, hi: f64, z: f64, ccw: bool) -> Contour {
+        let mut pts = vec![
+            Point3D::new(lo, lo, z),
+            Point3D::new(hi, lo, z),
+            Point3D::new(hi, hi, z),
+            Point3D::new(lo, hi, z),
+        ];
+        if !ccw {
+            pts.reverse();
+        }
+        Contour::new(pts, true)
+    }
+
+    /// Regression test for D-20. A contour nested inside another is a hole,
+    /// and used to be treated as a solid island: wall loops offset into it and
+    /// infill laid across it. On a Benchy that put 16% of extruded points
+    /// where the model has no material.
+    ///
+    /// Run for every combination of winding, because the windings that reach
+    /// the generator are arbitrary and the offsetter keys off them.
+    #[test]
+    fn test_nothing_is_extruded_inside_a_hole() {
+        for &(outer_ccw, hole_ccw) in &[(true, false), (true, true), (false, false), (false, true)] {
+            // 40 mm plate with a 10 mm square hole through the middle.
+            let layer = Layer::new(
+                0.2,
+                vec![square(0.0, 40.0, 0.2, outer_ccw), square(15.0, 25.0, 0.2, hole_ccw)],
+                0.2,
+            );
+            let generator = ToolpathGenerator::new(0.4, 0.2);
+            let toolpaths = generator.generate(&[layer], None);
+            let paths = &toolpaths[0].paths;
+
+            let in_hole = |p: &Point3D| p.x > 15.0 + 1e-6 && p.x < 25.0 - 1e-6
+                && p.y > 15.0 + 1e-6 && p.y < 25.0 - 1e-6;
+
+            let mut extruded = 0usize;
+            let mut around_hole = 0usize;
+            for i in 1..paths.len() {
+                if paths[i].extrusion <= 0.0 {
+                    continue;
+                }
+                extruded += 1;
+                let (a, b) = (paths[i - 1].position, paths[i].position);
+                // Check along the move, not just its end: a line that enters
+                // and leaves between two samples would otherwise slip through.
+                for k in 0..=8 {
+                    let t = k as f64 / 8.0;
+                    let p = Point3D::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y), a.z);
+                    assert!(
+                        !in_hole(&p),
+                        "windings (outer ccw={}, hole ccw={}): extruding through the hole at ({:.3}, {:.3})",
+                        outer_ccw, hole_ccw, p.x, p.y
+                    );
+                }
+                // The hole's own walls: a ring within 1 mm outside it.
+                let ring = (b.x - 20.0).abs().max((b.y - 20.0).abs());
+                if ring > 5.0 && ring < 6.0 {
+                    around_hole += 1;
+                }
+            }
+
+            assert!(extruded > 50, "expected walls and infill, got {} moves", extruded);
+            assert!(
+                around_hole >= 8,
+                "windings (outer ccw={}, hole ccw={}): the hole has no walls around it ({} moves)",
+                outer_ccw, hole_ccw, around_hole
+            );
+        }
+    }
+
+    #[test]
+    fn test_cut_line_around_splits_at_the_boundary() {
+        let hole = square(4.0, 6.0, 0.0, true);
+        let line: Vec<Point3D> = (0..=10).map(|i| Point3D::new(i as f64, 5.0, 0.0)).collect();
+
+        let pieces = cut_line_around(&line, &[hole]);
+        assert_eq!(pieces.len(), 2, "a line through a hole is two pieces");
+
+        // Each piece ends on the hole's edge, not a whole sample short of it.
+        let left_end = pieces[0].last().unwrap().x;
+        let right_start = pieces[1].first().unwrap().x;
+        assert!((left_end - 4.0).abs() < 1e-4, "left piece ends at {}", left_end);
+        assert!((right_start - 6.0).abs() < 1e-4, "right piece starts at {}", right_start);
+
+        // A line that misses is returned whole.
+        let clear: Vec<Point3D> = (0..=10).map(|i| Point3D::new(i as f64, 1.0, 0.0)).collect();
+        let pieces = cut_line_around(&clear, &[square(4.0, 6.0, 0.0, true)]);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].len(), clear.len());
+    }
 
     #[test]
     fn test_toolpath_generation() {
