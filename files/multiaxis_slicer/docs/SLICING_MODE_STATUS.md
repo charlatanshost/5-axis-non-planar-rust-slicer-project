@@ -1,6 +1,6 @@
 # Slicing mode status
 
-What each slicing mode actually does as of commit `2b0e972` (November 2026), what
+What each slicing mode actually does as of commit `91a3cb0` (November 2026), what
 was repaired to get there, and what is still broken. Every number below was
 measured, not estimated; the method is at the end so results can be reproduced.
 
@@ -258,18 +258,67 @@ roughly radially symmetric parts: a central spire, a funnel, a bowl.
 
 ---
 
-## S4 Deform — limited to one or two rotation axes
+## S4 Deform — works, limited to one or two rotation axes
 
-Three defaults each independently collapse it toward a global bend:
+Until `462cc4f`…`91a3cb0` this mode did not produce usable output on a real
+model in any orientation. Four separate defects, in the order they were found:
+
+- **The torn-triangle filter deleted the model** (`462cc4f`). It dropped any
+  deformed triangle with an edge over `max(median × multiplier, 5 mm)`. On the
+  Benchy that is 4 355 honest hull and deck triangles; 1 208 of the 1 281
+  contours sliced from the remainder were open. It now requires the edge to
+  have been stretched more than 3× as well.
+- **Layers were mapped back point by point** (`9727e10`): deform the surface,
+  slice it with planes, send each contour point back through a point-location
+  query. Points that missed the deformed tet mesh landed elsewhere, the jumps
+  were cut out, and contours came back open (305 of 530 after the fix above).
+  The layers also had no record of their shape, so the toolpath generator
+  applied its centroidal tilt to any that looked flat: 271 moves below the bed,
+  to Z −9.9. Layers are now cut on the original surface as level sets of
+  deformed Z, with `extract_surface_layers`, exactly as TetVolumetric does.
+- **The rotation field diffused to nothing** (`4ced5cd`). Overhang seeds were
+  not held during diffusion, only the bed was, so 15° requested became 1.00°
+  delivered with 0.8 % of tets rotated. The mode was slicing planar.
+- **The default deformation folds the mesh** (`91a3cb0`) once the field is
+  real. `deform_tet_mesh_direct` rotates every vertex about one anchor on the
+  bed, so a change in rotation between neighbours becomes shear. The default is
+  now ASAP.
+
+S4 end to end with GUI defaults, layer height 0.5 mm:
+
+| | 3dbenchy | Stanford bunny |
+|---|---|---|
+| layer contours | 329, all closed | 205, all closed |
+| inverted tets | 0.0 % | 0.0 % |
+| layer-normal tilt, p99 / max | 4.0° / 10.2° | 4.0° / 8.2° |
+| per-layer Z spread, median / max | 0.37 / 0.97 mm | 0.19 / 0.58 mm |
+| max tool tilt | 8.2° | 8.2° |
+| moves below the bed | 0 | 0 |
+| extruded points > 0.05 mm off their layer | 0.3 % | 0.0 % |
+| slice time | 16 s | 32 s |
+
+For comparison, the direct deformation on the Benchy: 0.6 % inverted, layer
+normals to 121°, tool tilt pinned at the 45° budget.
+
+**Still wrong:** a model whose overhangs face opposite ways folds even under
+ASAP. The test sphere comes out with 0.6 % inverted tets and layer normals past
+90°, because single-axis mode puts one rotation axis on all of them. That is
+the ceiling described below, and the quality gate does not catch it.
+
+The stepwise GUI path (Deform → Slice → Un-deform) previews a planar slice of
+the deformed mesh; the final layers are now cut at levels the extractor
+chooses, so they do not correspond one-to-one with the previewed ones.
+
+Three settings each independently collapse it toward a global bend:
 
 - `s4_multi_axis: false` → `normalize_single_axis()` forces *every* rotation in
   the model onto one axis, that of the single most severe overhang tet. The code
   says so: *"This guarantees stable SLERP averaging at the cost of
   multi-directional accuracy."* Setting it true allows up to **two** axis
   clusters.
-- `s4_use_asap: false` → `deform_tet_mesh_direct` rotates every vertex about one
-  global anchor at the base-plane bbox centre. One axis plus one anchor is a
-  global bend.
+- `s4_use_asap: false` (no longer the default) → `deform_tet_mesh_direct`
+  rotates every vertex about one global anchor at the base-plane bbox centre.
+  One axis plus one anchor is a global bend.
 - `s4_max_rotation_degrees: 15.0` caps the result regardless.
 
 The single-axis constraint exists *because* of the direct deformation — averaging
