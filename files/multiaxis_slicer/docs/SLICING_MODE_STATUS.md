@@ -1,6 +1,6 @@
 # Slicing mode status
 
-What each slicing mode actually does as of commit `419842d` (November 2026), what
+What each slicing mode actually does as of commit `2b0e972` (November 2026), what
 was repaired to get there, and what is still broken. Every number below was
 measured, not estimated; the method is at the end so results can be reproduced.
 
@@ -115,6 +115,33 @@ defects, each fixed in turn:
   — and overshot the model because the tet mesh does. `surface_layers.rs` now
   samples the field at the model's surface vertices and takes level sets on the
   model's own triangles.
+- **Only the outline lay on the layer** (`607bd80`). Inner wall loops sat at the
+  layer's nominal Z and infill heights were interpolated inward from the
+  boundary. A layer now carries its surface (`LayerSurface::z_at`); for the tet
+  pipeline that solves `field(x, y, z) = level` along the vertical, and the
+  toolpath generator uses it for every wall loop and infill point.
+- **Holes were treated as solid islands** (`66898e2`): wall loops offset into
+  the hole and infill laid across it. Nesting depth now classifies contours,
+  windings are normalised to what the offsetter expects, and infill is cut at
+  each hole's outermost wall.
+- **Outlines were traced through a field sampled only at surface vertices**
+  (`2b0e972`), so on a model with large triangles the outline cut across a field
+  that curves between them. On the Benchy (hull triangles to 18 mm) 28.9 % of
+  outline points were more than 0.05 mm off their own layer, worst 0.88 mm. The
+  surface is now refined to about one tet per edge (1 mm) before tracing.
+
+Extruded points more than 0.05 mm from the layer they belong to, across those
+three commits:
+
+| | 3dbenchy | Stanford bunny |
+|---|---|---|
+| before `607bd80` | 45.6 % | 60.5 % |
+| with layer surfaces and holes | 5.8 % | 0.1 % |
+| with surface refinement | 0.3 % (82 of 23 978, max 0.78 mm) | 0.1 % (137 of 137 393, max 1.19 mm) |
+
+The remainder is not diagnosed. On the bunny it shows up as short runs of
+consecutive infill points 0.05-0.1 mm off, which suggests a level set with more
+than one height above a point, but that has not been checked.
 
 ### Current behaviour
 
@@ -124,16 +151,19 @@ End to end, slice through G-code, layer height 0.5 mm, default profile:
 |---|---|---|
 | tetrahedralizer | grid, 271 492 tets | grid |
 | layers | 94 | 163 |
-| layer contours | 308, all closed | 198, all closed |
-| layer Z range | 0.477–48.000 (model 0–48) | 1.239–83.549 (model 0.88–83.75) |
-| toolpath moves | 31 546 | 150 855 |
+| layer contours | 316, all closed | 198, all closed |
+| layer Z range | 0.477–48.000 (model 0–48) | 1.307–83.534 (model 0.88–83.75) |
+| extruding moves | 23 978 | 137 393 |
 | max tool tilt | 43.57° | 45.00° (at the budget) |
 | A / B range | −40.4…43.0° / −25.2…35.9° | −42.4…42.3° / −33.6…40.7° |
 | non-finite, negative-E or below-model moves | 0 | 0 |
-| slice / toolpath time | 25 s / 2.1 s | 58 s / 3.2 s |
+
+Tilt, A/B range and move sanity were last measured at `419842d`, before the
+three commits above; timings have not been re-measured since and will have
+grown, since every wall and infill point now solves for its height.
 
 Toolpath Z reads about 2 mm above each model. That is travel z-hop; extruding
-moves alone top out at 47.987 and 83.548.
+moves alone span 0.539–47.962 and 1.407–83.350.
 
 How non-planar the layers are was last measured before the switch to surface
 extraction: on the Benchy, median per-layer Z spread 1.234 mm with 0 inverted
@@ -141,8 +171,12 @@ tets at 20 ASAP iterations. It has not been re-measured on the new contours.
 
 ### Known limitations
 
-- **Infill is planar.** Walls now follow the curved layer exactly, but infill is
-  generated as straight scan lines across each layer and projected onto it.
+- **Infill lies on the curved layer but is laid out in XY.** Scan lines are
+  generated in the plane and lifted onto the layer surface, so line spacing is
+  correct seen from above and stretches on steep parts of a layer. Extrusion
+  amounts do not yet account for that.
+- **A layer is assumed to have one height above each (x, y).** Where a level set
+  folds over itself the solver returns the root nearest the boundary's height.
 - **The tet mesh encloses the model on purpose.** `from_surface_mesh_grid` keeps
   any cube with at least one inside vertex, so every surface vertex has a
   containing tet. Both `deform_surface_through_tets` and `surface_layers.rs`
@@ -255,7 +289,9 @@ field is unused.
 
 Ordered roughly by value.
 
-1. **Curved-layer infill.** The largest remaining gap in the printed output.
+1. **Re-measure the end-to-end output** (tilt, A/B range, timings, layer
+   non-planarity) after `607bd80`…`2b0e972`, and chase the last 0.1–0.3 % of
+   off-layer points.
 2. **Tighten the deformation quality gate** from 30 % inverted tets to something
    that reflects when folding becomes visible.
 3. **Kinematics: joint offsets and the part branch**, per the design note. Needed
