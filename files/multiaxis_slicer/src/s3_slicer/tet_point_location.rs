@@ -44,8 +44,16 @@ impl TetSpatialGrid {
         let extent = tet_mesh.bounds_max - tet_mesh.bounds_min;
         let max_extent = extent.x.max(extent.y).max(extent.z).max(1e-10);
 
-        // Target ~15 cells along longest axis
-        let target_cells = 15.0;
+        // Size the cells to the mesh rather than using a fixed count. At a
+        // fixed 15 cells along the longest axis, a 271k-tet Benchy put several
+        // hundred candidate tets in every cell, each needing a barycentric
+        // test per query, and the nearest-tet fallback scans 125 cells. Aim
+        // for a handful of tets per cell instead; never coarser than the old
+        // grid, and capped so memory stays bounded.
+        let volume = (extent.x.max(1e-10)) * (extent.y.max(1e-10)) * (extent.z.max(1e-10));
+        let wanted_cells = (tet_mesh.tets.len() as f64 / 6.0).max(1.0);
+        let ideal_cell = (volume / wanted_cells).cbrt();
+        let target_cells = (max_extent / ideal_cell.max(1e-10)).clamp(15.0, 128.0);
         let base_cell_size = max_extent / target_cells;
 
         // Compute per-axis dims (at least 1 cell)

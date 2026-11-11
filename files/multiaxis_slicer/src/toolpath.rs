@@ -180,7 +180,11 @@ impl ToolpathGenerator {
 
         // Non-planar offset: only apply for planar layers that need centroidal axis adjustment
         let apply_nonplanar_offset = |p: Point3D| -> Point3D {
-            if has_curved_z || is_conical {
+            // A layer that carries its own surface has exact heights already,
+            // however flat it happens to be. The has_curved_z heuristic missed
+            // those: a tet-pipeline layer that is locally level to within 10
+            // microns looked "planar" and had this tilt applied on top.
+            if has_curved_z || is_conical || layer.surface.is_some() {
                 return p; // Z already correct from back-transform / conical_z_fn
             }
             if slicing_direction.norm() > 0.001 {
@@ -334,8 +338,36 @@ impl ToolpathGenerator {
             // not linear: IDW gives z≈50mm at the center when the correct value is z=20mm.
             // We recover deformed_z from any contour point (all points share the same
             // deformed Z — that is what the planar slicer cut at).
-            let conical_z_fn: Option<Box<dyn Fn(f64, f64) -> f64>> =
-                if let Some((cx, cy, signed_tan, z_min)) = self.pattern_config.conical_params {
+            //
+            // The same slot serves any layer that knows its own surface. A
+            // tet-pipeline layer is a level set of a volumetric field and can
+            // say exactly how high it is above any (x, y); without that, its
+            // inner wall loops were left at the layer's nominal Z and its
+            // infill was interpolated inward from the boundary, so only the
+            // outermost wall actually lay on the layer.
+            let conical_z_fn: Option<Box<dyn Fn(f64, f64) -> f64 + '_>> =
+                if let Some(surface) = layer.surface.as_ref() {
+                    let surface = surface.clone();
+                    // Height of the nearest boundary point: the starting guess
+                    // for the solve, and the answer if the layer has no single
+                    // height above (x, y).
+                    let boundary_z = move |x: f64, y: f64| -> f64 {
+                        contour
+                            .points
+                            .iter()
+                            .min_by(|a, b| {
+                                let da = (a.x - x).powi(2) + (a.y - y).powi(2);
+                                let db = (b.x - x).powi(2) + (b.y - y).powi(2);
+                                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .map(|p| p.z)
+                            .unwrap_or(layer.z)
+                    };
+                    Some(Box::new(move |x: f64, y: f64| {
+                        let guess = boundary_z(x, y);
+                        surface.z_at(x, y, guess).unwrap_or(guess)
+                    }))
+                } else if let Some((cx, cy, signed_tan, z_min)) = self.pattern_config.conical_params {
                     // Recover deformed_z from contour points using the minimum.
                     // For each point: D_computed = p.z + signed_tan × r.
                     // Clamped points (at bed_z) give D_computed > D (too high).

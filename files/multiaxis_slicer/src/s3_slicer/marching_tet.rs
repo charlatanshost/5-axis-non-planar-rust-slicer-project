@@ -64,6 +64,19 @@ pub fn extract_tet_layers(
 /// looking for the nearest *model* triangle, which is a different surface and
 /// disagrees wherever the layer cuts across the model rather than along it.
 pub(crate) fn tet_gradient(tet_mesh: &TetMesh, v: &[usize; 4], s: &[f64; 4]) -> Option<Vector3D> {
+    let grad = tet_gradient_raw(tet_mesh, v, s)?;
+    let len = grad.norm();
+    if !len.is_finite() || len < 1e-12 {
+        // Degenerate or flat tet: no usable direction.
+        return None;
+    }
+    Some(grad / len)
+}
+
+/// As [`tet_gradient`] but not normalised: the actual rate of change of the
+/// field, in field units per millimetre. Needed to solve for where a level
+/// set lies, where the magnitude matters and not just the direction.
+pub(crate) fn tet_gradient_raw(tet_mesh: &TetMesh, v: &[usize; 4], s: &[f64; 4]) -> Option<Vector3D> {
     use nalgebra::Matrix3;
 
     let p0 = tet_mesh.vertices[v[0]];
@@ -80,12 +93,7 @@ pub(crate) fn tet_gradient(tet_mesh: &TetMesh, v: &[usize; 4], s: &[f64; 4]) -> 
     let b = Vector3D::new(s[1] - s[0], s[2] - s[0], s[3] - s[0]);
 
     let grad = dt.try_inverse()? * b;
-    let len = grad.norm();
-    if !len.is_finite() || len < 1e-12 {
-        // Degenerate or flat tet: no usable direction.
-        return None;
-    }
-    Some(grad / len)
+    if grad.iter().all(|c| c.is_finite()) { Some(grad) } else { None }
 }
 
 fn extract_at_iso_value(

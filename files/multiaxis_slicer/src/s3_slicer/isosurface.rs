@@ -151,11 +151,8 @@ impl CurvedLayer {
             })
             .collect();
 
-        Layer {
-            z: self.z,
-            contours,
-            layer_height: 0.2,  // Will be adjusted based on deformation
-        }
+        // layer_height will be adjusted based on deformation
+        Layer::new(self.z, contours, 0.2)
     }
 
     /// Get average Z coordinate

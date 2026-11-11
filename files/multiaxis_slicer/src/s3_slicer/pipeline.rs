@@ -1004,7 +1004,7 @@ pub fn execute_s4_untransform(
                 .flat_map(|c| c.points.iter())
                 .map(|p| p.z)
                 .fold(f64::INFINITY, f64::min);
-            Some(Layer { z: min_z, contours: untransformed_contours, layer_height: layer.layer_height })
+            Some(Layer::new(min_z, untransformed_contours, layer.layer_height))
         } else {
             None
         }

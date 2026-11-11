@@ -41,12 +41,28 @@ impl Default for SlicingConfig {
     }
 }
 
+/// The surface a curved layer lies on, for slicers that can describe it.
+///
+/// A layer's contours say where its boundary is. Everything printed inside
+/// that boundary -- inner wall loops, infill -- also has to lie on the layer,
+/// and the contours alone cannot say where that is: interpolating Z inward
+/// from the boundary, or ray-casting onto the model's outer skin, are both
+/// guesses about a surface the slicer already knows exactly.
+pub trait LayerSurface: Send + Sync + std::fmt::Debug {
+    /// Height of the layer above `(x, y)`, searching from `near_z`.
+    /// `None` if the layer does not pass over that point.
+    fn z_at(&self, x: f64, y: f64, near_z: f64) -> Option<f64>;
+}
+
 /// A single layer with contours
 #[derive(Debug, Clone)]
 pub struct Layer {
     pub z: f64,
     pub contours: Vec<Contour>,
     pub layer_height: f64,
+    /// The surface this layer lies on, when the slicer that made it can
+    /// evaluate it. `None` for planar layers, whose surface is just `z`.
+    pub surface: Option<std::sync::Arc<dyn LayerSurface>>,
 }
 
 impl Layer {
@@ -55,7 +71,14 @@ impl Layer {
             z,
             contours,
             layer_height,
+            surface: None,
         }
+    }
+
+    /// Attach the surface this layer lies on.
+    pub fn with_surface(mut self, surface: std::sync::Arc<dyn LayerSurface>) -> Self {
+        self.surface = Some(surface);
+        self
     }
 
     /// Check if layer is empty

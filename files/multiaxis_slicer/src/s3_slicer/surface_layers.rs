@@ -72,6 +72,155 @@ fn layer_normal(tet_index: usize, tet_mesh: &TetMesh, field: &TetScalarField) ->
     tet_gradient(tet_mesh, v, &s).unwrap_or_else(|| Vector3D::new(0.0, 0.0, 1.0))
 }
 
+/// The volumetric field and what is needed to query it, shared by every layer
+/// cut from it.
+struct FieldData {
+    tet_mesh: TetMesh,
+    grid: TetSpatialGrid,
+    field: TetScalarField,
+    /// Height range of the tet mesh, which bounds the search.
+    z_lo: f64,
+    z_hi: f64,
+    /// Height range of the model itself, which bounds acceptable answers.
+    model_z_lo: f64,
+    model_z_hi: f64,
+}
+
+impl std::fmt::Debug for FieldData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FieldData")
+            .field("tets", &self.tet_mesh.tets.len())
+            .finish()
+    }
+}
+
+/// One level set of the volumetric field: the surface a layer lies on.
+///
+/// The layer's contours are where this surface meets the model. Inner wall
+/// loops and infill are placed in XY inside those contours and then need a
+/// height, and the right height is this surface's -- not the model's outer
+/// skin, which is what ray-casting gives, and not a blend of boundary
+/// heights, which is what inverse-distance weighting gives. Both are wrong
+/// in the interior of any layer that is not flat.
+#[derive(Debug)]
+pub struct FieldSurface {
+    data: std::sync::Arc<FieldData>,
+    level: f64,
+}
+
+impl FieldSurface {
+    /// Field value and its vertical rate of change at a point.
+    ///
+    /// Evaluates the located tet's linear function directly rather than
+    /// interpolating with clamped barycentrics, so a point slightly outside
+    /// the tet mesh extrapolates linearly instead of hitting a plateau, which
+    /// would stall the solve below.
+    fn eval(&self, p: &Point3D) -> Option<(f64, f64)> {
+        let d = &*self.data;
+        let loc = d
+            .grid
+            .find_containing_tet(p, &d.tet_mesh)
+            .unwrap_or_else(|| d.grid.find_nearest_tet(p, &d.tet_mesh));
+        let v = &d.tet_mesh.tets[loc.tet_index].vertices;
+        let s = [
+            d.field.value_at(v[0]),
+            d.field.value_at(v[1]),
+            d.field.value_at(v[2]),
+            d.field.value_at(v[3]),
+        ];
+        let g = crate::s3_slicer::marching_tet::tet_gradient_raw(&d.tet_mesh, v, &s)?;
+        let value = s[0] + g.dot(&(*p - d.tet_mesh.vertices[v[0]]));
+        Some((value, g.z))
+    }
+}
+
+impl crate::slicing::LayerSurface for FieldSurface {
+    /// Solve `field(x, y, z) = level` for z.
+    ///
+    /// The field is piecewise linear, so Newton's method along the vertical
+    /// lands exactly once it is in the right tet, typically in two or three
+    /// steps. Steps are capped so a shallow gradient cannot throw the iterate
+    /// across the model.
+    fn z_at(&self, x: f64, y: f64, near_z: f64) -> Option<f64> {
+        let d = &*self.data;
+        let mut z = near_z.clamp(d.z_lo, d.z_hi);
+        const MAX_STEP: f64 = 3.0;
+
+        for _ in 0..16 {
+            let (value, dz_rate) = self.eval(&Point3D::new(x, y, z))?;
+            let err = self.level - value;
+            if err.abs() < 1e-7 {
+                return self.inside_model(z);
+            }
+            if !dz_rate.is_finite() || dz_rate.abs() < 1e-9 {
+                // Level set is vertical here: no single height above (x, y).
+                return None;
+            }
+            z += (err / dz_rate).clamp(-MAX_STEP, MAX_STEP);
+            if z < d.z_lo - MAX_STEP || z > d.z_hi + MAX_STEP {
+                return None;
+            }
+        }
+
+        // Accept a near miss.
+        let (value, _) = self.eval(&Point3D::new(x, y, z))?;
+        if (self.level - value).abs() < 1e-4 {
+            return self.inside_model(z);
+        }
+
+        // Newton did not settle: the field is only piecewise linear, and
+        // across a kink between tets the iterate can bounce between two of
+        // them indefinitely. Fall back to something that cannot cycle --
+        // bracket the nearest sign change around the starting guess, then
+        // bisect.
+        let start = near_z.clamp(d.z_lo, d.z_hi);
+        let g = |z: f64| self.eval(&Point3D::new(x, y, z)).map(|(v, _)| v - self.level);
+        let g0 = g(start)?;
+        const H: f64 = 0.2;
+        const REACH: usize = 30; // 6 mm either way
+        let mut bracket: Option<(f64, f64, f64)> = None; // (z_a, z_b, g_a)
+        let (mut up_prev, mut dn_prev) = ((start, g0), (start, g0));
+        for k in 1..=REACH {
+            let zu = start + k as f64 * H;
+            if let Some(gu) = g(zu) {
+                if gu == 0.0 { return self.inside_model(zu); }
+                if (gu > 0.0) != (up_prev.1 > 0.0) {
+                    bracket = Some((up_prev.0, zu, up_prev.1));
+                    break;
+                }
+                up_prev = (zu, gu);
+            }
+            let zd = start - k as f64 * H;
+            if let Some(gd) = g(zd) {
+                if gd == 0.0 { return self.inside_model(zd); }
+                if (gd > 0.0) != (dn_prev.1 > 0.0) {
+                    bracket = Some((dn_prev.0, zd, dn_prev.1));
+                    break;
+                }
+                dn_prev = (zd, gd);
+            }
+        }
+        let (mut a, mut b, ga) = bracket?;
+        for _ in 0..50 {
+            let m = 0.5 * (a + b);
+            let gm = g(m)?;
+            if (gm > 0.0) == (ga > 0.0) { a = m; } else { b = m; }
+            if (b - a).abs() < 1e-7 { break; }
+        }
+        self.inside_model(0.5 * (a + b))
+    }
+}
+
+impl FieldSurface {
+    /// The tet mesh deliberately extends past the model, so the level set
+    /// does too. A height outside the model's own range is the layer leaving
+    /// the part, not somewhere to put plastic.
+    fn inside_model(&self, z: f64) -> Option<f64> {
+        let d = &*self.data;
+        if z >= d.model_z_lo - 1e-6 && z <= d.model_z_hi + 1e-6 { Some(z) } else { None }
+    }
+}
+
 /// Extract layers as level sets of the volumetric field on the model surface.
 ///
 /// `surface` is the original model; `tet_mesh` and `field` are the REST-pose
@@ -89,13 +238,25 @@ pub fn extract_surface_layers(
     }
 
     let topo = MeshTopology::from_mesh(surface);
-    let grid = TetSpatialGrid::build(tet_mesh);
+
+    // Shared by every layer, so each can answer "how high are you at (x, y)?"
+    // for the wall loops and infill placed inside its outline.
+    let data = std::sync::Arc::new(FieldData {
+        grid: TetSpatialGrid::build(tet_mesh),
+        tet_mesh: tet_mesh.clone(),
+        field: field.clone(),
+        z_lo: tet_mesh.bounds_min.z,
+        z_hi: tet_mesh.bounds_max.z,
+        model_z_lo: surface.bounds_min.z,
+        model_z_hi: surface.bounds_max.z,
+    });
+    let grid = &data.grid;
 
     // Field value at every surface vertex.
     let values: Vec<f64> = topo
         .vertices
         .par_iter()
-        .map(|p| sample_field(p, tet_mesh, &grid, field).0)
+        .map(|p| sample_field(p, tet_mesh, grid, field).0)
         .collect();
 
     // Range over the SURFACE, not over the tet mesh. The tet mesh extends past
@@ -132,7 +293,7 @@ pub fn extract_surface_layers(
                         .points
                         .iter()
                         .map(|p| {
-                            let (_, ti) = sample_field(p, tet_mesh, &grid, field);
+                            let (_, ti) = sample_field(p, tet_mesh, grid, field);
                             layer_normal(ti, tet_mesh, field)
                         })
                         .collect();
@@ -149,7 +310,10 @@ pub fn extract_surface_layers(
                 .flat_map(|c| c.points.iter())
                 .fold((0.0, 0usize), |(s, n), p| (s + p.z, n + 1));
             let z = if n > 0 { sum / n as f64 } else { level };
-            Some(Layer::new(z, contours, layer_height))
+            // extract_level_set nudges the level off exact vertex values by a
+            // relative 1e-9; far below anything the solve tolerance resolves.
+            let surface = std::sync::Arc::new(FieldSurface { data: data.clone(), level });
+            Some(Layer::new(z, contours, layer_height).with_surface(surface))
         })
         .collect();
 
@@ -286,6 +450,116 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn tilted_setup() -> (Mesh, TetMesh, TetScalarField) {
+        let surface = box_mesh(20.0, 20.0, 10.0);
+        let (tet_mesh, mut field) = grid_setup(&surface);
+        // s = z + 0.2 x: level sets are planes tilted about Y.
+        field.values = tet_mesh.vertices.iter().map(|v| v.z + 0.2 * v.x).collect();
+        field.min_value = field.values.iter().cloned().fold(f64::INFINITY, f64::min);
+        field.max_value = field.values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        (surface, tet_mesh, field)
+    }
+
+    /// Regression test for D-19. A layer must be able to say how high it is
+    /// anywhere inside its outline, not just on it. For s = z + 0.2x the
+    /// level set through a boundary point is the plane z = z0 - 0.2 (x - x0).
+    #[test]
+    fn test_layer_surface_gives_exact_interior_height() {
+        let (surface, tet_mesh, field) = tilted_setup();
+        let layers = extract_surface_layers(&surface, &tet_mesh, &field, 1.0);
+        let layer = &layers[layers.len() / 2];
+        let surf = layer.surface.as_ref().expect("tet layers must carry their surface");
+
+        let p0 = layer.contours[0].points[0];
+        let level = p0.z + 0.2 * p0.x;
+
+        for &(x, y) in &[(10.0, 10.0), (3.0, 17.0), (16.5, 4.2), (10.0, 1.0)] {
+            let expect = level - 0.2 * x;
+            if expect < 0.0 || expect > 10.0 {
+                continue; // this level does not pass over that point inside the box
+            }
+            // Deliberately bad starting guesses: the solve must not depend on them.
+            for &guess in &[layer.z, 0.0, 10.0] {
+                let z = surf.z_at(x, y, guess).expect("interior point should resolve");
+                assert!(
+                    (z - expect).abs() < 1e-6,
+                    "z_at({}, {}) from guess {} = {:.9}, expected {:.9}",
+                    x, y, guess, z, expect
+                );
+            }
+        }
+    }
+
+    /// The point of D-19, end to end: everything the toolpath generator
+    /// extrudes for a layer -- outer wall, inner wall loops, infill -- must lie
+    /// on that layer. Before this, only the outermost wall did; inner loops sat
+    /// at the layer's nominal Z and infill was interpolated from the boundary.
+    #[test]
+    fn test_walls_and_infill_lie_on_the_curved_layer() {
+        let (surface, tet_mesh, field) = tilted_setup();
+        let layers = extract_surface_layers(&surface, &tet_mesh, &field, 1.0);
+
+        let generator = crate::toolpath::ToolpathGenerator::new(0.4, 1.0);
+        let toolpaths = generator.generate(&layers, Some(&surface));
+        assert_eq!(toolpaths.len(), layers.len());
+
+        let mut checked = 0usize;
+        for tp in &toolpaths {
+            // On the layer, z + 0.2x is one constant. Measure how far the
+            // extruded points stray from that.
+            let s: Vec<f64> = tp
+                .paths
+                .iter()
+                .filter(|seg| seg.extrusion > 0.0)
+                .map(|seg| seg.position.z + 0.2 * seg.position.x)
+                .collect();
+            if s.len() < 10 {
+                continue;
+            }
+            let lo = s.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = s.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            assert!(
+                hi - lo < 1e-3,
+                "extruded points stray {:.4} mm off their layer (z={:.2})",
+                hi - lo,
+                tp.z
+            );
+            checked += 1;
+        }
+        assert!(checked >= 5, "only {} layers had enough extrusion to check", checked);
+
+        // Control: the same layers without their surface. If this did not
+        // stray, the assertion above would be passing for some other reason.
+        let stripped: Vec<Layer> = layers
+            .iter()
+            .map(|l| Layer::new(l.z, l.contours.clone(), l.layer_height))
+            .collect();
+        let worst_without = generator
+            .generate(&stripped, Some(&surface))
+            .iter()
+            .map(|tp| {
+                let s: Vec<f64> = tp
+                    .paths
+                    .iter()
+                    .filter(|seg| seg.extrusion > 0.0)
+                    .map(|seg| seg.position.z + 0.2 * seg.position.x)
+                    .collect();
+                if s.len() < 10 {
+                    return 0.0;
+                }
+                s.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+                    - s.iter().cloned().fold(f64::INFINITY, f64::min)
+            })
+            .fold(0.0f64, f64::max);
+        assert!(
+            worst_without > 0.05,
+            "without the layer surface the points strayed only {:.4} mm, so this \
+             test is not exercising the defect",
+            worst_without
+        );
+        eprintln!("stray without layer surface: {:.4} mm", worst_without);
     }
 
     /// A tilted field must give tilted layers: the mechanism has to follow the
