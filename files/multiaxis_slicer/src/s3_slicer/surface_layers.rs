@@ -221,6 +221,76 @@ impl FieldSurface {
     }
 }
 
+/// Split every surface triangle edge longer than `max_edge`, conformingly.
+///
+/// The level sets below are traced through a field that is sampled at surface
+/// vertices and taken to be linear across each triangle. The real field is
+/// linear only within a tet, and a CAD-style model has triangles spanning
+/// dozens of tets: on a Benchy, with hull triangles up to 18 mm long, 29 % of
+/// outline points sat more than 0.05 mm off the layer they were meant to
+/// outline (worst 0.88 mm), and the walls faithfully followed them. Sampling
+/// at tet resolution removes the disagreement at its source.
+///
+/// Whether an edge is split depends only on its own length, and both triangles
+/// sharing it compute the same midpoint, so no T-junctions are created and the
+/// level sets stay closed.
+fn refine_surface(surface: &Mesh, max_edge: f64) -> Vec<crate::geometry::Triangle> {
+    use crate::geometry::Triangle;
+    let mid = |a: &Point3D, b: &Point3D| Point3D::new(0.5 * (a.x + b.x), 0.5 * (a.y + b.y), 0.5 * (a.z + b.z));
+    let long = |a: &Point3D, b: &Point3D| (*a - *b).norm() > max_edge;
+
+    let mut done: Vec<Triangle> = Vec::with_capacity(surface.triangles.len());
+    let mut work: Vec<Triangle> = surface.triangles.clone();
+    while let Some(t) = work.pop() {
+        let v = [t.v0, t.v1, t.v2];
+        // Edge i runs from v[i] to v[i+1].
+        let marked = [long(&v[0], &v[1]), long(&v[1], &v[2]), long(&v[2], &v[0])];
+        let m = |i: usize| mid(&v[i], &v[(i + 1) % 3]);
+        match marked.iter().filter(|&&x| x).count() {
+            0 => done.push(t),
+            3 => {
+                let (a, b, c) = (m(0), m(1), m(2));
+                work.push(Triangle::new(v[0], a, c));
+                work.push(Triangle::new(a, v[1], b));
+                work.push(Triangle::new(c, b, v[2]));
+                work.push(Triangle::new(a, b, c));
+            }
+            1 => {
+                let i = marked.iter().position(|&x| x).unwrap();
+                let (p, q, r) = (v[i], v[(i + 1) % 3], v[(i + 2) % 3]);
+                let a = m(i);
+                work.push(Triangle::new(p, a, r));
+                work.push(Triangle::new(a, q, r));
+            }
+            _ => {
+                // Two marked edges meet at q; the third edge p-r is short.
+                let i = marked.iter().position(|&x| !x).unwrap();
+                let (r, p, q) = (v[i], v[(i + 1) % 3], v[(i + 2) % 3]);
+                // Marked: p-q (edge i+1) and q-r (edge i+2).
+                let (a, b) = (m((i + 1) % 3), m((i + 2) % 3));
+                work.push(Triangle::new(a, q, b));
+                work.push(Triangle::new(r, p, a));
+                work.push(Triangle::new(r, a, b));
+            }
+        }
+    }
+    done
+}
+
+/// Longest surface edge to leave unsplit: about one tet across, relaxed on
+/// very large models so refinement cannot run away with memory.
+fn refine_edge_limit(surface: &Mesh) -> f64 {
+    const TARGET_EDGE: f64 = 1.0;
+    const TRIANGLE_BUDGET: f64 = 1.5e6;
+    let area: f64 = surface
+        .triangles
+        .iter()
+        .map(|t| 0.5 * (t.v1 - t.v0).cross(&(t.v2 - t.v0)).norm())
+        .sum();
+    // An equilateral triangle of edge L covers 0.433 L^2.
+    TARGET_EDGE.max((area / (0.433 * TRIANGLE_BUDGET)).sqrt())
+}
+
 /// Extract layers as level sets of the volumetric field on the model surface.
 ///
 /// `surface` is the original model; `tet_mesh` and `field` are the REST-pose
@@ -233,11 +303,26 @@ pub fn extract_surface_layers(
     field: &TetScalarField,
     layer_height: f64,
 ) -> Vec<Layer> {
+    extract_surface_layers_refined(surface, tet_mesh, field, layer_height, refine_edge_limit(surface))
+}
+
+/// As `extract_surface_layers`, with the surface refinement limit explicit.
+fn extract_surface_layers_refined(
+    surface: &Mesh,
+    tet_mesh: &TetMesh,
+    field: &TetScalarField,
+    layer_height: f64,
+    max_edge: f64,
+) -> Vec<Layer> {
     if layer_height <= 0.0 || surface.triangles.is_empty() || tet_mesh.tets.is_empty() {
         return Vec::new();
     }
 
-    let topo = MeshTopology::from_mesh(surface);
+    let refined = match Mesh::new(refine_surface(surface, max_edge)) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    let topo = MeshTopology::from_mesh(&refined);
 
     // Shared by every layer, so each can answer "how high are you at (x, y)?"
     // for the wall loops and infill placed inside its outline.
@@ -596,5 +681,80 @@ mod tests {
         let expect = Vector3D::new(0.2, 0.0, 1.0).normalize();
         let n = layers[layers.len() / 2].contours[0].normals.as_ref().unwrap()[0];
         assert!((n - expect).norm() < 1e-6, "normal {:?} != {:?}", n, expect);
+    }
+    /// Refinement must shorten every edge without changing the surface or
+    /// opening it: a T-junction would leave level sets unclosed.
+    #[test]
+    fn test_refine_surface_is_conforming() {
+        // A long thin box exercises the one- and two-edge split patterns as
+        // well as the uniform one.
+        let surface = box_mesh(20.0, 3.0, 1.4);
+        let area = |ts: &[Triangle]| -> f64 {
+            ts.iter().map(|t| 0.5 * (t.v1 - t.v0).cross(&(t.v2 - t.v0)).norm()).sum()
+        };
+        let refined = refine_surface(&surface, 1.0);
+        assert!(refined.len() > surface.triangles.len());
+        assert!((area(&refined) - area(&surface.triangles)).abs() < 1e-9);
+
+        let key = |p: &Point3D| ((p.x * 1e6).round() as i64, (p.y * 1e6).round() as i64, (p.z * 1e6).round() as i64);
+        let mut edges: std::collections::HashMap<_, usize> = std::collections::HashMap::new();
+        for t in &refined {
+            for (a, b) in [(t.v0, t.v1), (t.v1, t.v2), (t.v2, t.v0)] {
+                assert!((a - b).norm() <= 1.0 + 1e-9, "edge of {:.3} mm survived", (a - b).norm());
+                let (ka, kb) = (key(&a), key(&b));
+                *edges.entry(if ka < kb { (ka, kb) } else { (kb, ka) }).or_insert(0) += 1;
+            }
+        }
+        assert!(
+            edges.values().all(|&n| n == 2),
+            "refined surface is not watertight: {} edges not shared by exactly two triangles",
+            edges.values().filter(|&&n| n != 2).count()
+        );
+    }
+
+    /// Worst disagreement between a layer's outline and the layer's own
+    /// surface, in mm of height.
+    fn worst_outline_error(layers: &[Layer]) -> f64 {
+        let mut worst = 0.0f64;
+        for layer in layers {
+            let surf = layer.surface.as_ref().unwrap();
+            for p in layer.contours.iter().flat_map(|c| c.points.iter()) {
+                if let Some(z) = surf.z_at(p.x, p.y, p.z) {
+                    worst = worst.max((z - p.z).abs());
+                }
+            }
+        }
+        worst
+    }
+
+    /// Regression test for D-21. An outline is traced through field values
+    /// sampled at surface vertices, so on a model with large triangles it cut
+    /// straight across a field that curves between them: the outline and the
+    /// layer it outlines disagreed (0.88 mm on a Benchy), and the walls
+    /// followed the outline. A box with two triangles per face and a bowed
+    /// field is the smallest case.
+    #[test]
+    fn test_outlines_agree_with_their_layer_on_a_coarse_mesh() {
+        let surface = box_mesh(20.0, 20.0, 10.0);
+        let (tet_mesh, mut field) = grid_setup(&surface);
+        // Level sets bow 2 mm between the middle of the box and its sides.
+        field.values = tet_mesh.vertices.iter().map(|v| v.z + 0.02 * (v.x - 10.0).powi(2)).collect();
+        field.min_value = field.values.iter().cloned().fold(f64::INFINITY, f64::min);
+        field.max_value = field.values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+        let layers = extract_surface_layers(&surface, &tet_mesh, &field, 1.0);
+        assert!(layers.len() >= 5);
+        let worst = worst_outline_error(&layers);
+        assert!(worst < 0.05, "outline is {:.4} mm off its own layer", worst);
+
+        // Control: the same extraction on the unrefined surface.
+        let coarse = extract_surface_layers_refined(&surface, &tet_mesh, &field, 1.0, f64::INFINITY);
+        let worst_coarse = worst_outline_error(&coarse);
+        assert!(
+            worst_coarse > 0.5,
+            "unrefined outline was only {:.4} mm off, so this test is not exercising the defect",
+            worst_coarse
+        );
+        eprintln!("outline error: refined {:.4} mm, unrefined {:.4} mm", worst, worst_coarse);
     }
 }
