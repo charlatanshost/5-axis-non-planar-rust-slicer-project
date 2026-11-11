@@ -936,6 +936,40 @@ pub fn execute_s4_untransform(
     jump_split_multiplier: f64,
 ) -> Vec<Layer> {
     log::info!("S4 Untransform: {} planar layers → original space", planar_layers.len());
+
+    // A layer is everything the deformation sends to one height: a level set,
+    // on the ORIGINAL model, of "deformed Z". The deformation is linear per
+    // tet, so that field is known exactly at the original tet mesh's vertices
+    // and the layers can be cut straight from the original surface.
+    //
+    // The route below gets to the same curves the long way round -- deform the
+    // surface, slice it with planes, then carry every contour point back
+    // through a point-location query -- and every step of it leaks. Points on
+    // the deformed surface that miss the deformed tet mesh are mapped through
+    // the nearest tet and land somewhere else, the jumps that leaves are cut
+    // out, and the contour is no longer closed: a Benchy came back as 530
+    // contours with 305 of them open, and as planar-looking layers with no
+    // record of their real heights, which the toolpath generator then tilted
+    // about the centroidal axis, 9.9 mm below the bed at worst.
+    //
+    // Cutting on the original surface has none of those steps. Contours are
+    // closed and on the model by construction, and each layer carries its
+    // surface, so inner walls and infill get exact heights too.
+    {
+        let values: Vec<f64> = data.deformed_tet.vertices.iter().map(|v| v.z).collect();
+        let min_value = values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_value = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let field = TetScalarField { values, min_value, max_value };
+        let layers = crate::s3_slicer::surface_layers::extract_surface_layers(
+            original_mesh, &data.original_tet, &field, layer_height);
+        if !layers.is_empty() {
+            let total_contours: usize = layers.iter().map(|l| l.contours.len()).sum();
+            log::info!("  → {} layers, {} contours (level sets of deformed Z on the model surface)",
+                layers.len(), total_contours);
+            return layers;
+        }
+        log::warn!("  Surface extraction produced no layers; falling back to point-wise untransform");
+    }
     let deformed_grid = TetSpatialGrid::build(&data.deformed_tet);
 
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -1290,5 +1324,55 @@ mod tests {
         let deformed = Mesh::new(torn).unwrap();
         let kept = filter_torn_triangles(&original, &deformed, 15.0).unwrap();
         assert_eq!(kept.triangles.len(), 201, "exactly the torn triangle should go");
+    }
+
+    /// Regression test for D-23. S4 layers are the level sets of "deformed Z"
+    /// on the original model. Getting them by slicing the deformed surface
+    /// and mapping each point back left contours open and layers with no
+    /// record of their real shape. A sheared box makes the right answer
+    /// checkable: with z' = z + 0.2 x, every point of a layer has the same
+    /// z + 0.2 x.
+    #[test]
+    fn test_s4_layers_are_closed_level_sets_on_the_model() {
+        let p = |x: f64, y: f64, z: f64| Point3D::new(x, y, z);
+        let v = [
+            p(0.0, 0.0, 0.0), p(20.0, 0.0, 0.0), p(20.0, 20.0, 0.0), p(0.0, 20.0, 0.0),
+            p(0.0, 0.0, 10.0), p(20.0, 0.0, 10.0), p(20.0, 20.0, 10.0), p(0.0, 20.0, 10.0),
+        ];
+        let mut tris = Vec::new();
+        for &(a, b, c, d) in &[(0,3,2,1), (4,5,6,7), (0,1,5,4), (1,2,6,5), (2,3,7,6), (3,0,4,7)] {
+            tris.push(Triangle::new(v[a], v[b], v[c]));
+            tris.push(Triangle::new(v[a], v[c], v[d]));
+        }
+        let original = Mesh::new(tris).unwrap();
+
+        let original_tet = TetMesh::from_surface_mesh_grid(&original, 12).unwrap();
+        let sheared: Vec<Point3D> = original_tet.vertices.iter().map(|q| p(q.x, q.y, q.z + 0.2 * q.x)).collect();
+        let deformed_tet = TetMesh::new(sheared, original_tet.tets.clone());
+        let deformed_surface = crate::s3_slicer::tet_point_location::deform_surface_through_tets(
+            &original, &original_tet, &deformed_tet);
+        let data = S4DeformData { original_tet, deformed_tet, deformed_surface };
+
+        let planar = execute_s4_slice(&data.deformed_surface, 1.0).unwrap();
+        let layers = execute_s4_untransform(planar, &data, &original, 1.0, 10.0);
+        assert!(layers.len() >= 8, "expected about 13 layers, got {}", layers.len());
+
+        for layer in &layers {
+            assert!(layer.surface.is_some(), "S4 layers must know their own surface");
+            for c in &layer.contours {
+                assert!(c.closed, "open contour in S4 layer at z={:.2}", layer.z);
+                let s: Vec<f64> = c.points.iter().map(|q| q.z + 0.2 * q.x).collect();
+                let lo = s.iter().cloned().fold(f64::INFINITY, f64::min);
+                let hi = s.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                assert!(hi - lo < 1e-6, "layer is not a level set of deformed Z (spread {:.6})", hi - lo);
+                for q in &c.points {
+                    assert!(
+                        q.x > -1e-6 && q.x < 20.0 + 1e-6 && q.y > -1e-6 && q.y < 20.0 + 1e-6
+                            && q.z > -1e-6 && q.z < 10.0 + 1e-6,
+                        "S4 contour point {:?} is off the model", q
+                    );
+                }
+            }
+        }
     }
 }
