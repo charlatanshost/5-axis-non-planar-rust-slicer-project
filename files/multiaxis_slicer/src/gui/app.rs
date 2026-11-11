@@ -748,7 +748,12 @@ impl Default for SlicerApp {
             s4_asap_convergence: 1e-4,
             s4_z_bias: 0.8,
             s4_auto_z_bias: true,
-            s4_use_asap: false,
+            // The alternative, rotating every vertex about one anchor on the
+            // bed, turns any change in rotation between neighbouring tets into
+            // shear in proportion to the distance from that anchor. Measured
+            // on a Benchy: layer normals out to 121 degrees and 0.6 % of tets
+            // inverted, against 10 degrees and none with ASAP.
+            s4_use_asap: true,
             s4_base_detection_threshold: 0.05,
             s4_edge_filter_multiplier: 15.0,
             s4_jump_split_multiplier: 10.0,
