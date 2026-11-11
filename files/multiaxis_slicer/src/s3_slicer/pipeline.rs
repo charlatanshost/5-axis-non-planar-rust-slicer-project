@@ -863,38 +863,61 @@ pub fn execute_s4_deform(
     );
     log::info!("  → Deformed surface: {} triangles", raw_surface.triangles.len());
 
-    // Filter spurious very-long-edge triangles (from bad STL geometry)
-    let deformed_surface = {
-        let mut edge_lengths: Vec<f64> = raw_surface.triangles.iter()
-            .flat_map(|tri| {
-                let e0 = ((tri.v1.x-tri.v0.x).powi(2)+(tri.v1.y-tri.v0.y).powi(2)+(tri.v1.z-tri.v0.z).powi(2)).sqrt();
-                let e1 = ((tri.v2.x-tri.v1.x).powi(2)+(tri.v2.y-tri.v1.y).powi(2)+(tri.v2.z-tri.v1.z).powi(2)).sqrt();
-                let e2 = ((tri.v0.x-tri.v2.x).powi(2)+(tri.v0.y-tri.v2.y).powi(2)+(tri.v0.z-tri.v2.z).powi(2)).sqrt();
-                [e0, e1, e2]
-            })
-            .collect();
-        edge_lengths.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median_edge = edge_lengths[edge_lengths.len() / 2];
-        let max_allowed = (median_edge * config.edge_filter_multiplier).max(5.0);
-        let filtered: Vec<_> = raw_surface.triangles.iter()
-            .filter(|tri| {
-                let e0 = ((tri.v1.x-tri.v0.x).powi(2)+(tri.v1.y-tri.v0.y).powi(2)+(tri.v1.z-tri.v0.z).powi(2)).sqrt();
-                let e1 = ((tri.v2.x-tri.v1.x).powi(2)+(tri.v2.y-tri.v1.y).powi(2)+(tri.v2.z-tri.v1.z).powi(2)).sqrt();
-                let e2 = ((tri.v0.x-tri.v2.x).powi(2)+(tri.v0.y-tri.v2.y).powi(2)+(tri.v0.z-tri.v2.z).powi(2)).sqrt();
-                e0 <= max_allowed && e1 <= max_allowed && e2 <= max_allowed
-            })
-            .cloned()
-            .collect();
-        let removed = raw_surface.triangles.len() - filtered.len();
-        if removed > 0 {
-            log::info!("  → Filtered {} spurious triangles (median edge={:.2}mm, max={:.2}mm)",
-                removed, median_edge, max_allowed);
-        }
-        Mesh::new(filtered).map_err(|e| format!("Filtered mesh construction failed: {}", e))?
-    };
+    // Drop triangles the deformation tore apart.
+    let deformed_surface = filter_torn_triangles(original_mesh, &raw_surface, config.edge_filter_multiplier)?;
 
     log::info!("=== S4 Deform Step Complete ===");
     Ok(S4DeformData { original_tet: tet_mesh, deformed_tet: deformed_tet_mesh, deformed_surface })
+}
+
+/// Remove triangles that the deformation stretched out of all proportion.
+///
+/// A surface vertex that falls outside the tet mesh is mapped through its
+/// nearest tet, which can land it far from its neighbours and leave a long
+/// sliver across the model. Those are what this removes.
+///
+/// "Long" has to be judged against the triangle's own length before the
+/// deformation. This used to drop anything with an edge over
+/// `max(median * multiplier, 5 mm)`, which on a model with honest large
+/// triangles removed the model: a Benchy lost 4 355 triangles of hull and
+/// deck, and 1 208 of the 1 281 contours sliced from what remained were open.
+/// An edge is now torn only if it is over that limit AND more than three
+/// times as long as it started.
+fn filter_torn_triangles(
+    original: &Mesh,
+    deformed: &Mesh,
+    edge_filter_multiplier: f64,
+) -> Result<Mesh, String> {
+    const MAX_STRETCH: f64 = 3.0;
+    let edges = |t: &crate::geometry::Triangle| [(t.v1 - t.v0).norm(), (t.v2 - t.v1).norm(), (t.v0 - t.v2).norm()];
+
+    let mut lengths: Vec<f64> = deformed.triangles.iter().flat_map(|t| edges(t)).collect();
+    lengths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_edge = lengths[lengths.len() / 2];
+    let max_allowed = (median_edge * edge_filter_multiplier).max(5.0);
+
+    // deform_surface_through_tets maps triangle i to triangle i.
+    let kept: Vec<_> = deformed
+        .triangles
+        .iter()
+        .zip(original.triangles.iter())
+        .filter(|(d, o)| {
+            edges(d)
+                .iter()
+                .zip(edges(o).iter())
+                .all(|(&after, &before)| after <= max_allowed || after <= before * MAX_STRETCH)
+        })
+        .map(|(d, _)| d.clone())
+        .collect();
+
+    let removed = deformed.triangles.len() - kept.len();
+    if removed > 0 {
+        log::warn!(
+            "  → Removed {} triangles torn by the deformation (edge over {:.2} mm and stretched more than {}x)",
+            removed, max_allowed, MAX_STRETCH
+        );
+    }
+    Mesh::new(kept).map_err(|e| format!("Filtered mesh construction failed: {}", e))
 }
 
 /// Step 5b: Planarly slice the deformed surface.
@@ -1237,5 +1260,35 @@ mod tests {
 
         assert!(!result.layers.is_empty());
         assert_eq!(result.original_mesh.triangles.len(), result.deformed_mesh.triangles.len());
+    }
+
+    /// Regression test for D-22. The torn-triangle filter judged length in
+    /// absolute terms, so on a model that is mostly fine triangles with a few
+    /// honest large ones it deleted the large ones: 4 355 triangles of the
+    /// hull and deck of a Benchy. Only stretch says a triangle was torn.
+    #[test]
+    fn test_torn_triangle_filter_keeps_honest_large_triangles() {
+        let p = |x: f64, y: f64| Point3D::new(x, y, 0.0);
+        // 200 triangles 0.2 mm across, and two 20 mm ones.
+        let mut tris: Vec<Triangle> = (0..200)
+            .map(|i| {
+                let x = i as f64 * 0.3;
+                Triangle::new(p(x, 30.0), p(x + 0.2, 30.0), p(x, 30.2))
+            })
+            .collect();
+        tris.push(Triangle::new(p(0.0, 0.0), p(20.0, 0.0), p(20.0, 20.0)));
+        tris.push(Triangle::new(p(0.0, 0.0), p(20.0, 20.0), p(0.0, 20.0)));
+        let original = Mesh::new(tris.clone()).unwrap();
+
+        // Undeformed: nothing is torn, large or not.
+        let kept = filter_torn_triangles(&original, &original, 15.0).unwrap();
+        assert_eq!(kept.triangles.len(), 202, "an undeformed mesh lost triangles");
+
+        // Tear one small triangle: one vertex thrown 40 mm away.
+        let mut torn = tris;
+        torn[7].v2 = p(40.0, 70.0);
+        let deformed = Mesh::new(torn).unwrap();
+        let kept = filter_torn_triangles(&original, &deformed, 15.0).unwrap();
+        assert_eq!(kept.triangles.len(), 201, "exactly the torn triangle should go");
     }
 }
