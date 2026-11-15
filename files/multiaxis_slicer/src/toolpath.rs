@@ -427,9 +427,10 @@ impl ToolpathGenerator {
                             .map(|p| p.z)
                             .unwrap_or(layer.z)
                     };
+                    // NaN where the layer has no height above (x, y): see the
+                    // two uses below for what that means for each.
                     Some(Box::new(move |x: f64, y: f64| {
-                        let guess = boundary_z(x, y);
-                        surface.z_at(x, y, guess).unwrap_or(guess)
+                        surface.z_at(x, y, boundary_z(x, y)).unwrap_or(f64::NAN)
                     }))
                 } else if let Some((cx, cy, signed_tan, z_min)) = self.pattern_config.conical_params {
                     // Recover deformed_z from contour points using the minimum.
@@ -461,7 +462,13 @@ impl ToolpathGenerator {
             if let Some(ref z_fn) = conical_z_fn {
                 for wall_contour in &mut wall_loops {
                     for pt in &mut wall_contour.points {
-                        pt.z = z_fn(pt.x, pt.y);
+                        // A wall hugs the outline, so a point with no layer
+                        // height is a hair outside the layer at most: keep it
+                        // at the height the offset left it, the outline's.
+                        let z = z_fn(pt.x, pt.y);
+                        if z.is_finite() {
+                            pt.z = z;
+                        }
                     }
                 }
             }
@@ -508,6 +515,28 @@ impl ToolpathGenerator {
                     raycaster_opt, // Accurate mesh Z + coverage gap fill
                     z_override,    // Analytic conical formula (overrides IDW)
                 );
+
+                // Infill is laid out across the outline in XY, but a curved
+                // layer need not reach everywhere inside its own outline. A
+                // dome-shaped layer near the top of a part rises out through
+                // the top face in the middle, and what is left of it is a
+                // ring. Where the layer has no height there is no layer, so
+                // stop the line there rather than print at a guessed height:
+                // on an inverted pyramid at 36 degrees that was 10 % of all
+                // extruded points, laid across the top face.
+                let infill_lines: Vec<Vec<Point3D>> = if layer.surface.is_some() {
+                    infill_lines
+                        .into_iter()
+                        .flat_map(|line| {
+                            line.split(|p| !p.z.is_finite())
+                                .filter(|run| run.len() >= 2)
+                                .map(|run| run.to_vec())
+                                .collect::<Vec<_>>()
+                        })
+                        .collect()
+                } else {
+                    infill_lines
+                };
 
                 // Infill is generated across the whole outline; cut it where
                 // it would cross a hole.
@@ -946,5 +975,50 @@ mod tests {
             total_flow,
             expected_flow
         );
+    }
+
+    /// A flat layer that does not exist within 8 mm of (20, 20).
+    #[derive(Debug)]
+    struct LayerWithAGap;
+    impl crate::slicing::LayerSurface for LayerWithAGap {
+        fn z_at(&self, x: f64, y: f64, _near_z: f64) -> Option<f64> {
+            if (x - 20.0).powi(2) + (y - 20.0).powi(2) < 64.0 { None } else { Some(0.2) }
+        }
+    }
+
+    /// Regression test for D-28. A curved layer need not reach everywhere
+    /// inside its own outline: a dome near the top of a part leaves through
+    /// the top face in the middle. Where the layer has no height, infill was
+    /// printed anyway at a height borrowed from the outline.
+    #[test]
+    fn test_infill_stops_where_the_layer_does_not_exist() {
+        let layer = Layer::new(0.2, vec![square(0.0, 40.0, 0.2, true)], 0.2)
+            .with_surface(std::sync::Arc::new(LayerWithAGap));
+        let generator = ToolpathGenerator::new(0.4, 0.2);
+        let toolpaths = generator.generate(&[layer], None);
+        let paths = &toolpaths[0].paths;
+
+        let r = |p: &Point3D| ((p.x - 20.0).powi(2) + (p.y - 20.0).powi(2)).sqrt();
+        let (mut extruded, mut beside_gap) = (0usize, 0usize);
+        for i in 1..paths.len() {
+            assert!(paths[i].position.z.is_finite(), "non-finite height reached the toolpath");
+            if paths[i].extrusion <= 0.0 {
+                continue;
+            }
+            extruded += 1;
+            let (a, b) = (paths[i - 1].position, paths[i].position);
+            // Anywhere along the move, not just at its ends. One node spacing
+            // of slack: a run ends at its last sample outside the gap.
+            for k in 0..=8 {
+                let t = k as f64 / 8.0;
+                let m = Point3D::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y), a.z);
+                assert!(r(&m) > 6.0, "extruding where the layer does not exist, at ({:.2}, {:.2})", m.x, m.y);
+            }
+            if r(&b) < 11.0 {
+                beside_gap += 1;
+            }
+        }
+        assert!(extruded > 50, "expected walls and infill, got {} moves", extruded);
+        assert!(beside_gap > 10, "infill should run right up to the gap, {} moves near it", beside_gap);
     }
 }
