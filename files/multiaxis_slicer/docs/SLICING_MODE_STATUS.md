@@ -1,6 +1,6 @@
 # Slicing mode status
 
-What each slicing mode actually does as of commit `91a3cb0` (November 2026), what
+What each slicing mode actually does as of commit `bba2547` (November 2026), what
 was repaired to get there, and what is still broken. Every number below was
 measured, not estimated; the method is at the end so results can be reproduced.
 
@@ -260,8 +260,8 @@ roughly radially symmetric parts: a central spire, a funnel, a bowl.
 
 ## S4 Deform — works, limited to one or two rotation axes
 
-Until `462cc4f`…`91a3cb0` this mode did not produce usable output on a real
-model in any orientation. Four separate defects, in the order they were found:
+Until `462cc4f`…`bba2547` this mode did not produce usable output on a real
+model in any orientation. Seven separate defects, in the order they were found:
 
 - **The torn-triangle filter deleted the model** (`462cc4f`). It dropped any
   deformed triangle with an edge over `max(median × multiplier, 5 mm)`. On the
@@ -284,26 +284,59 @@ model in any orientation. Four separate defects, in the order they were found:
   bed, so a change in rotation between neighbours becomes shear. The default is
   now ASAP.
 
-S4 end to end with GUI defaults, layer height 0.5 mm:
+- **Opposite overhangs were turned the same way** (`11091aa`). Putting
+  rotations on a shared axis rebuilt each as (axis, |angle|), dropping the sign,
+  so the far side of a part was tilted against its own overhang. Multi-axis
+  mode did the same per cluster and averaged opposite axes to nothing.
+- **Overhangs were read off the tet mesh's staircase** (`31cdda3`). On the grid
+  tetrahedralizer a slope is level steps and risers; every level step got the X
+  axis whichever way the slope faced. Seeds now come from the model's own
+  surface normals, and a face that truly looks straight down takes its
+  direction from the Dijkstra gradient.
+- **Infill was printed where the layer does not exist** (`bba2547`). A domed
+  layer near the top of a part leaves through the top face in the middle; infill
+  was laid across the gap at a borrowed height. Lines now end where the layer
+  does. This is in the shared toolpath generator and applies to TetVolumetric
+  too.
+
+The overhang test for the last three is an inverted square frustum, 71.5 mm
+across the top and 18 mm tall, 62 208 triangles (grid tet mesh), sliced with
+two axes, max rotation 36°, threshold 20°. Mean outward lean of the layer
+normal on each side; positive is with the overhang, negative against it:
+
+| | +x | −x | +y | −y |
+|---|---|---|---|---|
+| before | +14.9° | −1.2° | +19.6° | −6.5° |
+| after | +39.4° | +42.4° | +34.4° | +34.7° |
+
+0.0 % inverted tets, all contours closed, layer normals to 60°. The same part
+below 10 000 triangles gets a TetGen mesh instead and still folds (0.3 %
+inverted, normals past 90°): its interior tets are too coarse for ASAP. Not
+fixed.
+
+S4 end to end with GUI defaults, layer height 0.5 mm (measured at `bba2547`):
 
 | | 3dbenchy | Stanford bunny |
 |---|---|---|
-| layer contours | 329, all closed | 205, all closed |
+| layer contours | 333, all closed | 205, all closed |
 | inverted tets | 0.0 % | 0.0 % |
-| layer-normal tilt, p99 / max | 4.0° / 10.2° | 4.0° / 8.2° |
-| per-layer Z spread, median / max | 0.37 / 0.97 mm | 0.19 / 0.58 mm |
-| max tool tilt | 8.2° | 8.2° |
+| layer-normal tilt, p99 / max | 5.0° / 17.6° | 7.0° / 21.3° |
+| per-layer Z spread, median / max | 0.17 / 0.95 mm | 0.07 / 0.67 mm |
+| max tool tilt | 15.0° | 19.5° |
 | moves below the bed | 0 | 0 |
 | extruded points > 0.05 mm off their layer | 0.3 % | 0.0 % |
-| slice time | 16 s | 32 s |
+| slice time | 14 s | 26 s |
 
-For comparison, the direct deformation on the Benchy: 0.6 % inverted, layer
-normals to 121°, tool tilt pinned at the 45° budget.
+For comparison, the direct deformation on the Benchy (measured at `91a3cb0`):
+0.6 % inverted, layer normals to 121°, tool tilt pinned at the 45° budget.
 
-**Still wrong:** a model whose overhangs face opposite ways folds even under
-ASAP. The test sphere comes out with 0.6 % inverted tets and layer normals past
-90°, because single-axis mode puts one rotation axis on all of them. That is
-the ceiling described below, and the quality gate does not catch it.
+**Still limited:** rotations are confined to one axis, or two with multi-axis
+on. A four-sided part needs multi-axis to be treated evenly; in single-axis mode
+each side gets only its component about the shared axis (the frustum's sides
+lean +0.9° to +6.4°). A part with overhangs all the way round, like the test
+sphere, has no two axes that suit it, and the sphere also lands on the coarse
+TetGen mesh; it was last measured folding (0.6 % inverted) at `91a3cb0` and has
+not been re-measured. The quality gate does not catch folding.
 
 The stepwise GUI path (Deform → Slice → Un-deform) previews a planar slice of
 the deformed mesh; the final layers are now cut at levels the extractor
