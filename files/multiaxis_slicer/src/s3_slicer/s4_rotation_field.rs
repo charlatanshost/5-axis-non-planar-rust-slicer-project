@@ -296,6 +296,36 @@ fn compute_initial_rotations(
     (rotations, magnitudes)
 }
 
+/// The part of a rotation that is about `axis`: same axis, signed angle.
+///
+/// Overhangs on opposite sides of a part ask for rotations about opposite
+/// axes. Putting them on a common axis has to keep that: the far side's
+/// rotation becomes a NEGATIVE angle about the shared axis. Rebuilding every
+/// rotation as (shared axis, |angle|) instead turned the far side the same
+/// way as the near side, which is the wrong way for it -- on an inverted
+/// pyramid two faces were tilted to follow their overhang and the two
+/// opposite were tilted against it by the same amount.
+///
+/// An overhang facing along the axis has no component about it and is left
+/// alone, rather than being rotated at full strength in a direction that
+/// does nothing for it.
+fn project_onto_axis(
+    q: &UnitQuaternion<f64>,
+    axis: &nalgebra::Unit<Vector3D>,
+) -> UnitQuaternion<f64> {
+    match q.axis() {
+        Some(own) => {
+            let signed = q.angle() * own.dot(axis);
+            if signed.abs() < 1e-9 {
+                UnitQuaternion::identity()
+            } else {
+                UnitQuaternion::from_axis_angle(axis, signed)
+            }
+        }
+        None => UnitQuaternion::identity(),
+    }
+}
+
 /// Single-axis normalization: force all Phase 1 rotations onto the dominant axis.
 /// This guarantees stable SLERP averaging at the cost of multi-directional accuracy.
 fn normalize_single_axis(rotations: &mut [UnitQuaternion<f64>], num_tets: usize) {
@@ -312,9 +342,8 @@ fn normalize_single_axis(rotations: &mut [UnitQuaternion<f64>], num_tets: usize)
         let dom_unit = nalgebra::Unit::new_normalize(dom_ax);
         let mut normalized = 0usize;
         for ti in 0..num_tets {
-            let mag = rotations[ti].angle();
-            if mag > 1e-6 {
-                rotations[ti] = UnitQuaternion::from_axis_angle(&dom_unit, mag);
+            if rotations[ti].angle() > 1e-6 {
+                rotations[ti] = project_onto_axis(&rotations[ti], &dom_unit);
                 normalized += 1;
             }
         }
@@ -389,14 +418,17 @@ fn normalize_multi_axis(rotations: &mut [UnitQuaternion<f64>], num_tets: usize) 
     let mut cluster1_count = 0usize;
     let mut cluster2_count = 0usize;
 
-    for &(ti, ax, mag) in &axes {
-        let dot1 = ax.dot(&primary_axis).abs();
-        let dot2 = ax.dot(&secondary_axis).abs();
-        if dot1 >= dot2 {
-            cluster1_sum += ax * mag; // weight by magnitude
+    // An axis and its negative are the same line, and a cluster holds both:
+    // the two opposite faces of a part. Flip each onto the seed's side before
+    // summing, or they cancel and the "mean axis" is whatever rounding left.
+    for &(_ti, ax, mag) in &axes {
+        let d1 = ax.dot(&primary_axis);
+        let d2 = ax.dot(&secondary_axis);
+        if d1.abs() >= d2.abs() {
+            cluster1_sum += ax * (mag * d1.signum()); // weight by magnitude
             cluster1_count += 1;
         } else {
-            cluster2_sum += ax * mag;
+            cluster2_sum += ax * (mag * d2.signum());
             cluster2_count += 1;
         }
     }
@@ -413,14 +445,10 @@ fn normalize_multi_axis(rotations: &mut [UnitQuaternion<f64>], num_tets: usize) 
     // Normalize each tet to its cluster's axis
     let mut normalized = 0usize;
     for &(ti, ax, _) in &axes {
-        let mag = rotations[ti].angle();
         let dot1 = ax.dot(&c1_axis).abs();
         let dot2 = ax.dot(&c2_axis).abs();
-        if dot1 >= dot2 {
-            rotations[ti] = UnitQuaternion::from_axis_angle(&c1_unit, mag);
-        } else {
-            rotations[ti] = UnitQuaternion::from_axis_angle(&c2_unit, mag);
-        }
+        let unit = if dot1 >= dot2 { &c1_unit } else { &c2_unit };
+        rotations[ti] = project_onto_axis(&rotations[ti], unit);
         normalized += 1;
     }
 
@@ -627,5 +655,56 @@ mod tests {
         let rotated = field.rotations.iter().filter(|q| q.angle() > 0.01).count();
         assert!(rotated > seeds, "diffusion did not spread the rotation ({} of {} seeds)", rotated, seeds);
         eprintln!("seeds {}, rotated after diffusion {}, max {:.2} deg", seeds, rotated, max_deg);
+    }
+
+    fn about(x: f64, y: f64, degrees: f64) -> UnitQuaternion<f64> {
+        UnitQuaternion::from_axis_angle(
+            &nalgebra::Unit::new_normalize(Vector3D::new(x, y, 0.0)),
+            degrees.to_radians(),
+        )
+    }
+
+    /// Rotation vector: axis scaled by angle. Two rotations are the same turn
+    /// exactly when these agree, whatever axis each happens to be stored on.
+    fn rotation_vector(q: &UnitQuaternion<f64>) -> Vector3D {
+        q.axis().map(|a| a.into_inner() * q.angle()).unwrap_or_else(Vector3D::zeros)
+    }
+
+    /// Regression test for D-26. Overhangs on opposite sides of a part ask
+    /// for opposite rotations. Normalising onto a shared axis rebuilt each as
+    /// (shared axis, |angle|), which turned the far side the same way as the
+    /// near side: against its own overhang.
+    #[test]
+    fn test_axis_normalisation_keeps_the_direction_of_rotation() {
+        // Single axis: two opposite faces.
+        let asked = vec![about(0.0, 1.0, 12.0), about(0.0, -1.0, 10.0)];
+        let mut got = asked.clone();
+        normalize_single_axis(&mut got, 2);
+        for (a, g) in asked.iter().zip(got.iter()) {
+            assert!(
+                (rotation_vector(a) - rotation_vector(g)).norm() < 1e-9,
+                "single-axis: asked for {:?}, got {:?}", rotation_vector(a), rotation_vector(g)
+            );
+        }
+
+        // Two axes: the four faces of a pyramid.
+        let asked = vec![
+            about(0.0, 1.0, 12.0), about(0.0, -1.0, 10.0),
+            about(1.0, 0.0, 11.0), about(-1.0, 0.0, 9.0),
+        ];
+        let mut got = asked.clone();
+        normalize_multi_axis(&mut got, 4);
+        for (a, g) in asked.iter().zip(got.iter()) {
+            assert!(
+                (rotation_vector(a) - rotation_vector(g)).norm() < 1e-6,
+                "multi-axis: asked for {:?}, got {:?}", rotation_vector(a), rotation_vector(g)
+            );
+        }
+
+        // A rotation square to the shared axis has nothing to contribute and
+        // must not be applied at full strength about it.
+        let mut got = vec![about(0.0, 1.0, 12.0), about(1.0, 0.0, 10.0)];
+        normalize_single_axis(&mut got, 2);
+        assert!(got[1].angle() < 1e-9, "a perpendicular overhang was rotated {:.2} deg", got[1].angle().to_degrees());
     }
 }
