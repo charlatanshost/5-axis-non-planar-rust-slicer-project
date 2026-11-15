@@ -234,7 +234,7 @@ impl FieldSurface {
 /// Whether an edge is split depends only on its own length, and both triangles
 /// sharing it compute the same midpoint, so no T-junctions are created and the
 /// level sets stay closed.
-fn refine_surface(surface: &Mesh, max_edge: f64) -> Vec<crate::geometry::Triangle> {
+pub(crate) fn refine_surface(surface: &Mesh, max_edge: f64) -> Vec<crate::geometry::Triangle> {
     use crate::geometry::Triangle;
     let mid = |a: &Point3D, b: &Point3D| Point3D::new(0.5 * (a.x + b.x), 0.5 * (a.y + b.y), 0.5 * (a.z + b.z));
     let long = |a: &Point3D, b: &Point3D| (*a - *b).norm() > max_edge;
@@ -279,7 +279,7 @@ fn refine_surface(surface: &Mesh, max_edge: f64) -> Vec<crate::geometry::Triangl
 
 /// Longest surface edge to leave unsplit: about one tet across, relaxed on
 /// very large models so refinement cannot run away with memory.
-fn refine_edge_limit(surface: &Mesh) -> f64 {
+pub(crate) fn refine_edge_limit(surface: &Mesh) -> f64 {
     const TARGET_EDGE: f64 = 1.0;
     const TRIANGLE_BUDGET: f64 = 1.5e6;
     let area: f64 = surface

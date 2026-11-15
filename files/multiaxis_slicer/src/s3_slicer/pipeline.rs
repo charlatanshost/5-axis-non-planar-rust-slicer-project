@@ -816,7 +816,8 @@ pub fn execute_s4_deform(
         smoothness_weight: config.smoothness_weight,
         multi_axis: config.multi_axis,
     };
-    let rotation_field = S4RotationField::compute(&tet_mesh, &dijkstra_field, &s4_config);
+    let rotation_field = S4RotationField::compute_for_surface(
+        &tet_mesh, &dijkstra_field, &s4_config, Some(original_mesh));
 
     // Step 4: Deformation (direct vertex rotation or ASAP)
     let deformed_tet_mesh = if config.use_asap {

@@ -91,6 +91,26 @@ impl S4RotationField {
         dijkstra_field: &TetDijkstraField,
         config: &S4RotationConfig,
     ) -> Self {
+        Self::compute_for_surface(tet_mesh, dijkstra_field, config, None)
+    }
+
+    /// As `compute`, reading overhangs off the model's own surface.
+    ///
+    /// Without `surface` the overhang direction comes from the boundary faces
+    /// of the tet mesh. That is the model's surface only if the tet mesh
+    /// conforms to it. The grid tetrahedralizer, which is what any model over
+    /// 10 000 triangles gets, does not: a slope is a staircase of level steps
+    /// and vertical risers. A level step faces straight down, which says
+    /// nothing about which way the slope faces, and every one of them was
+    /// given the same arbitrary rotation axis. On an inverted pyramid that
+    /// tilted two opposite faces the same way: one with its overhang, the
+    /// other against it.
+    pub fn compute_for_surface(
+        tet_mesh: &TetMesh,
+        dijkstra_field: &TetDijkstraField,
+        config: &S4RotationConfig,
+        surface: Option<&crate::mesh::Mesh>,
+    ) -> Self {
         let num_tets = tet_mesh.tets.len();
         log::info!("Computing S4 rotation field for {} tets...", num_tets);
         log::info!("  Overhang threshold: {:.1} deg, max rotation: {:.1} deg",
@@ -102,7 +122,7 @@ impl S4RotationField {
         // anchor in deform_tet_mesh_direct caused a visible shear tear in the mesh.
         // Instead, diffusion (Step 3 below) spreads the Phase 1 rotations smoothly.
         let (mut rotations, magnitudes) =
-            compute_initial_rotations(tet_mesh, dijkstra_field, config);
+            compute_initial_rotations(tet_mesh, dijkstra_field, config, surface);
 
         let non_identity = rotations.iter().filter(|q| q.angle() > 0.01).count();
         let max_angle = rotations.iter().map(|q| q.angle()).fold(0.0f64, f64::max);
@@ -216,6 +236,7 @@ fn compute_initial_rotations(
     tet_mesh: &TetMesh,
     dijkstra_field: &TetDijkstraField,
     config: &S4RotationConfig,
+    surface: Option<&crate::mesh::Mesh>,
 ) -> (Vec<UnitQuaternion<f64>>, Vec<f64>) {
     let num_tets = tet_mesh.tets.len();
     let overhang_rad = config.overhang_threshold.to_radians();
@@ -225,26 +246,27 @@ fn compute_initial_rotations(
     // ── Phase 1: surface overhang tets → per-tet quaternion via normal × Z ────
     let mut rotations = vec![UnitQuaternion::identity(); num_tets];
 
-    for ti in 0..num_tets {
-        let neighbors = &tet_mesh.tet_neighbors[ti];
-
-        // Accumulate area-weighted normals from boundary (surface) faces
-        let mut surface_normal = Vector3D::zeros();
-        let mut has_surface = false;
-        let face_normals = tet_mesh.tets[ti].face_normals(&tet_mesh.vertices);
-
-        for fi in 0..4 {
-            if neighbors[fi].is_none() {
-                let n = face_normals[fi];
-                let area = n.norm();
-                if area > 1e-10 {
-                    surface_normal += n;
-                    has_surface = true;
+    // Area-weighted outward normal of the surface passing through each tet;
+    // zero where there is none.
+    let tet_normals: Vec<Vector3D> = match surface {
+        Some(surface) => surface_normals_per_tet(tet_mesh, surface),
+        None => (0..num_tets)
+            .map(|ti| {
+                let neighbors = &tet_mesh.tet_neighbors[ti];
+                let face_normals = tet_mesh.tets[ti].face_normals(&tet_mesh.vertices);
+                let mut sum = Vector3D::zeros();
+                for fi in 0..4 {
+                    if neighbors[fi].is_none() && face_normals[fi].norm() > 1e-10 {
+                        sum += face_normals[fi];
+                    }
                 }
-            }
-        }
+                sum
+            })
+            .collect(),
+    };
 
-        if !has_surface { continue; }
+    for ti in 0..num_tets {
+        let surface_normal = tet_normals[ti];
         let norm = surface_normal.norm();
         if norm < 1e-10 { continue; }
         let unit_normal = surface_normal / norm;
@@ -257,11 +279,23 @@ fn compute_initial_rotations(
         // Axis = normal × build_dir = (ny, -nx, 0) — the horizontal axis that
         // lifts this overhang toward +Z.
         let horiz_len = (unit_normal.x * unit_normal.x + unit_normal.y * unit_normal.y).sqrt();
-        let rotation_axis = if horiz_len > 1e-6 {
-            Vector3D::new(unit_normal.y / horiz_len, -unit_normal.x / horiz_len, 0.0)
+        // A face looking straight down has no sideways direction of its own.
+        // It used to be given the X axis regardless, which tilts the
+        // underside of a cap the same way all round: right on one side,
+        // wrong on the other. What does have a direction there is the route
+        // back to the bed. The Dijkstra distance grows outward along the
+        // underside, away from whatever holds it up, and that is the way
+        // such a face should be treated as facing. If that is level too,
+        // nothing says which way to turn, so leave the tet to its neighbours.
+        let (hx, hy) = if horiz_len >= 0.05 {
+            (unit_normal.x / horiz_len, unit_normal.y / horiz_len)
         } else {
-            Vector3D::new(1.0, 0.0, 0.0)
+            let g = dijkstra_field.gradients.get(ti).copied().unwrap_or_else(Vector3D::zeros);
+            let g_horiz = (g.x * g.x + g.y * g.y).sqrt();
+            if !g_horiz.is_finite() || g_horiz < 0.05 * g.norm().max(1e-12) { continue; }
+            (g.x / g_horiz, g.y / g_horiz)
         };
+        let rotation_axis = Vector3D::new(hy, -hx, 0.0);
 
         let q = UnitQuaternion::from_axis_angle(
             &nalgebra::Unit::new_normalize(rotation_axis),
@@ -294,6 +328,45 @@ fn compute_initial_rotations(
 
     let magnitudes: Vec<f64> = rotations.iter().map(|q| q.angle()).collect();
     (rotations, magnitudes)
+}
+
+/// Sum of the model surface's area-weighted normals in each tet.
+///
+/// The surface is refined first so that one large triangle contributes to
+/// every tet it crosses and not only to the one holding its centroid.
+fn surface_normals_per_tet(tet_mesh: &TetMesh, surface: &crate::mesh::Mesh) -> Vec<Vector3D> {
+    use crate::s3_slicer::surface_layers::{refine_edge_limit, refine_surface};
+    use crate::s3_slicer::tet_point_location::TetSpatialGrid;
+
+    let grid = TetSpatialGrid::build(tet_mesh);
+    let triangles = refine_surface(surface, refine_edge_limit(surface));
+
+    let located: Vec<(usize, Vector3D)> = triangles
+        .par_iter()
+        .filter_map(|t| {
+            // Cross product: length is twice the area, direction is outward
+            // for a consistently wound mesh.
+            let n = (t.v1 - t.v0).cross(&(t.v2 - t.v0));
+            if n.norm() < 1e-12 {
+                return None;
+            }
+            let c = crate::geometry::Point3D::new(
+                (t.v0.x + t.v1.x + t.v2.x) / 3.0,
+                (t.v0.y + t.v1.y + t.v2.y) / 3.0,
+                (t.v0.z + t.v1.z + t.v2.z) / 3.0,
+            );
+            let loc = grid
+                .find_containing_tet(&c, tet_mesh)
+                .unwrap_or_else(|| grid.find_nearest_tet(&c, tet_mesh));
+            Some((loc.tet_index, n))
+        })
+        .collect();
+
+    let mut normals = vec![Vector3D::zeros(); tet_mesh.tets.len()];
+    for (ti, n) in located {
+        normals[ti] += n;
+    }
+    normals
 }
 
 /// The part of a rotation that is about `axis`: same axis, signed angle.
@@ -706,5 +779,97 @@ mod tests {
         let mut got = vec![about(0.0, 1.0, 12.0), about(1.0, 0.0, 10.0)];
         normalize_single_axis(&mut got, 2);
         assert!(got[1].angle() < 1e-9, "a perpendicular overhang was rotated {:.2} deg", got[1].angle().to_degrees());
+    }
+
+    /// Inverted square frustum: half-width `a` on the bed, `b` at height `h`.
+    fn inverted_frustum(a: f64, b: f64, h: f64) -> crate::mesh::Mesh {
+        use crate::geometry::Triangle;
+        let p = |x: f64, y: f64, z: f64| Point3D::new(x, y, z);
+        let lo = [p(-a, -a, 0.0), p(a, -a, 0.0), p(a, a, 0.0), p(-a, a, 0.0)];
+        let hi = [p(-b, -b, h), p(b, -b, h), p(b, b, h), p(-b, b, h)];
+        let mut t = vec![
+            Triangle::new(lo[0], lo[2], lo[1]), Triangle::new(lo[0], lo[3], lo[2]),
+            Triangle::new(hi[0], hi[1], hi[2]), Triangle::new(hi[0], hi[2], hi[3]),
+        ];
+        for i in 0..4 {
+            let j = (i + 1) % 4;
+            t.push(Triangle::new(lo[i], lo[j], hi[j]));
+            t.push(Triangle::new(lo[i], hi[j], hi[i]));
+        }
+        crate::mesh::Mesh::new(t).unwrap()
+    }
+
+    /// Largest difference, in degrees, between the rotation each seed on a
+    /// flat face of the frustum was given and `expected`, and how many such
+    /// seeds there were. Corner tets, where two faces meet, are left out.
+    fn seed_error_on_faces(
+        mesh: &TetMesh,
+        surface: &crate::mesh::Mesh,
+        field: &S4RotationField,
+        expected: f64,
+    ) -> (f64, usize) {
+        let truth = surface_normals_per_tet(mesh, surface);
+        let (mut worst, mut seeds) = (0.0f64, 0usize);
+        for (ti, q) in field.rotations.iter().enumerate() {
+            if truth[ti].norm() < 1e-9 {
+                continue;
+            }
+            let n = truth[ti].normalize();
+            // Purely one sloping face: not a corner, and not an edge shared
+            // with the top or the base, where the summed normal is a blend.
+            let face_nz = -10.0 / (164.0f64).sqrt();
+            let on_one_face = (n.z - face_nz).abs() < 0.01 && (n.x.abs() < 0.02 || n.y.abs() < 0.02);
+            if !on_one_face {
+                continue;
+            }
+            seeds += 1;
+            // Signed: the rotation must also be the right way round, which
+            // is the way that makes this face overhang less.
+            let helps = (q * n).z >= n.z - 1e-9;
+            let got = if helps { q.angle().to_degrees() } else { -q.angle().to_degrees() };
+            worst = worst.max((got - expected).abs());
+        }
+        (worst, seeds)
+    }
+
+    /// Regression test for D-27. On a grid tet mesh a slope is a staircase of
+    /// level steps and vertical risers. Read off that, an overhang's angle is
+    /// whatever mix of step and riser a tet happens to hold, and its
+    /// direction, for a level step, is no direction at all. Read off the
+    /// model, every tet on a face gets that face's rotation.
+    #[test]
+    fn test_overhangs_are_read_from_the_model_not_the_tet_staircase() {
+        // Faces rise 8 over a run of 10: 51.34 degrees past vertical.
+        let surface = inverted_frustum(5.0, 15.0, 8.0);
+        let mesh = TetMesh::from_surface_mesh_grid(&surface, 16).expect("grid tet mesh");
+        let dijkstra = TetDijkstraField::compute(&mesh, 0.8);
+        // No diffusion: judge the seeds themselves.
+        let config = S4RotationConfig {
+            overhang_threshold: 20.0,
+            max_rotation_degrees: 40.0,
+            multi_axis: true,
+            smoothing_iterations: 0,
+            ..S4RotationConfig::default()
+        };
+        let expected = (10.0f64 / (164.0f64).sqrt()).asin().to_degrees() - 20.0;
+
+        let field = S4RotationField::compute_for_surface(&mesh, &dijkstra, &config, Some(&surface));
+        let (worst, seeds) = seed_error_on_faces(&mesh, &surface, &field, expected);
+        assert!(seeds > 40, "expected seeds on all four faces, got {}", seeds);
+        assert!(
+            worst < 0.5,
+            "seeds on the faces are up to {:.2} deg from the {:.2} their overhang calls for",
+            worst, expected
+        );
+
+        // Control: the same thing read off the tet mesh's own boundary.
+        let staircase = S4RotationField::compute(&mesh, &dijkstra, &config);
+        let (worst_staircase, _) = seed_error_on_faces(&mesh, &surface, &staircase, expected);
+        assert!(
+            worst_staircase > 5.0,
+            "staircase seeding was within {:.2} deg, so this test is not exercising the defect",
+            worst_staircase
+        );
+        eprintln!("seed error on faces: from the model {:.2} deg, from the staircase {:.2} deg", worst, worst_staircase);
     }
 }
